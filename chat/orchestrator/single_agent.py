@@ -59,7 +59,7 @@ class SingleAgentOrchestrator:
             tool_registry=self.tool_registry
         )
 
-    def handle_request(self, user_profile, conversation_id, message_text: str, agent_type: str = "ResearchAgent", selected_provider: str = None) -> dict:
+    def handle_request(self, user_profile, conversation_id, message_text: str, agent_type: str = "ResearchAgent", selected_provider: str = None, **kwargs) -> dict:
         agent = self.research_agent
 
         if conversation_id:
@@ -90,7 +90,7 @@ class SingleAgentOrchestrator:
         
         agent_run = AgentRun.objects.create(
             conversation=conversation,
-            agent_type=agent.name,
+            agent_type=agent_type,
             status='running'
         )
         
@@ -118,6 +118,57 @@ class SingleAgentOrchestrator:
         }
         
         try:
+            if agent_type == "MarketResearchAgent":
+                from chat.agents.market_research_agent import MarketResearchAgent
+                mr_agent = MarketResearchAgent(provider=self.provider, tool_registry=self.tool_registry)
+                
+                as_of_val = kwargs.get("as_of")
+                depth_val = kwargs.get("depth", "standard")
+                
+                response_text = mr_agent.execute(
+                    prompt=message_text,
+                    conversation_history=history,
+                    on_tool_execution=log_tool_execution,
+                    agent_run_id=agent_run.id,
+                    as_of=as_of_val,
+                    depth=depth_val
+                )
+                
+                prompt_tokens = getattr(mr_agent, "accumulated_prompt_tokens", 0)
+                completion_tokens = getattr(mr_agent, "accumulated_completion_tokens", 0)
+                total_tokens = prompt_tokens + completion_tokens
+                
+                Message.objects.create(
+                    conversation=conversation,
+                    role='assistant',
+                    content=response_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    provider=conversation.selected_provider,
+                    model=conversation.selected_model
+                )
+                
+                from decimal import Decimal
+                total_cost = (Decimal(prompt_tokens) * Decimal("0.075") + Decimal(completion_tokens) * Decimal("0.30")) / Decimal("1000000")
+                
+                agent_run.prompt_tokens = prompt_tokens
+                agent_run.completion_tokens = completion_tokens
+                agent_run.total_cost = total_cost
+                agent_run.status = 'completed'
+                agent_run.completed_at = timezone.now()
+                agent_run.save()
+                
+                return {
+                    "conversation_id": str(conversation.id),
+                    "response": response_text,
+                    "selected_provider": conversation.selected_provider,
+                    "selected_model": conversation.selected_model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens
+                }
+                
             from chat.agents.checkpoint_saver import DjangoCheckpointSaver
             from chat.agents.v2_graph import get_v2_agent_graph
             

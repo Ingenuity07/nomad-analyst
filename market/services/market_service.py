@@ -259,16 +259,19 @@ class MarketService:
         # Return all bars for the instrument/timeframe
         return list(OHLCVBar.objects.filter(instrument=instrument, timeframe=timeframe).order_by('timestamp'))
 
-    def get_historical_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 500) -> List[OHLCVBar]:
+    def get_historical_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 500, as_of: Optional[datetime] = None) -> List[OHLCVBar]:
         """
         Retrieves stored historical OHLCV bars sorted chronologically (oldest to newest).
         """
         try:
             instrument = Instrument.objects.get(symbol=symbol.strip().upper())
-            return list(OHLCVBar.objects.filter(
+            query = OHLCVBar.objects.filter(
                 instrument=instrument,
                 timeframe=timeframe
-            ).order_by('-timestamp')[:limit])[::-1]
+            )
+            if as_of:
+                query = query.filter(timestamp__lte=as_of)
+            return list(query.order_by('-timestamp')[:limit])[::-1]
         except Instrument.DoesNotExist:
             return []
 
@@ -283,7 +286,7 @@ class MarketService:
         except Instrument.DoesNotExist:
             return 0
 
-    def get_stored_features(self, symbol: str, timeframe: str = "1d", name: Optional[str] = None) -> List[TechnicalFeature]:
+    def get_stored_features(self, symbol: str, timeframe: str = "1d", name: Optional[str] = None, as_of: Optional[datetime] = None) -> List[TechnicalFeature]:
         """
         Retrieves stored derived features from database.
         """
@@ -292,6 +295,8 @@ class MarketService:
             query = TechnicalFeature.objects.filter(instrument=instrument, timeframe=timeframe)
             if name:
                 query = query.filter(name=name)
+            if as_of:
+                query = query.filter(timestamp__lte=as_of)
             return list(query.order_by('timestamp'))
         except Instrument.DoesNotExist:
             return []

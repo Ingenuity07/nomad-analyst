@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from decimal import Decimal
 import re
 from typing import Dict, Any, List, Optional
@@ -27,6 +27,29 @@ class FundamentalDataService:
     
     def __init__(self, provider=None):
         self.provider = provider or ScreenerFundamentalProvider()
+
+    def _parse_period_end(self, period_str: str) -> Optional[date]:
+        """
+        Parses Screener period labels (e.g. 'Mar 2025') into standard dates (e.g. 2025-03-31).
+        """
+        parts = period_str.strip().split()
+        if len(parts) != 2:
+            return None
+        month_str, year_str = parts[0][:3].lower(), parts[1]
+        try:
+            year = int(year_str)
+        except ValueError:
+            return None
+            
+        if month_str == "mar":
+            return date(year, 3, 31)
+        elif month_str == "dec":
+            return date(year, 12, 31)
+        elif month_str == "sep":
+            return date(year, 9, 30)
+        elif month_str == "jun":
+            return date(year, 6, 30)
+        return None
 
     def ingest_company_financials(self, symbol: str) -> Dict[str, Any]:
         """
@@ -96,6 +119,7 @@ class FundamentalDataService:
                 # Parse fiscal year, e.g. "Mar 2025" -> 2025
                 year_match = re.search(r'\d{4}', period)
                 fiscal_year = int(year_match.group()) if year_match else datetime.now().year
+                period_end_date = self._parse_period_end(period)
                 
                 # 1. Income Statement Ingestion
                 # Screener names: Sales, Expenses, Operating Profit, Depreciation, Interest, Profit before tax, Net Profit, EPS in Rs
@@ -126,6 +150,7 @@ class FundamentalDataService:
                     period_string=period,
                     defaults={
                         "fiscal_year": fiscal_year,
+                        "period_end": period_end_date,
                         "revenue": rev,
                         "expenses": exp,
                         "ebitda": ebitda,
@@ -140,7 +165,6 @@ class FundamentalDataService:
                 )
                 
                 # 2. Balance Sheet Ingestion
-                # Screener names: Share Capital / Equity Capital, Reserves, Borrowings, Other Liabilities, Total Liabilities / Total Assets, Fixed Assets, CWIP, Investments, Other Assets
                 eq_cap = get_val(bs_data, "Equity Capital", period) or get_val(bs_data, "Share Capital", period)
                 reserves = get_val(bs_data, "Reserves", period)
                 borrowings = get_val(bs_data, "Borrowings", period)
@@ -158,6 +182,7 @@ class FundamentalDataService:
                     period_string=period,
                     defaults={
                         "fiscal_year": fiscal_year,
+                        "period_end": period_end_date,
                         "equity_capital": eq_cap,
                         "reserves": reserves,
                         "borrowings": borrowings,
@@ -172,7 +197,6 @@ class FundamentalDataService:
                 )
                 
                 # 3. Cash Flow Ingestion
-                # Screener names: Cash from Operating Activity, Cash from Investing Activity, Cash from Financing Activity, Free Cash Flow
                 cfo = get_val(cf_data, "Cash from Operating Activity", period)
                 cfi = get_val(cf_data, "Cash from Investing Activity", period)
                 cff = get_val(cf_data, "Cash from Financing Activity", period)
@@ -184,6 +208,7 @@ class FundamentalDataService:
                     period_string=period,
                     defaults={
                         "fiscal_year": fiscal_year,
+                        "period_end": period_end_date,
                         "operating_cash_flow": cfo,
                         "investing_cash_flow": cfi,
                         "financing_cash_flow": cff,
@@ -209,6 +234,7 @@ class FundamentalDataService:
             for period in periods:
                 year_match = re.search(r'\d{4}', period)
                 fiscal_year = int(year_match.group()) if year_match else datetime.now().year
+                period_end_date = self._parse_period_end(period)
                 
                 # Quarters names match Profit Loss table names
                 rev = get_val(q_data, "Sales", period)
@@ -234,6 +260,7 @@ class FundamentalDataService:
                     period_string=period,
                     defaults={
                         "fiscal_year": fiscal_year,
+                        "period_end": period_end_date,
                         "revenue": rev,
                         "expenses": exp,
                         "ebitda": ebitda,

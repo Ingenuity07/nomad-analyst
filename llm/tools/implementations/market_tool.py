@@ -1,9 +1,10 @@
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
 from llm.tools.base import BaseTool
 from llm.tools.result import ToolResult, ToolError
 from market.services.market_service import MarketService
-from market.services.fundamental_service import FundamentalDataService
+from market.services.fundamental_service import FundamentalDataService, FundamentalMetricService
 from market.services.news_service import NewsIntelligenceService
 from market.models import (
     IncomeStatement,
@@ -88,6 +89,7 @@ class GetHistoricalOHLCVInput(BaseModel):
     symbol: str = Field(..., description="The stock ticker symbol (e.g. RELIANCE, TCS).")
     timeframe: str = Field("1d", description="Bar timeframe: '1d', '1h', '5m', etc.")
     limit: int = Field(100, description="Maximum number of historical bars to retrieve.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetHistoricalOHLCVTool(BaseTool):
     """Tool to fetch historical price and volume bars for a stock."""
@@ -124,11 +126,15 @@ class GetHistoricalOHLCVTool(BaseTool):
     def output_description(self) -> str:
         return "A list of historical price bars sorted chronologically."
 
-    def execute(self, symbol: str, timeframe: str = "1d", limit: int = 100, **kwargs) -> ToolResult:
+    def execute(self, symbol: str, timeframe: str = "1d", limit: int = 100, as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
             service = MarketService()
-            bars = service.get_historical_ohlcv(symbol, timeframe, limit)
-            if not bars:
+            as_of_dt = None
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                
+            bars = service.get_historical_ohlcv(symbol, timeframe, limit, as_of=as_of_dt)
+            if not bars and not as_of_dt:
                 bars = service.fetch_and_save_historical_ohlcv(symbol, timeframe)
                 bars = bars[-limit:] if len(bars) > limit else bars
                 
@@ -162,6 +168,7 @@ class GetTechnicalFeaturesInput(BaseModel):
     symbol: str = Field(..., description="The stock ticker symbol (e.g. RELIANCE, TCS).")
     timeframe: str = Field("1d", description="Bar timeframe: '1d', '1h', etc.")
     name: Optional[str] = Field(None, description="Filter for specific indicator name (e.g. 'RSI_14', 'SMA_20').")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetTechnicalFeaturesTool(BaseTool):
     """Tool to fetch stored calculated technical features for a stock."""
@@ -198,11 +205,15 @@ class GetTechnicalFeaturesTool(BaseTool):
     def output_description(self) -> str:
         return "A list of technical indicators with timestamp mapping."
 
-    def execute(self, symbol: str, timeframe: str = "1d", name: Optional[str] = None, **kwargs) -> ToolResult:
+    def execute(self, symbol: str, timeframe: str = "1d", name: Optional[str] = None, as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
             service = MarketService()
-            features = service.get_stored_features(symbol, timeframe, name)
-            if not features:
+            as_of_dt = None
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                
+            features = service.get_stored_features(symbol, timeframe, name, as_of=as_of_dt)
+            if not features and not as_of_dt:
                 service.refresh_features(symbol, timeframe)
                 features = service.get_stored_features(symbol, timeframe, name)
                 
@@ -232,6 +243,7 @@ class GetTechnicalFeaturesTool(BaseTool):
 class GetCompanyFinancialsInput(BaseModel):
     symbol: str = Field(..., description="The company short ticker symbol (e.g. RELIANCE, TCS).")
     period_type: str = Field("ANNUAL", description="Statement period filter: 'ANNUAL' or 'QUARTERLY'.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetCompanyFinancialsTool(BaseTool):
     """Tool to fetch normalized income, balance sheet, and cash flow statements for a company."""
@@ -268,17 +280,29 @@ class GetCompanyFinancialsTool(BaseTool):
     def output_description(self) -> str:
         return "Structured income, balance sheet, and cash flow statement arrays."
 
-    def execute(self, symbol: str, period_type: str = "ANNUAL", **kwargs) -> ToolResult:
+    def execute(self, symbol: str, period_type: str = "ANNUAL", as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
-            # Check if statements exist, else backfill them
             clean_symbol = symbol.strip().upper().split('.')[0]
             company = Company.objects.get(short_name=clean_symbol)
             incomes = IncomeStatement.objects.filter(company=company, period_type=period_type)
+            balances = BalanceSheetStatement.objects.filter(company=company, period_type=period_type)
+            cash_flows = CashFlowStatement.objects.filter(company=company, period_type=period_type)
             
-            if not incomes.exists():
+            # Trigger backfill first if database is empty and no as_of is restricting it
+            if not incomes.exists() and not as_of:
                 service = FundamentalDataService()
                 service.ingest_company_financials(clean_symbol)
                 incomes = IncomeStatement.objects.filter(company=company, period_type=period_type)
+                balances = BalanceSheetStatement.objects.filter(company=company, period_type=period_type)
+                cash_flows = CashFlowStatement.objects.filter(company=company, period_type=period_type)
+                
+            # Apply point-in-time constraints
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                as_of_date = as_of_dt.date()
+                incomes = incomes.filter(period_end__lte=as_of_date)
+                balances = balances.filter(period_end__lte=as_of_date)
+                cash_flows = cash_flows.filter(period_end__lte=as_of_date)
                 
             data = {
                 "income_statement": [],
@@ -302,8 +326,7 @@ class GetCompanyFinancialsTool(BaseTool):
                     "eps": float(inc.eps) if inc.eps is not None else None,
                 })
                 
-            balances = BalanceSheetStatement.objects.filter(company=company, period_type=period_type).order_by('fiscal_year')
-            for bal in balances:
+            for bal in balances.order_by('fiscal_year'):
                 data["balance_sheet"].append({
                     "period": bal.period_string,
                     "fiscal_year": bal.fiscal_year,
@@ -319,8 +342,7 @@ class GetCompanyFinancialsTool(BaseTool):
                     "total_assets": float(bal.total_assets) if bal.total_assets is not None else None,
                 })
                 
-            cash_flows = CashFlowStatement.objects.filter(company=company, period_type=period_type).order_by('fiscal_year')
-            for cf in cash_flows:
+            for cf in cash_flows.order_by('fiscal_year'):
                 data["cash_flow"].append({
                     "period": cf.period_string,
                     "fiscal_year": cf.fiscal_year,
@@ -348,6 +370,7 @@ class GetCompanyFinancialsTool(BaseTool):
 class GetFinancialMetricsInput(BaseModel):
     symbol: str = Field(..., description="The company short ticker symbol (e.g. RELIANCE, TCS).")
     name: Optional[str] = Field(None, description="Optional name of specific derived metric (e.g. 'return_on_equity', 'debt_equity').")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetFinancialMetricsTool(BaseTool):
     """Tool to fetch pre-calculated derived fundamental metrics for a company."""
@@ -384,14 +407,13 @@ class GetFinancialMetricsTool(BaseTool):
     def output_description(self) -> str:
         return "A list of fundamental ratios and growth rates grouped by reporting period."
 
-    def execute(self, symbol: str, name: Optional[str] = None, **kwargs) -> ToolResult:
+    def execute(self, symbol: str, name: Optional[str] = None, as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
             clean_symbol = symbol.strip().upper().split('.')[0]
             company = Company.objects.get(short_name=clean_symbol)
             metrics = DerivedFundamentalMetric.objects.filter(company=company)
             
-            if not metrics.exists():
-                # Backfill statement data which automatically triggers metrics calculations
+            if not metrics.exists() and not as_of:
                 service = FundamentalDataService()
                 service.ingest_company_financials(clean_symbol)
                 metrics = DerivedFundamentalMetric.objects.filter(company=company)
@@ -399,8 +421,24 @@ class GetFinancialMetricsTool(BaseTool):
             if name:
                 metrics = metrics.filter(name=name)
                 
+            # Filter in Python using the parsed period end date helper
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                as_of_date = as_of_dt.date()
+                
+                filtered_metrics = []
+                helper_service = FundamentalDataService()
+                for m in metrics:
+                    p_end = helper_service._parse_period_end(m.period_string)
+                    if p_end and p_end > as_of_date:
+                        continue
+                    filtered_metrics.append(m)
+                metrics = filtered_metrics
+            else:
+                metrics = list(metrics)
+                
             data = []
-            for m in metrics.order_by('period_string', 'name'):
+            for m in sorted(metrics, key=lambda x: (x.period_string, x.name)):
                 data.append({
                     "period": m.period_string,
                     "name": m.name,
@@ -424,6 +462,7 @@ class GetFinancialMetricsTool(BaseTool):
 class GetCompanyNewsInput(BaseModel):
     symbol: str = Field(..., description="The stock ticker symbol (e.g. RELIANCE, TCS).")
     limit: int = Field(10, description="Max number of news articles to retrieve.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetCompanyNewsTool(BaseTool):
     """Tool to fetch recent company news headlines and summaries."""
@@ -460,19 +499,22 @@ class GetCompanyNewsTool(BaseTool):
     def output_description(self) -> str:
         return "A list of news articles sorted by publication date."
 
-    def execute(self, symbol: str, limit: int = 10, **kwargs) -> ToolResult:
+    def execute(self, symbol: str, limit: int = 10, as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
             clean_symbol = symbol.strip().upper().split('.')[0]
             company = Company.objects.get(short_name=clean_symbol)
             service = NewsIntelligenceService()
             
-            # Fetch latest news first if database has no articles for this company
-            news_items = service.get_company_news(company.id)
-            if not news_items:
+            as_of_dt = None
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                
+            # Fetch latest news first
+            news_items = service.get_company_news(company.id, as_of=as_of_dt)
+            if not news_items and not as_of_dt:
                 service.fetch_and_save_company_news(clean_symbol)
                 news_items = service.get_company_news(company.id)
                 
-            # Limit list
             news_items = news_items[:limit]
             
             data = []
@@ -503,6 +545,7 @@ class GetCompanyNewsTool(BaseTool):
 class GetCompanyEventsInput(BaseModel):
     symbol: str = Field(..., description="The stock ticker symbol (e.g. RELIANCE, TCS).")
     event_type: str = Field(..., description="Deterministic category filter (e.g. 'earnings/results', 'dividend').")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetCompanyEventsTool(BaseTool):
     """Tool to fetch company news filtered by categorized event type."""
@@ -539,18 +582,22 @@ class GetCompanyEventsTool(BaseTool):
     def output_description(self) -> str:
         return "A list of categorized events sorted by date."
 
-    def execute(self, symbol: str, event_type: str, **kwargs) -> ToolResult:
+    def execute(self, symbol: str, event_type: str, as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
             clean_symbol = symbol.strip().upper().split('.')[0]
             company = Company.objects.get(short_name=clean_symbol)
             service = NewsIntelligenceService()
             
+            as_of_dt = None
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                
             # Fetch latest news first
-            news_items = service.get_company_news(company.id)
-            if not news_items:
+            news_items = service.get_company_news(company.id, as_of=as_of_dt)
+            if not news_items and not as_of_dt:
                 service.fetch_and_save_company_news(clean_symbol)
                 
-            events = service.get_company_events(company.id, event_type)
+            events = service.get_company_events(company.id, event_type, as_of=as_of_dt)
             
             data = []
             for item in events:
@@ -579,6 +626,7 @@ class GetCompanyEventsTool(BaseTool):
 
 class GetMarketNewsInput(BaseModel):
     limit: int = Field(10, description="Max number of market news to retrieve.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
 
 class GetMarketNewsTool(BaseTool):
     """Tool to fetch recent market-wide news feed."""
@@ -615,10 +663,14 @@ class GetMarketNewsTool(BaseTool):
     def output_description(self) -> str:
         return "A list of general market-wide news articles."
 
-    def execute(self, limit: int = 10, **kwargs) -> ToolResult:
+    def execute(self, limit: int = 10, as_of: Optional[str] = None, **kwargs) -> ToolResult:
         try:
             service = NewsIntelligenceService()
-            news_items = service.get_market_news()[:limit]
+            as_of_dt = None
+            if as_of:
+                as_of_dt = datetime.fromisoformat(as_of.replace('Z', '+00:00'))
+                
+            news_items = service.get_market_news(as_of=as_of_dt)[:limit]
             
             data = []
             for item in news_items:
