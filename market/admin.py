@@ -1,5 +1,17 @@
 from django.contrib import admin
-from .models import Company, Instrument, MarketSnapshot, OHLCVBar, TechnicalFeature
+from .models import (
+    Company,
+    Instrument,
+    MarketSnapshot,
+    OHLCVBar,
+    TechnicalFeature,
+    RawFundamentalData,
+    IncomeStatement,
+    BalanceSheetStatement,
+    CashFlowStatement,
+    DerivedFundamentalMetric,
+    CorporateEvent
+)
 
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
@@ -32,3 +44,45 @@ class TechnicalFeatureAdmin(admin.ModelAdmin):
     search_fields = ('instrument__symbol', 'name', 'param_key')
     list_filter = ('timeframe', 'name', 'timestamp')
     raw_id_fields = ('instrument',)
+
+@admin.register(RawFundamentalData)
+class RawFundamentalDataAdmin(admin.ModelAdmin):
+    list_display = ('company', 'source', 'reporting_type', 'fiscal_period', 'retrieved_at', 'status')
+    search_fields = ('company__name', 'company__short_name', 'fiscal_period')
+    list_filter = ('source', 'reporting_type', 'status')
+    raw_id_fields = ('company',)
+
+@admin.register(IncomeStatement)
+class IncomeStatementAdmin(admin.ModelAdmin):
+    list_display = ('company', 'period_type', 'period_string', 'fiscal_year', 'revenue', 'pat', 'eps')
+    search_fields = ('company__name', 'company__short_name', 'period_string')
+    list_filter = ('period_type', 'fiscal_year')
+    raw_id_fields = ('company',)
+
+@admin.register(BalanceSheetStatement)
+class BalanceSheetStatementAdmin(admin.ModelAdmin):
+    list_display = ('company', 'period_type', 'period_string', 'fiscal_year', 'total_assets', 'total_liabilities')
+    search_fields = ('company__name', 'company__short_name', 'period_string')
+    list_filter = ('period_type', 'fiscal_year')
+    raw_id_fields = ('company',)
+
+@admin.register(CashFlowStatement)
+class CashFlowStatementAdmin(admin.ModelAdmin):
+    list_display = ('company', 'period_type', 'period_string', 'fiscal_year', 'operating_cash_flow', 'free_cash_flow')
+    search_fields = ('company__name', 'company__short_name', 'period_string')
+    list_filter = ('period_type', 'fiscal_year')
+    raw_id_fields = ('company',)
+
+@admin.register(DerivedFundamentalMetric)
+class DerivedFundamentalMetricAdmin(admin.ModelAdmin):
+    list_display = ('company', 'period_type', 'period_string', 'name', 'value')
+    search_fields = ('company__name', 'company__short_name', 'name', 'period_string')
+    list_filter = ('period_type', 'name')
+    raw_id_fields = ('company',)
+
+@admin.register(CorporateEvent)
+class CorporateEventAdmin(admin.ModelAdmin):
+    list_display = ('company', 'event_type', 'announcement_date', 'ex_date')
+    search_fields = ('company__name', 'company__short_name', 'event_type')
+    list_filter = ('event_type',)
+    raw_id_fields = ('company',)

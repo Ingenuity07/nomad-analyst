@@ -5,11 +5,23 @@ from unittest.mock import patch, MagicMock
 import numpy as np
 import requests
 
-from market.models import Company, Instrument, MarketSnapshot, OHLCVBar, TechnicalFeature
+from market.models import (
+    Company,
+    Instrument,
+    MarketSnapshot,
+    OHLCVBar,
+    TechnicalFeature,
+    RawFundamentalData,
+    IncomeStatement,
+    BalanceSheetStatement,
+    CashFlowStatement,
+    DerivedFundamentalMetric
+)
 from market.providers.yfinance import YFinanceMarketProvider
 from market.normalizers.yfinance import YFinanceNormalizer
 from market.services.market_service import MarketService
 from market.services.feature_engine import TechnicalFeatureEngine
+from market.services.fundamental_service import FundamentalDataService
 from market.exceptions import (
     ProviderConnectionError,
     RateLimitExceededError,
@@ -22,7 +34,9 @@ from llm.tools.executor import ToolExecutor
 from llm.tools.implementations.market_tool import (
     GetStockSnapshotTool,
     GetHistoricalOHLCVTool,
-    GetTechnicalFeaturesTool
+    GetTechnicalFeaturesTool,
+    GetCompanyFinancialsTool,
+    GetFinancialMetricsTool
 )
 
 # Standard mock response payload matching Yahoo Finance Chart API structure
@@ -554,3 +568,325 @@ class QuantTechnicalSubsystemTests(TestCase):
         self.assertTrue(result_feat.success)
         self.assertGreater(len(result_feat.data), 0)
         self.assertEqual(result_feat.data[0]["name"], "daily_return")
+
+
+MOCK_SCREENER_HTML = """
+<section id="quarters">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Dec 2024</th>
+        <th>Mar 2025</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Sales</td>
+        <td>1000</td>
+        <td>1200</td>
+      </tr>
+      <tr>
+        <td>Expenses</td>
+        <td>800</td>
+        <td>900</td>
+      </tr>
+      <tr>
+        <td>Operating Profit</td>
+        <td>200</td>
+        <td>300</td>
+      </tr>
+      <tr>
+        <td>Net Profit</td>
+        <td>120</td>
+        <td>180</td>
+      </tr>
+      <tr>
+        <td>EPS in Rs</td>
+        <td>1.20</td>
+        <td>1.80</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+<section id="profit-loss">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Mar 2024</th>
+        <th>Mar 2025</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Sales</td>
+        <td>4000</td>
+        <td>5000</td>
+      </tr>
+      <tr>
+        <td>Expenses</td>
+        <td>3200</td>
+        <td>3800</td>
+      </tr>
+      <tr>
+        <td>Operating Profit</td>
+        <td>800</td>
+        <td>1200</td>
+      </tr>
+      <tr>
+        <td>Depreciation</td>
+        <td>100</td>
+        <td>120</td>
+      </tr>
+      <tr>
+        <td>Interest</td>
+        <td>50</td>
+        <td>60</td>
+      </tr>
+      <tr>
+        <td>Profit before tax</td>
+        <td>650</td>
+        <td>1020</td>
+      </tr>
+      <tr>
+        <td>Net Profit</td>
+        <td>500</td>
+        <td>800</td>
+      </tr>
+      <tr>
+        <td>EPS in Rs</td>
+        <td>5.00</td>
+        <td>8.00</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+<section id="balance-sheet">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Mar 2024</th>
+        <th>Mar 2025</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Equity Capital</td>
+        <td>100</td>
+        <td>100</td>
+      </tr>
+      <tr>
+        <td>Reserves</td>
+        <td>900</td>
+        <td>1400</td>
+      </tr>
+      <tr>
+        <td>Borrowings</td>
+        <td>500</td>
+        <td>600</td>
+      </tr>
+      <tr>
+        <td>Other Liabilities</td>
+        <td>200</td>
+        <td>300</td>
+      </tr>
+      <tr>
+        <td>Total Liabilities</td>
+        <td>1700</td>
+        <td>2400</td>
+      </tr>
+      <tr>
+        <td>Fixed Assets</td>
+        <td>1000</td>
+        <td>1300</td>
+      </tr>
+      <tr>
+        <td>CWIP</td>
+        <td>100</td>
+        <td>200</td>
+      </tr>
+      <tr>
+        <td>Investments</td>
+        <td>300</td>
+        <td>400</td>
+      </tr>
+      <tr>
+        <td>Other Assets</td>
+        <td>300</td>
+        <td>500</td>
+      </tr>
+      <tr>
+        <td>Total Assets</td>
+        <td>1700</td>
+        <td>2400</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+<section id="cash-flow">
+  <table>
+    <thead>
+      <tr>
+        <th></th>
+        <th>Mar 2024</th>
+        <th>Mar 2025</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Cash from Operating Activity</td>
+        <td>600</td>
+        <td>900</td>
+      </tr>
+      <tr>
+        <td>Cash from Investing Activity</td>
+        <td>-400</td>
+        <td>-600</td>
+      </tr>
+      <tr>
+        <td>Cash from Financing Activity</td>
+        <td>-150</td>
+        <td>-200</td>
+      </tr>
+      <tr>
+        <td>Free Cash Flow</td>
+        <td>200</td>
+        <td>300</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+"""
+
+
+class FundamentalAnalysisSubsystemTests(TestCase):
+    """
+    Subsystem tests checking raw fundamental data logging, statement normalization,
+    derived metric formulas, quarterly vs annual period separation, and tool integrations.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Infosys", short_name="INFY")
+        self.instrument = Instrument.objects.create(company=self.company, symbol="INFY", exchange="NSE")
+
+    @patch("requests.get")
+    def test_screener_ingestion_and_provenance(self, mock_get):
+        """Verifies ingestion saves RawFundamentalData logs for audit and maps statements cleanly."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_SCREENER_HTML
+        mock_get.return_value = mock_resp
+
+        service = FundamentalDataService()
+        raw_payload = service.ingest_company_financials("INFY")
+
+        # 1. Verify Raw provenance logged
+        self.assertEqual(RawFundamentalData.objects.filter(company=self.company).count(), 1)
+        raw_log = RawFundamentalData.objects.get(company=self.company)
+        self.assertEqual(raw_log.status, "NORMALIZED")
+        self.assertEqual(raw_log.source, "screener")
+
+        # 2. Verify Statements parsed
+        # Annual: Mar 2024, Mar 2025
+        self.assertEqual(IncomeStatement.objects.filter(company=self.company, period_type="ANNUAL").count(), 2)
+        self.assertEqual(BalanceSheetStatement.objects.filter(company=self.company, period_type="ANNUAL").count(), 2)
+        self.assertEqual(CashFlowStatement.objects.filter(company=self.company, period_type="ANNUAL").count(), 2)
+
+        # Quarterly: Dec 2024, Mar 2025
+        self.assertEqual(IncomeStatement.objects.filter(company=self.company, period_type="QUARTERLY").count(), 2)
+
+        # 3. Verify normalized data values for Mar 2025
+        inc_2025 = IncomeStatement.objects.get(company=self.company, period_type="ANNUAL", period_string="Mar 2025")
+        self.assertEqual(inc_2025.revenue, Decimal("5000.00"))
+        self.assertEqual(inc_2025.pat, Decimal("800.00"))
+        self.assertEqual(inc_2025.ebit, Decimal("1080.00"))  # EBITDA (1200) - Dep (120) = 1080
+
+        bal_2025 = BalanceSheetStatement.objects.get(company=self.company, period_type="ANNUAL", period_string="Mar 2025")
+        self.assertEqual(bal_2025.borrowings, Decimal("600.00"))
+        self.assertEqual(bal_2025.equity_capital, Decimal("100.00"))
+        self.assertEqual(bal_2025.reserves, Decimal("1400.00"))
+
+        cf_2025 = CashFlowStatement.objects.get(company=self.company, period_type="ANNUAL", period_string="Mar 2025")
+        self.assertEqual(cf_2025.operating_cash_flow, Decimal("900.00"))
+        self.assertEqual(cf_2025.free_cash_flow, Decimal("300.00"))
+
+    @patch("requests.get")
+    def test_derived_fundamental_metrics(self, mock_get):
+        """Verifies formulas for derived growth, margins, return metrics, and leverage ratios."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_SCREENER_HTML
+        mock_get.return_value = mock_resp
+
+        service = FundamentalDataService()
+        service.ingest_company_financials("INFY")
+
+        # Ratios for Mar 2025:
+        # 1. Revenue Growth YoY: (5000 - 4000) / 4000 = 0.25 (25%)
+        # 2. EBITDA Margin: 1200 / 5000 = 0.24 (24%)
+        # 3. Debt/Equity: Borrowings (600) / (Equity Capital 100 + Reserves 1400) = 600 / 1500 = 0.40
+        # 4. ROE: PAT (800) / Equity (1500) = 0.533333 (53.33%)
+        # 5. ROCE: EBIT (1080) / Capital Employed (Equity 1500 + Borrowings 600) = 1080 / 2100 = 0.514286 (51.43%)
+        
+        rev_growth = DerivedFundamentalMetric.objects.get(company=self.company, name="revenue_growth_yoy", period_string="Mar 2025")
+        self.assertEqual(rev_growth.value, Decimal("0.250000"))
+
+        ebitda_margin = DerivedFundamentalMetric.objects.get(company=self.company, name="ebitda_margin", period_string="Mar 2025")
+        self.assertEqual(ebitda_margin.value, Decimal("0.240000"))
+
+        debt_eq = DerivedFundamentalMetric.objects.get(company=self.company, name="debt_equity", period_string="Mar 2025")
+        self.assertEqual(debt_eq.value, Decimal("0.400000"))
+
+        roe = DerivedFundamentalMetric.objects.get(company=self.company, name="return_on_equity", period_string="Mar 2025")
+        self.assertEqual(roe.value, Decimal("0.533333"))
+
+        roce = DerivedFundamentalMetric.objects.get(company=self.company, name="return_on_capital_employed", period_string="Mar 2025")
+        self.assertEqual(roce.value, Decimal("0.514286"))
+
+    def test_missing_values_distinctness(self):
+        """Verifies missing financial statements fields are preserved as None/Null instead of coerced to zero."""
+        # Create income statement manually with missing fields
+        IncomeStatement.objects.create(
+            company=self.company,
+            period_type="ANNUAL",
+            period_string="Mar 2026",
+            fiscal_year=2026,
+            revenue=Decimal("6000.00"),
+            pat=None, # Missing PAT
+            eps=None  # Missing EPS
+        )
+        
+        inc = IncomeStatement.objects.get(company=self.company, period_string="Mar 2026")
+        self.assertEqual(inc.revenue, Decimal("6000.00"))
+        self.assertIsNone(inc.pat)
+        self.assertIsNone(inc.eps)
+
+    @patch("requests.get")
+    def test_fundamental_tools_layer(self, mock_get):
+        """Verifies get_company_financials and get_financial_metrics tools execute cleanly."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_SCREENER_HTML
+        mock_get.return_value = mock_resp
+
+        registry = ToolRegistry()
+        fin_tool = GetCompanyFinancialsTool()
+        metrics_tool = GetFinancialMetricsTool()
+        registry.register(fin_tool)
+        registry.register(metrics_tool)
+        executor = ToolExecutor(registry=registry)
+
+        # 1. Execute get_company_financials
+        result_fin = executor.execute("get_company_financials", {"symbol": "INFY", "period_type": "ANNUAL"})
+        self.assertTrue(result_fin.success)
+        self.assertEqual(len(result_fin.data["income_statement"]), 2)
+        self.assertEqual(result_fin.data["income_statement"][1]["revenue"], 5000.0)
+
+        # 2. Execute get_financial_metrics
+        result_metrics = executor.execute("get_financial_metrics", {"symbol": "INFY", "name": "debt_equity"})
+        self.assertTrue(result_metrics.success)
+        self.assertEqual(len(result_metrics.data), 2)  # Mar 2024 and Mar 2025
+        self.assertEqual(result_metrics.data[1]["value"], 0.40)
+
