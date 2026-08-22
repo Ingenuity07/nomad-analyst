@@ -77,3 +77,60 @@ class MarketSnapshot(models.Model):
 
     def __str__(self):
         return f"{self.instrument.symbol} @ {self.timestamp.isoformat()}"
+
+
+class OHLCVBar(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    instrument = models.ForeignKey(Instrument, on_delete=models.CASCADE, related_name='ohlcv_bars')
+    timeframe = models.CharField(max_length=10, default='1d', help_text="Timeframe (e.g. 1d, 1h, 5m)")
+    timestamp = models.DateTimeField(help_text="Time of the bar opening (timezone-aware)")
+    open = models.DecimalField(max_digits=12, decimal_places=2)
+    high = models.DecimalField(max_digits=12, decimal_places=2)
+    low = models.DecimalField(max_digits=12, decimal_places=2)
+    close = models.DecimalField(max_digits=12, decimal_places=2)
+    volume = models.BigIntegerField()
+    source = models.CharField(max_length=50)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['instrument', 'timeframe', 'timestamp'],
+                name='unique_instrument_timeframe_timestamp'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['instrument', 'timeframe', 'timestamp']),
+            models.Index(fields=['timestamp']),
+        ]
+
+    def __str__(self):
+        return f"{self.instrument.symbol} [{self.timeframe}] @ {self.timestamp.isoformat()}"
+
+
+class TechnicalFeature(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    instrument = models.ForeignKey(Instrument, on_delete=models.CASCADE, related_name='technical_features')
+    timeframe = models.CharField(max_length=10, default='1d')
+    timestamp = models.DateTimeField(help_text="Timestamp corresponding to the calculations source bar")
+    name = models.CharField(max_length=100, help_text="Name of the technical indicator (e.g. RSI, SMA)")
+    parameters = models.JSONField(default=dict, help_text="Parameter dictionary used for calculation")
+    param_key = models.CharField(max_length=100, help_text="Sorted serialized parameters string for indexing")
+    value = models.DecimalField(max_digits=16, decimal_places=6, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['instrument', 'timeframe', 'name', 'param_key', 'timestamp'],
+                name='unique_instrument_timeframe_feature_param_timestamp'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['instrument', 'timeframe', 'name', 'param_key', 'timestamp']),
+            models.Index(fields=['timestamp']),
+        ]
+
+    def __str__(self):
+        return f"{self.instrument.symbol} [{self.timeframe}] {self.name}({self.param_key}) @ {self.timestamp.isoformat()} = {self.value}"
+

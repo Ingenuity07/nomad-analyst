@@ -1,5 +1,5 @@
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any
 
 class DummyMarketProvider:
@@ -49,3 +49,72 @@ class DummyMarketProvider:
             "vol_traded": volume,
             "last_trade_time": datetime.now(timezone.utc).isoformat()
         }
+
+    def get_historical_ohlcv(self, symbol: str, timeframe: str = "1d", start_date: datetime = None, end_date: datetime = None) -> Dict[str, Any]:
+        upper_symbol = symbol.strip().upper()
+        clean_symbol = upper_symbol.split('.')[0]
+        
+        # Determine number of days
+        days = 30
+        if start_date and end_date:
+            days = max(1, (end_date - start_date).days)
+            
+        timestamps = []
+        base_time = end_date or datetime.now(timezone.utc)
+        for i in range(days):
+            t = base_time - timedelta(days=days - i)
+            timestamps.append(int(t.timestamp()))
+            
+        base_price = self._base_prices.get(clean_symbol, 100.00)
+        opens = []
+        highs = []
+        lows = []
+        closes = []
+        volumes = []
+        
+        current_price = base_price
+        for _ in range(days):
+            change = current_price * random.uniform(-0.015, 0.02)
+            close = round(current_price + change, 2)
+            open_p = round(current_price * (1 + random.uniform(-0.005, 0.005)), 2)
+            high = max(open_p, close, round(current_price * (1 + random.uniform(0.001, 0.02)), 2))
+            low = min(open_p, close, round(current_price * (1 - random.uniform(0.001, 0.02)), 2))
+            vol = random.randint(50000, 2000000)
+            
+            opens.append(open_p)
+            highs.append(high)
+            lows.append(low)
+            closes.append(close)
+            volumes.append(vol)
+            current_price = close
+            
+        return {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "symbol": f"{clean_symbol}.NS",
+                            "currency": "INR",
+                            "fullExchangeName": "NSE",
+                            "regularMarketTime": timestamps[-1],
+                            "regularMarketPrice": closes[-1],
+                            "chartPreviousClose": base_price
+                        },
+                        "timestamp": timestamps,
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "open": opens,
+                                    "high": highs,
+                                    "low": lows,
+                                    "close": closes,
+                                    "volume": volumes
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "error": None
+            }
+        }
+

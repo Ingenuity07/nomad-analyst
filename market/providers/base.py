@@ -28,3 +28,10 @@ class MarketDataProvider(Protocol):
         Returns a raw dictionary response.
         """
         ...
+
+    def get_historical_ohlcv(self, symbol: str, timeframe: str = "1d", start_date: datetime = None, end_date: datetime = None) -> dict:
+        """
+        Fetches historical OHLCV data for the symbol from the provider.
+        Returns a raw dictionary response.
+        """
+        ...
