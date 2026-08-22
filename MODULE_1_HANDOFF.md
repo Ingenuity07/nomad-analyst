@@ -65,7 +65,7 @@ To prevent database bloating and redundant snapshots if the same quote is retrie
 ## 5. Technical Decisions & Debt
 
 *   **Yahoo Chart API vs standard Quote API**: The standard quote API has been restricted by Yahoo Finance. The `/chart` endpoint is fully open, reliable, and returns identical pricing data.
-*   **Single Provider Dependency**: Although YFinance works well for a personal project, future iterations should include a backup provider (such as NSE scrapers) to failover during rate limit blockages.
+*   **Single Provider Dependency**: Although YFinance works well for a personal project, future iterations should include a backup provider (such as NSE scrapers) to failover during rate limit blockages. See the global technology registry in [TECHNOLOGY_STACK.md](file:///Users/shivamsingh/personal/nomad-analyst/docs/architecture/TECHNOLOGY_STACK.md) for more details.
 
 ---
 
