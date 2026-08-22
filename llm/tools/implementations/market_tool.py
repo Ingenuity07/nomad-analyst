@@ -4,6 +4,7 @@ from llm.tools.base import BaseTool
 from llm.tools.result import ToolResult, ToolError
 from market.services.market_service import MarketService
 from market.services.fundamental_service import FundamentalDataService
+from market.services.news_service import NewsIntelligenceService
 from market.models import (
     IncomeStatement,
     BalanceSheetStatement,
@@ -409,6 +410,231 @@ class GetFinancialMetricsTool(BaseTool):
                 success=True,
                 data=data,
                 provider="ScreenerFundamentalProvider",
+                tool_name=self.name
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetCompanyNewsInput(BaseModel):
+    symbol: str = Field(..., description="The stock ticker symbol (e.g. RELIANCE, TCS).")
+    limit: int = Field(10, description="Max number of news articles to retrieve.")
+
+class GetCompanyNewsTool(BaseTool):
+    """Tool to fetch recent company news headlines and summaries."""
+
+    @property
+    def name(self) -> str:
+        return "get_company_news"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve recent structured news headlines, summaries, and source details for a stock ticker symbol."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetCompanyNewsInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetCompanyNewsInput
+
+    @property
+    def category(self) -> str:
+        return "news"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "A list of news articles sorted by publication date."
+
+    def execute(self, symbol: str, limit: int = 10, **kwargs) -> ToolResult:
+        try:
+            clean_symbol = symbol.strip().upper().split('.')[0]
+            company = Company.objects.get(short_name=clean_symbol)
+            service = NewsIntelligenceService()
+            
+            # Fetch latest news first if database has no articles for this company
+            news_items = service.get_company_news(company.id)
+            if not news_items:
+                service.fetch_and_save_company_news(clean_symbol)
+                news_items = service.get_company_news(company.id)
+                
+            # Limit list
+            news_items = news_items[:limit]
+            
+            data = []
+            for item in news_items:
+                data.append({
+                    "headline": item.headline,
+                    "summary": item.summary,
+                    "source": item.source,
+                    "url": item.url,
+                    "published_at": item.published_at.isoformat(),
+                    "event_type": item.event_type
+                })
+            return ToolResult(
+                success=True,
+                data=data,
+                provider="YahooRSSNewsProvider",
+                tool_name=self.name
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetCompanyEventsInput(BaseModel):
+    symbol: str = Field(..., description="The stock ticker symbol (e.g. RELIANCE, TCS).")
+    event_type: str = Field(..., description="Deterministic category filter (e.g. 'earnings/results', 'dividend').")
+
+class GetCompanyEventsTool(BaseTool):
+    """Tool to fetch company news filtered by categorized event type."""
+
+    @property
+    def name(self) -> str:
+        return "get_company_events"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve categorized corporate material events (dividend, earnings, split, management change) for a stock symbol."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetCompanyEventsInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetCompanyEventsInput
+
+    @property
+    def category(self) -> str:
+        return "news"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "A list of categorized events sorted by date."
+
+    def execute(self, symbol: str, event_type: str, **kwargs) -> ToolResult:
+        try:
+            clean_symbol = symbol.strip().upper().split('.')[0]
+            company = Company.objects.get(short_name=clean_symbol)
+            service = NewsIntelligenceService()
+            
+            # Fetch latest news first
+            news_items = service.get_company_news(company.id)
+            if not news_items:
+                service.fetch_and_save_company_news(clean_symbol)
+                
+            events = service.get_company_events(company.id, event_type)
+            
+            data = []
+            for item in events:
+                data.append({
+                    "headline": item.headline,
+                    "summary": item.summary,
+                    "source": item.source,
+                    "url": item.url,
+                    "published_at": item.published_at.isoformat(),
+                    "event_type": item.event_type
+                })
+            return ToolResult(
+                success=True,
+                data=data,
+                provider="YahooRSSNewsProvider",
+                tool_name=self.name
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetMarketNewsInput(BaseModel):
+    limit: int = Field(10, description="Max number of market news to retrieve.")
+
+class GetMarketNewsTool(BaseTool):
+    """Tool to fetch recent market-wide news feed."""
+
+    @property
+    def name(self) -> str:
+        return "get_market_news"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve general market-wide financial news feed."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetMarketNewsInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetMarketNewsInput
+
+    @property
+    def category(self) -> str:
+        return "news"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "A list of general market-wide news articles."
+
+    def execute(self, limit: int = 10, **kwargs) -> ToolResult:
+        try:
+            service = NewsIntelligenceService()
+            news_items = service.get_market_news()[:limit]
+            
+            data = []
+            for item in news_items:
+                data.append({
+                    "company": item.company.short_name if item.company else None,
+                    "headline": item.headline,
+                    "summary": item.summary,
+                    "source": item.source,
+                    "url": item.url,
+                    "published_at": item.published_at.isoformat(),
+                    "event_type": item.event_type
+                })
+            return ToolResult(
+                success=True,
+                data=data,
+                provider="YahooRSSNewsProvider",
                 tool_name=self.name
             )
         except Exception as e:

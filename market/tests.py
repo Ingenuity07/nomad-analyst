@@ -15,13 +15,16 @@ from market.models import (
     IncomeStatement,
     BalanceSheetStatement,
     CashFlowStatement,
-    DerivedFundamentalMetric
+    DerivedFundamentalMetric,
+    NewsItem,
+    CorporateDisclosure
 )
 from market.providers.yfinance import YFinanceMarketProvider
 from market.normalizers.yfinance import YFinanceNormalizer
 from market.services.market_service import MarketService
 from market.services.feature_engine import TechnicalFeatureEngine
 from market.services.fundamental_service import FundamentalDataService
+from market.services.news_service import NewsIntelligenceService
 from market.exceptions import (
     ProviderConnectionError,
     RateLimitExceededError,
@@ -36,7 +39,10 @@ from llm.tools.implementations.market_tool import (
     GetHistoricalOHLCVTool,
     GetTechnicalFeaturesTool,
     GetCompanyFinancialsTool,
-    GetFinancialMetricsTool
+    GetFinancialMetricsTool,
+    GetCompanyNewsTool,
+    GetCompanyEventsTool,
+    GetMarketNewsTool
 )
 
 # Standard mock response payload matching Yahoo Finance Chart API structure
@@ -889,4 +895,168 @@ class FundamentalAnalysisSubsystemTests(TestCase):
         self.assertTrue(result_metrics.success)
         self.assertEqual(len(result_metrics.data), 2)  # Mar 2024 and Mar 2025
         self.assertEqual(result_metrics.data[1]["value"], 0.40)
+
+
+MOCK_NEWS_RSS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Yahoo Finance News</title>
+    <link>http://finance.yahoo.com</link>
+    <description>Latest news</description>
+    <item>
+      <title>Infosys Q3 net profit rises 10% YoY</title>
+      <link>https://finance.yahoo.com/news/infosys-q3-net-profit-rises-12345.html</link>
+      <pubDate>Thu, 20 Aug 2026 12:00:00 GMT</pubDate>
+      <description>Infosys reported strong Q3 numbers with sales growing 12%.</description>
+      <guid isPermaLink="false">infosys_q3_12345</guid>
+    </item>
+    <item>
+      <title>Infosys declares interim dividend of Rs 20</title>
+      <link>https://finance.yahoo.com/news/infosys-declares-interim-dividend-67890.html</link>
+      <pubDate>Fri, 21 Aug 2026 12:00:00 GMT</pubDate>
+      <description>Board declared Rs 20 dividend per equity share.</description>
+      <guid isPermaLink="false">infosys_div_67890</guid>
+    </item>
+    <item>
+      <title>Infosys bags USD 100M contract win</title>
+      <link>https://finance.yahoo.com/news/infosys-bags-contract-win-99999.html</link>
+      <pubDate>Sat, 22 Aug 2026 12:00:00 GMT</pubDate>
+      <description>The company secured a major order from an international client.</description>
+      <guid isPermaLink="false">infosys_order_99999</guid>
+    </item>
+  </channel>
+</rss>
+"""
+
+
+class NewsAnalysisSubsystemTests(TestCase):
+    """
+    Subsystem tests checking news RSS feed parsing, event classification keyword mapping,
+    strict content-hash deduplication, point-in-time querying constraints, and tools.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(name="Infosys", short_name="INFY")
+        self.instrument = Instrument.objects.create(company=self.company, symbol="INFY", exchange="NSE")
+
+    @patch("requests.get")
+    def test_news_rss_parsing_and_ingestion(self, mock_get):
+        """Verifies XML RSS response parses successfully and saves trace-auditable NewsItems."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_NEWS_RSS_XML
+        mock_get.return_value = mock_resp
+
+        service = NewsIntelligenceService()
+        items = service.fetch_and_save_company_news("INFY")
+
+        self.assertEqual(len(items), 3)
+        self.assertEqual(NewsItem.objects.filter(company=self.company).count(), 3)
+        
+        # Verify first parsed item values
+        item = NewsItem.objects.filter(company=self.company).order_by('published_at').first()
+        self.assertEqual(item.headline, "Infosys Q3 net profit rises 10% YoY")
+        self.assertEqual(item.source, "yahoo_rss")
+        self.assertEqual(item.source_id, "infosys_q3_12345")
+        self.assertEqual(item.url, "https://finance.yahoo.com/news/infosys-q3-net-profit-rises-12345.html")
+        self.assertEqual(item.event_type, "earnings/results")
+
+    @patch("requests.get")
+    def test_news_event_classification(self, mock_get):
+        """Verifies deterministic event categories are mapped cleanly from title keywords."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_NEWS_RSS_XML
+        mock_get.return_value = mock_resp
+
+        service = NewsIntelligenceService()
+        service.fetch_and_save_company_news("INFY")
+
+        # 1. earnings/results
+        item_results = NewsItem.objects.get(source_id="infosys_q3_12345")
+        self.assertEqual(item_results.event_type, "earnings/results")
+
+        # 2. dividend
+        item_div = NewsItem.objects.get(source_id="infosys_div_67890")
+        self.assertEqual(item_div.event_type, "dividend")
+
+        # 3. order/win
+        item_order = NewsItem.objects.get(source_id="infosys_order_99999")
+        self.assertEqual(item_order.event_type, "order/win")
+
+    @patch("requests.get")
+    def test_news_deduplication(self, mock_get):
+        """Verifies strict content hash uniqueness checks prevent duplicate/syndicated db records."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_NEWS_RSS_XML
+        mock_get.return_value = mock_resp
+
+        service = NewsIntelligenceService()
+        
+        # Ingest once
+        service.fetch_and_save_company_news("INFY")
+        self.assertEqual(NewsItem.objects.filter(company=self.company).count(), 3)
+
+        # Ingest again: must ignore conflicts and skip duplicate entries
+        service.fetch_and_save_company_news("INFY")
+        self.assertEqual(NewsItem.objects.filter(company=self.company).count(), 3)
+
+    @patch("requests.get")
+    def test_point_in_time_safety(self, mock_get):
+        """Verifies point-in-time as_of filters prevent future data leakage in backtesting queries."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_NEWS_RSS_XML
+        mock_get.return_value = mock_resp
+
+        service = NewsIntelligenceService()
+        service.fetch_and_save_company_news("INFY")
+
+        # Set as_of to August 21, 2026 18:00:00 UTC (should exclude August 22 article)
+        as_of_t = datetime(2026, 8, 21, 18, 0, 0, tzinfo=timezone.utc)
+        
+        pit_news = service.get_company_news(self.company.id, as_of=as_of_t)
+        
+        self.assertEqual(len(pit_news), 2)
+        # Should contain Mar 20, Mar 21 articles, but not Mar 22 order win
+        headlines = [n.headline for n in pit_news]
+        self.assertIn("Infosys Q3 net profit rises 10% YoY", headlines)
+        self.assertIn("Infosys declares interim dividend of Rs 20", headlines)
+        self.assertNotIn("Infosys bags USD 100M contract win", headlines)
+
+    @patch("requests.get")
+    def test_news_tools_layer(self, mock_get):
+        """Verifies news retrieval tools execute correctly and return clean structured schemas."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = MOCK_NEWS_RSS_XML
+        mock_get.return_value = mock_resp
+
+        registry = ToolRegistry()
+        news_tool = GetCompanyNewsTool()
+        events_tool = GetCompanyEventsTool()
+        market_tool = GetMarketNewsTool()
+        registry.register(news_tool)
+        registry.register(events_tool)
+        registry.register(market_tool)
+        executor = ToolExecutor(registry=registry)
+
+        # 1. Execute get_company_news
+        result_news = executor.execute("get_company_news", {"symbol": "INFY", "limit": 2})
+        self.assertTrue(result_news.success)
+        self.assertEqual(len(result_news.data), 2)
+        self.assertEqual(result_news.data[0]["headline"], "Infosys bags USD 100M contract win") # Sorted descending
+
+        # 2. Execute get_company_events
+        result_events = executor.execute("get_company_events", {"symbol": "INFY", "event_type": "dividend"})
+        self.assertTrue(result_events.success)
+        self.assertEqual(len(result_events.data), 1)
+        self.assertEqual(result_events.data[0]["event_type"], "dividend")
+
+        # 3. Execute get_market_news
+        result_mkt = executor.execute("get_market_news", {"limit": 5})
+        self.assertTrue(result_mkt.success)
+        self.assertEqual(len(result_mkt.data), 3)
+
 

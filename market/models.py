@@ -311,3 +311,66 @@ class CorporateEvent(models.Model):
         return f"{self.company.short_name} {self.event_type} Ex-Date {self.ex_date}"
 
 
+class NewsItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='news_items', null=True, blank=True)
+    instrument = models.ForeignKey(Instrument, on_delete=models.CASCADE, related_name='news_items', null=True, blank=True)
+    headline = models.CharField(max_length=500)
+    summary = models.TextField(null=True, blank=True)
+    source = models.CharField(max_length=50, default='yahoo_rss')
+    source_id = models.CharField(max_length=200, null=True, blank=True)
+    url = models.URLField(max_length=500, null=True, blank=True)
+    published_at = models.DateTimeField(db_index=True)
+    ingested_at = models.DateTimeField(auto_now_add=True)
+    event_type = models.CharField(max_length=50, default='other')
+    raw_metadata = models.JSONField(default=dict)
+    content_hash = models.CharField(max_length=64, unique=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['content_hash'],
+                name='unique_news_item_content_hash'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['company', 'published_at']),
+            models.Index(fields=['published_at']),
+            models.Index(fields=['event_type']),
+        ]
+
+    def __str__(self):
+        company_name = self.company.short_name if self.company else "MarketWide"
+        return f"[{company_name}] {self.headline} ({self.published_at.isoformat()})"
+
+
+class CorporateDisclosure(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='corporate_disclosures')
+    headline = models.CharField(max_length=500)
+    category = models.CharField(max_length=100)
+    source = models.CharField(max_length=50, default='NSE')
+    announcement_id = models.CharField(max_length=100)
+    url = models.URLField(max_length=500, null=True, blank=True)
+    published_at = models.DateTimeField(db_index=True)
+    ingested_at = models.DateTimeField(auto_now_add=True)
+    details = models.JSONField(default=dict)
+    content_hash = models.CharField(max_length=64, unique=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['content_hash'],
+                name='unique_corporate_disclosure_content_hash'
+            )
+        ]
+        indexes = [
+            models.Index(fields=['company', 'published_at']),
+            models.Index(fields=['published_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.company.short_name} Disclosure: {self.headline} @ {self.published_at.isoformat()}"
+
+
+

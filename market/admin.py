@@ -10,7 +10,9 @@ from .models import (
     BalanceSheetStatement,
     CashFlowStatement,
     DerivedFundamentalMetric,
-    CorporateEvent
+    CorporateEvent,
+    NewsItem,
+    CorporateDisclosure
 )
 
 @admin.register(Company)
@@ -85,4 +87,18 @@ class CorporateEventAdmin(admin.ModelAdmin):
     list_display = ('company', 'event_type', 'announcement_date', 'ex_date')
     search_fields = ('company__name', 'company__short_name', 'event_type')
     list_filter = ('event_type',)
+    raw_id_fields = ('company',)
+
+@admin.register(NewsItem)
+class NewsItemAdmin(admin.ModelAdmin):
+    list_display = ('company', 'headline', 'source', 'published_at', 'event_type')
+    search_fields = ('company__name', 'company__short_name', 'headline')
+    list_filter = ('source', 'event_type', 'published_at')
+    raw_id_fields = ('company', 'instrument')
+
+@admin.register(CorporateDisclosure)
+class CorporateDisclosureAdmin(admin.ModelAdmin):
+    list_display = ('company', 'headline', 'category', 'published_at', 'source')
+    search_fields = ('company__name', 'company__short_name', 'headline', 'category')
+    list_filter = ('source', 'published_at')
     raw_id_fields = ('company',)

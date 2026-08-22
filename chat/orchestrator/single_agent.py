@@ -20,7 +20,10 @@ from llm.tools.implementations.market_tool import (
     GetHistoricalOHLCVTool,
     GetTechnicalFeaturesTool,
     GetCompanyFinancialsTool,
-    GetFinancialMetricsTool
+    GetFinancialMetricsTool,
+    GetCompanyNewsTool,
+    GetCompanyEventsTool,
+    GetMarketNewsTool
 )
 from chat.models import Conversation, Message, AgentRun
 
@@ -47,6 +50,9 @@ class SingleAgentOrchestrator:
         self.tool_registry.register(GetTechnicalFeaturesTool())
         self.tool_registry.register(GetCompanyFinancialsTool())
         self.tool_registry.register(GetFinancialMetricsTool())
+        self.tool_registry.register(GetCompanyNewsTool())
+        self.tool_registry.register(GetCompanyEventsTool())
+        self.tool_registry.register(GetMarketNewsTool())
         
         self.research_agent = ResearchAgent(
             provider=self.provider,
