@@ -1,0 +1,64 @@
+# Environment variables
+.env
+.env.*
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.cache/
+.mypy_cache/
+
+# FE files
+*.ts
+*.tsx
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+*.md
+
+# Databases (Local/SQLite development)
+*.db
+*.sqlite3
+*.sqlite3-journal
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Playwright / Screenshots / Test output artifacts
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# Generated Media and Resumes
+media/
+*.aux
+*.out
+*.toc
+
+# Celery Beat runtime schedule database
+celerybeat-schedule
+celerybeat-schedule.db
+
+# Project-specific caches and locks
+.freebuff/
+skills-lock.json
+model_waterfall_plan.txt
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
+
+# Generated per-discovery execution traces (folder structure stays in git).
+discovery_traces/*.json
+discovery_traces/*.html
