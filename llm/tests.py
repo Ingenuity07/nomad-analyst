@@ -10,9 +10,7 @@ from llm.tools.executor import ToolExecutor
 from llm.tools.context import ToolContext
 from llm.tools.result import ToolResult
 from llm.tools.implementations.discovery_tools import (
-    SearchCompaniesTool,
-    SearchWebTool,
-    ExtractContactDataTool
+    SearchWebTool
 )
 from llm.providers.duckduckgo import DuckDuckGoSearchProvider
 from llm.providers.registry import provider_registry
@@ -184,24 +182,6 @@ class ToolPlatformTestCase(TestCase):
         self.assertFalse(res.success)
         self.assertEqual(res.error.code, "TIMEOUT")
         self.assertTrue(res.error.retryable)
-
-    def test_search_companies_tool_with_mock_provider(self):
-        provider_registry.register("dummy_prov", DummyCompanyProvider())
-        tool = SearchCompaniesTool()
-        
-        res = tool.execute(query="pest", provider="dummy_prov")
-        self.assertTrue(res.success)
-        self.assertEqual(len(res.data["companies"]), 1)
-        self.assertEqual(res.data["companies"][0]["name"], "Test Biz")
-
-    def test_extract_contact_data_tool(self):
-        tool = ExtractContactDataTool()
-        text = "Hello! Please email us at contact@testbiz.co.uk or call 0161 9998888. LinkedIn: https://linkedin.com/company/testbiz"
-        res = tool.execute(text=text)
-        self.assertTrue(res.success)
-        self.assertIn("contact@testbiz.co.uk", res.data["emails"])
-        self.assertIn("0161 9998888", res.data["phones"])
-        self.assertIn("https://linkedin.com/company/testbiz", res.data["linkedin_urls"])
 
     def test_swagger_endpoints(self):
         # Swagger UI endpoint
@@ -472,5 +452,86 @@ class TelemetryDatabaseSeparationTestCase(TestCase):
             )
             # The router completed generation despite telemetry persistence failing
             self.assertIsNotNone(res)
+
+
+class TestSchemaModel(BaseModel):
+    summary: str = Field(...)
+    score: int = Field(...)
+
+
+class LLMGenericModelRoutingTestCase(TestCase):
+    databases = {'default', 'telemetry'}
+
+    def test_pool_selection_and_priority(self):
+        from llm.enums import LLMComplexity
+        from llm.registry import get_pool_models
+
+        simple_models = [m.model_name for m in get_pool_models(LLMComplexity.SIMPLE)]
+        self.assertEqual(simple_models[0], "gemini-3.1-flash-lite")
+
+        standard_models = [m.model_name for m in get_pool_models(LLMComplexity.STANDARD)]
+        self.assertEqual(standard_models[0], "gemini-3.5-flash")
+
+        complex_models = [m.model_name for m in get_pool_models(LLMComplexity.COMPLEX)]
+        self.assertEqual(complex_models[0], "gemini-3.7-flash")
+
+    def test_structured_output_schema_validation_and_fallback(self):
+        from llm.router import IntelligentRouter
+        from llm.contracts import LLMRequest
+        from llm.enums import LLMOperation, LLMComplexity
+
+        router = IntelligentRouter()
+        router.health_monitor.reset("google")
+
+        # Mock adapters: first model returns bad json schema, second returns valid schema
+        bad_adapter = MagicMock()
+        bad_adapter.model_name = "gemini-3.7-flash"
+        bad_adapter.generate.return_value = {"type": "text", "text": "{\"invalid\": \"json\"}"}
+
+        good_adapter = MagicMock()
+        good_adapter.model_name = "gemini-3.6-flash"
+        good_adapter.generate.return_value = {"type": "text", "text": "{\"summary\": \"Valid\", \"score\": 95}"}
+
+        def mock_get_adapter(cfg):
+            if cfg.model_name == "gemini-3.7-flash":
+                return bad_adapter
+            return good_adapter
+
+        with patch.object(router, "_get_adapter_for_model", side_effect=mock_get_adapter):
+            req = LLMRequest(
+                operation=LLMOperation.STRUCTURED_OUTPUT,
+                complexity=LLMComplexity.COMPLEX,
+                prompt="Generate summary",
+                schema=TestSchemaModel
+            )
+            res = router.execute(req)
+            self.assertTrue(res.is_success())
+            self.assertIsInstance(res.output, TestSchemaModel)
+            self.assertEqual(res.output.summary, "Valid")
+            self.assertEqual(res.output.score, 95)
+            self.assertEqual(res.attempts, 2)
+
+    def test_non_retryable_error_halts_fallback(self):
+        from llm.router import IntelligentRouter
+        from llm.contracts import LLMRequest
+        from llm.enums import LLMOperation, LLMComplexity, LLMErrorCategory
+
+        router = IntelligentRouter()
+        auth_adapter = MagicMock()
+        auth_adapter.model_name = "gemini-3.7-flash"
+        auth_adapter.generate.return_value = {"type": "error", "status_code": 401, "text": "Unauthorized API Key"}
+
+        with patch.object(router, "_get_adapter_for_model", return_value=auth_adapter):
+            req = LLMRequest(
+                operation=LLMOperation.GENERATE,
+                complexity=LLMComplexity.COMPLEX,
+                prompt="Hello"
+            )
+            res = router.execute(req)
+            self.assertFalse(res.is_success())
+            self.assertEqual(res.error_category, LLMErrorCategory.AUTHENTICATION_ERROR)
+            # Must halt on 401 without wasting retries across all pool models
+            self.assertEqual(res.attempts, 1)
+
 
 
