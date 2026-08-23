@@ -696,3 +696,817 @@ class GetMarketNewsTool(BaseTool):
                 error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
                 tool_name=self.name
             )
+
+
+class GetMarketContextInput(BaseModel):
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
+    universe: str = Field("NIFTY50", description="The stock universe to evaluate breadth for (e.g. NIFTY50).")
+
+class GetMarketContextTool(BaseTool):
+    """Tool to retrieve structured market context (regimes, breadth, global cues, correlations)."""
+
+    @property
+    def name(self) -> str:
+        return "get_market_context"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve the structured market context snapshot (index regimes, market breadth, sector leaderboard, global cues, cross-market correlations, macro events, and data quality) for a given point-in-time."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetMarketContextInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetMarketContextInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "Aggregated market context snapshot."
+
+    def execute(self, as_of: Optional[str] = None, universe: str = "NIFTY50", **kwargs) -> ToolResult:
+        try:
+            from market.services.context_service import MarketContextService
+            service = MarketContextService()
+            context = service.get_market_context(as_of=as_of, universe=universe)
+            return ToolResult(
+                success=True,
+                data=context,
+                provider="MarketContextService",
+                tool_name=self.name
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetStockOpportunitiesInput(BaseModel):
+    universe: str = Field("NIFTY50", description="The stock universe to scan (e.g. NIFTY50).")
+    horizon: str = Field("DELIVERY_SWING", description="Investment horizon: 'DELIVERY_SWING', 'LONG_TERM', 'INTRADAY'.")
+    opportunity_type: Optional[str] = Field(None, description="Optional opportunity type filter (e.g. TRENDING, MOMENTUM).")
+    sector: Optional[str] = Field(None, description="Optional sector name filter.")
+    limit: int = Field(10, description="Max candidates to return.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp (e.g. '2026-08-22T00:00:00Z').")
+
+class GetStockOpportunitiesTool(BaseTool):
+    """Tool to retrieve a ranked list of candidates matching discovery opportunity filters."""
+
+    @property
+    def name(self) -> str:
+        return "get_stock_opportunities"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve ranked list of stock candidates with final scores, classifications, pros, and risks matching the given filters."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetStockOpportunitiesInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetStockOpportunitiesInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "List of discovery stock opportunities."
+
+    def execute(self, universe: str = "NIFTY50", horizon: str = "DELIVERY_SWING", opportunity_type: Optional[str] = None, sector: Optional[str] = None, limit: int = 10, as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        try:
+            from django.utils import timezone as django_timezone
+            from market.services.discovery_service import OpportunityDiscoveryService
+            from market.models import StockOpportunitySnapshot
+            
+            if horizon == "INTRADAY":
+                return ToolResult(
+                    success=True,
+                    data={"status": "NOT READY", "message": "Intraday investment horizon capability is not ready."},
+                    provider="OpportunityDiscoveryService",
+                    tool_name=self.name
+                )
+                
+            service = OpportunityDiscoveryService()
+            dt_as_of = service._parse_as_of(as_of)
+            
+            # Check if snapshots already exist in DB for this PIT
+            snapshots = list(StockOpportunitySnapshot.objects.filter(
+                as_of=dt_as_of,
+                universe=universe,
+                horizon=horizon
+            ))
+            
+            # If not, scan dynamically
+            if not snapshots:
+                snapshots = service.scan_universe(universe, horizon, dt_as_of)
+                
+            # Filter
+            if opportunity_type:
+                snapshots = [s for s in snapshots if s.opportunity_type == opportunity_type.upper()]
+            if sector:
+                snapshots = [s for s in snapshots if s.instrument.company.sector and s.instrument.company.sector.lower() == sector.lower()]
+                
+            # Sort by final score descending
+            snapshots.sort(key=lambda s: s.final_opportunity_score, reverse=True)
+            
+            data = []
+            for s in snapshots[:limit]:
+                data.append({
+                    "symbol": s.instrument.symbol,
+                    "company_name": s.instrument.company.name,
+                    "sector": s.instrument.company.sector,
+                    "opportunity_type": s.opportunity_type,
+                    "final_score": float(s.final_opportunity_score),
+                    "component_scores": s.component_scores,
+                    "data_quality": s.data_quality["status"],
+                    "reasons": s.supporting_features.get("pros", []),
+                    "risks": s.risks
+                })
+                
+            return ToolResult(
+                success=True,
+                data=data,
+                provider="OpportunityDiscoveryService",
+                tool_name=self.name
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetStockOpportunityInput(BaseModel):
+    symbol: str = Field(..., description="Stock symbol to retrieve detailed snapshot for (e.g. RELIANCE).")
+    horizon: str = Field("DELIVERY_SWING", description="Investment horizon: 'DELIVERY_SWING', 'LONG_TERM', 'INTRADAY'.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp.")
+
+class GetStockOpportunityTool(BaseTool):
+    """Tool to retrieve full opportunity details for a single specific stock."""
+
+    @property
+    def name(self) -> str:
+        return "get_stock_opportunity"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve the full point-in-time scores, features, pros, and risks for a single stock opportunity."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetStockOpportunityInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetStockOpportunityInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "Detailed stock opportunity snapshot."
+
+    def execute(self, symbol: str, horizon: str = "DELIVERY_SWING", as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        try:
+            from market.services.discovery_service import OpportunityDiscoveryService
+            from market.models import StockOpportunitySnapshot, Instrument
+            
+            if horizon == "INTRADAY":
+                return ToolResult(
+                    success=True,
+                    data={"status": "NOT READY", "message": "Intraday investment horizon capability is not ready."},
+                    provider="OpportunityDiscoveryService",
+                    tool_name=self.name
+                )
+                
+            service = OpportunityDiscoveryService()
+            dt_as_of = service._parse_as_of(as_of)
+            clean_symbol = symbol.strip().upper().split('.')[0]
+            
+            snapshot = StockOpportunitySnapshot.objects.filter(
+                instrument__symbol=clean_symbol,
+                as_of=dt_as_of,
+                horizon=horizon
+            ).first()
+            
+            if not snapshot:
+                # Run dynamic scan for the target stock's universe to find it
+                inst = Instrument.objects.filter(symbol=clean_symbol, is_active=True).first()
+                if inst:
+                    service.scan_universe("NIFTY50", horizon, dt_as_of)
+                    snapshot = StockOpportunitySnapshot.objects.filter(
+                        instrument__symbol=clean_symbol,
+                        as_of=dt_as_of,
+                        horizon=horizon
+                    ).first()
+                    
+            if not snapshot:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=ToolError(code="NOT_FOUND", message=f"No opportunity snapshot found for symbol '{clean_symbol}' at {dt_as_of.isoformat()}.", retryable=False),
+                    tool_name=self.name
+                )
+                
+            data = {
+                "symbol": snapshot.instrument.symbol,
+                "company_name": snapshot.instrument.company.name,
+                "sector": snapshot.instrument.company.sector,
+                "horizon": snapshot.horizon,
+                "opportunity_type": snapshot.opportunity_type,
+                "final_score": float(snapshot.final_opportunity_score),
+                "component_scores": snapshot.component_scores,
+                "supporting_features": snapshot.supporting_features,
+                "reasons": snapshot.supporting_features.get("pros", []),
+                "risks": snapshot.risks,
+                "data_quality": snapshot.data_quality
+            }
+            
+            return ToolResult(
+                success=True,
+                data=data,
+                provider="OpportunityDiscoveryService",
+                tool_name=self.name
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetSectorOpportunitiesInput(BaseModel):
+    sector: Optional[str] = Field(None, description="Optional sector name to filter. If not provided, returns a summary of all sectors.")
+    horizon: str = Field("DELIVERY_SWING", description="Investment horizon: 'DELIVERY_SWING', 'LONG_TERM', 'INTRADAY'.")
+    as_of: Optional[str] = Field(None, description="ISO point-in-time timestamp.")
+
+class GetSectorOpportunitiesTool(BaseTool):
+    """Tool to summarize or retrieve opportunities grouped at the sector level."""
+
+    @property
+    def name(self) -> str:
+        return "get_sector_opportunities"
+
+    @property
+    def description(self) -> str:
+        return "Retrieve sector performance rankings or lists of candidates grouped by sector."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetSectorOpportunitiesInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetSectorOpportunitiesInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "Sector level opportunity discovery information."
+
+    def execute(self, sector: Optional[str] = None, horizon: str = "DELIVERY_SWING", as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        try:
+            from market.services.discovery_service import OpportunityDiscoveryService
+            from market.models import StockOpportunitySnapshot
+            from django.db.models import Avg, Count
+            
+            if horizon == "INTRADAY":
+                return ToolResult(
+                    success=True,
+                    data={"status": "NOT READY", "message": "Intraday investment horizon capability is not ready."},
+                    provider="OpportunityDiscoveryService",
+                    tool_name=self.name
+                )
+                
+            service = OpportunityDiscoveryService()
+            dt_as_of = service._parse_as_of(as_of)
+            
+            # Retrieve snapshots
+            snapshots = list(StockOpportunitySnapshot.objects.filter(
+                as_of=dt_as_of,
+                horizon=horizon
+            ))
+            
+            if not snapshots:
+                # Trigger dynamic NIFTY50 scan
+                snapshots = service.scan_universe("NIFTY50", horizon, dt_as_of)
+                
+            if sector and sector.upper() != "ALL":
+                # Filter to sector
+                snapshots = [s for s in snapshots if s.instrument.company.sector and s.instrument.company.sector.lower() == sector.lower()]
+                data = []
+                for s in snapshots:
+                    data.append({
+                        "symbol": s.instrument.symbol,
+                        "company_name": s.instrument.company.name,
+                        "opportunity_type": s.opportunity_type,
+                        "final_score": float(s.final_opportunity_score),
+                        "component_scores": s.component_scores
+                    })
+                return ToolResult(
+                    success=True,
+                    data={"sector": sector, "opportunities": data},
+                    provider="OpportunityDiscoveryService",
+                    tool_name=self.name
+                )
+            else:
+                # Group by sector and return averages
+                sector_stats = {}
+                for s in snapshots:
+                    sec = s.instrument.company.sector or "Unknown"
+                    stats = sector_stats.setdefault(sec, {"count": 0, "sum_score": 0.0, "opportunities": []})
+                    stats["count"] += 1
+                    stats["sum_score"] += float(s.final_opportunity_score)
+                    stats["opportunities"].append({
+                        "symbol": s.instrument.symbol,
+                        "opportunity_type": s.opportunity_type,
+                        "final_score": float(s.final_opportunity_score)
+                    })
+                    
+                data = []
+                for sec, stats in sector_stats.items():
+                    data.append({
+                        "sector": sec,
+                        "average_score": round(stats["sum_score"] / stats["count"], 2),
+                        "candidate_count": stats["count"],
+                        "candidates": sorted(stats["opportunities"], key=lambda c: c["final_score"], reverse=True)[:5]
+                    })
+                    
+                data.sort(key=lambda d: d["average_score"], reverse=True)
+                return ToolResult(
+                    success=True,
+                    data=data,
+                    provider="OpportunityDiscoveryService",
+                    tool_name=self.name
+                )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 8 — Recommendation Tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GetRecommendationsInput(BaseModel):
+    horizon: Optional[str] = Field(
+        None,
+        description="Filter by investment horizon: DELIVERY_SWING or LONG_TERM. Leave blank for all."
+    )
+    signal: Optional[str] = Field(
+        None,
+        description="Filter by signal direction: BUY, SELL, NO_ACTION. Leave blank for all."
+    )
+    confidence: Optional[str] = Field(
+        None,
+        description="Filter by confidence level: LOW, MEDIUM, HIGH. Leave blank for all."
+    )
+    symbol: Optional[str] = Field(
+        None,
+        description="Filter to recommendations for a specific ticker symbol."
+    )
+    status: Optional[str] = Field(
+        "ACTIVE",
+        description="Lifecycle status filter: ACTIVE, TRIGGERED, TARGET_HIT, STOPPED, EXPIRED, INVALIDATED, CANCELLED. Defaults to ACTIVE."
+    )
+    limit: int = Field(
+        20,
+        description="Maximum number of recommendations to return. Default 20."
+    )
+
+
+class GetRecommendationsTool(BaseTool):
+    """
+    Query stored StockRecommendation records with optional filters.
+
+    IMPORTANT RULE: The LLM MUST use this tool to retrieve existing recommendations.
+    The LLM must NEVER invent, modify, or override any recommendation fields
+    (entry_price, stop_price, target_price, signal). It may only use the
+    data returned by this tool.
+    """
+
+    @property
+    def name(self) -> str:
+        return "get_recommendations"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve stored stock recommendations filtered by horizon, signal direction, "
+            "confidence, status, or ticker. Use this to answer questions about actionable "
+            "opportunities. DO NOT fabricate entry/stop/target values — always use the values "
+            "returned by this tool."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetRecommendationsInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetRecommendationsInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "List of StockRecommendation records matching the filters."
+
+    def execute(
+        self,
+        horizon: Optional[str] = None,
+        signal: Optional[str] = None,
+        confidence: Optional[str] = None,
+        symbol: Optional[str] = None,
+        status: Optional[str] = "ACTIVE",
+        limit: int = 20,
+        **kwargs
+    ) -> ToolResult:
+        try:
+            from market.models import StockRecommendation
+            qs = StockRecommendation.objects.select_related(
+                'instrument__company'
+            ).order_by('-generated_at')
+
+            if status:
+                qs = qs.filter(status=status)
+            if horizon:
+                qs = qs.filter(horizon=horizon)
+            if signal:
+                qs = qs.filter(signal=signal)
+            if confidence:
+                qs = qs.filter(confidence=confidence)
+            if symbol:
+                qs = qs.filter(instrument__symbol=symbol.upper())
+
+            records = list(qs[:limit])
+
+            data = []
+            for rec in records:
+                data.append({
+                    "id": str(rec.id),
+                    "symbol": rec.instrument.symbol,
+                    "company_name": rec.instrument.company.name if rec.instrument.company else None,
+                    "sector": rec.instrument.company.sector if rec.instrument.company else None,
+                    "horizon": rec.horizon,
+                    "signal": rec.signal,
+                    "setup_type": rec.setup_type,
+                    "confidence": rec.confidence,
+                    "status": rec.status,
+                    "as_of": rec.as_of.isoformat(),
+                    "generated_at": rec.generated_at.isoformat(),
+                    "entry_type": rec.entry_type,
+                    "entry_price": float(rec.entry_price) if rec.entry_price else None,
+                    "entry_condition": rec.entry_condition,
+                    "stop_price": float(rec.stop_price) if rec.stop_price else None,
+                    "stop_method": rec.stop_method,
+                    "target_price": float(rec.target_price) if rec.target_price else None,
+                    "target_method": rec.target_method,
+                    "risk_reward_ratio": float(rec.risk_reward_ratio) if rec.risk_reward_ratio else None,
+                    "supporting_factors_count": len(rec.supporting_factors or []),
+                    "risk_factors_count": len(rec.risk_factors or []),
+                })
+
+            return ToolResult(
+                success=True,
+                data={"count": len(data), "recommendations": data},
+                provider="RecommendationService",
+                tool_name=self.name
+            )
+
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetRecommendationInput(BaseModel):
+    recommendation_id: Optional[str] = Field(
+        None,
+        description="UUID of a specific StockRecommendation record to retrieve in full detail."
+    )
+    symbol: Optional[str] = Field(
+        None,
+        description="Ticker symbol to get the most recent recommendation for."
+    )
+    horizon: Optional[str] = Field(
+        None,
+        description="Horizon filter when using symbol lookup: DELIVERY_SWING or LONG_TERM."
+    )
+
+
+class GetRecommendationTool(BaseTool):
+    """
+    Retrieve the full detail of a single StockRecommendation record.
+
+    Use this when the user asks for a deep-dive on a specific recommendation,
+    including all confidence components, supporting factors, market context, and
+    setup conditions. The LLM must NEVER alter or restate the numeric fields.
+    """
+
+    @property
+    def name(self) -> str:
+        return "get_recommendation"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve full detail of a single recommendation by its UUID or by ticker symbol. "
+            "Returns all confidence dimensions, supporting factors, risk factors, "
+            "setup conditions, and market context used at generation time."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetRecommendationInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetRecommendationInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "Full detail of a single StockRecommendation record."
+
+    def execute(
+        self,
+        recommendation_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+        horizon: Optional[str] = None,
+        **kwargs
+    ) -> ToolResult:
+        try:
+            from market.models import StockRecommendation
+            rec = None
+
+            if recommendation_id:
+                rec = StockRecommendation.objects.select_related(
+                    'instrument__company'
+                ).filter(id=recommendation_id).first()
+            elif symbol:
+                qs = StockRecommendation.objects.filter(
+                    instrument__symbol=symbol.upper()
+                ).select_related('instrument__company').order_by('-generated_at')
+                if horizon:
+                    qs = qs.filter(horizon=horizon)
+                rec = qs.first()
+
+            if not rec:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=ToolError(
+                        code="NOT_FOUND",
+                        message="No recommendation found with the given filters.",
+                        retryable=False
+                    ),
+                    tool_name=self.name
+                )
+
+            data = {
+                "id": str(rec.id),
+                "symbol": rec.instrument.symbol,
+                "company_name": rec.instrument.company.name if rec.instrument.company else None,
+                "sector": rec.instrument.company.sector if rec.instrument.company else None,
+                "horizon": rec.horizon,
+                "signal": rec.signal,
+                "setup_type": rec.setup_type,
+                "confidence": rec.confidence,
+                "status": rec.status,
+                "status_updated_at": rec.status_updated_at.isoformat() if rec.status_updated_at else None,
+                "as_of": rec.as_of.isoformat(),
+                "generated_at": rec.generated_at.isoformat(),
+                # Entry
+                "entry_type": rec.entry_type,
+                "entry_price": float(rec.entry_price) if rec.entry_price else None,
+                "entry_condition": rec.entry_condition,
+                # Stop
+                "stop_price": float(rec.stop_price) if rec.stop_price else None,
+                "stop_method": rec.stop_method,
+                "invalidation_reason": rec.invalidation_reason,
+                # Target
+                "target_price": float(rec.target_price) if rec.target_price else None,
+                "target_method": rec.target_method,
+                # R:R
+                "risk": float(rec.risk) if rec.risk else None,
+                "reward": float(rec.reward) if rec.reward else None,
+                "risk_reward_ratio": float(rec.risk_reward_ratio) if rec.risk_reward_ratio else None,
+                # Confidence detail
+                "confidence_components": rec.confidence_components,
+                # Evidence
+                "supporting_factors": rec.supporting_factors,
+                "risk_factors": rec.risk_factors,
+                # Setup detail
+                "setup_details": rec.setup_details,
+                # Context
+                "market_context": rec.market_context,
+                "sector_context": rec.sector_context,
+                # Quality
+                "data_quality": rec.data_quality,
+                # LLM explanation (may be null if not yet generated)
+                "llm_explanation": rec.llm_explanation,
+            }
+
+            return ToolResult(
+                success=True,
+                data=data,
+                provider="RecommendationService",
+                tool_name=self.name
+            )
+
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )
+
+
+class GetActiveRecommendationsInput(BaseModel):
+    horizon: Optional[str] = Field(
+        None,
+        description="Filter by horizon: DELIVERY_SWING or LONG_TERM. Leave blank for all."
+    )
+    signal: Optional[str] = Field(
+        None,
+        description="Filter by signal: BUY, SELL. Leave blank for all."
+    )
+    limit: int = Field(30, description="Maximum records to return. Default 30.")
+
+
+class GetActiveRecommendationsTool(BaseTool):
+    """
+    Retrieve all ACTIVE StockRecommendation records, ranked by recency.
+
+    Use this to get a comprehensive view of open recommendations across the
+    portfolio universe. The LLM must use the returned data verbatim when
+    discussing entry/stop/target levels.
+    """
+
+    @property
+    def name(self) -> str:
+        return "get_active_recommendations"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get all currently ACTIVE StockRecommendations with optional filters on "
+            "horizon and signal direction. Returns a ranked list of open opportunities "
+            "with entry, stop, target and confidence."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetActiveRecommendationsInput.model_json_schema()
+
+    @property
+    def input_schema(self) -> type[BaseModel]:
+        return GetActiveRecommendationsInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def requires_approval(self) -> bool:
+        return False
+
+    @property
+    def output_description(self) -> str:
+        return "All ACTIVE recommendations matching the optional horizon/signal filters."
+
+    def execute(
+        self,
+        horizon: Optional[str] = None,
+        signal: Optional[str] = None,
+        limit: int = 30,
+        **kwargs
+    ) -> ToolResult:
+        try:
+            from market.services.recommendation_service import RecommendationService
+            svc = RecommendationService()
+            records = svc.get_active_recommendations(
+                horizon=horizon, signal=signal, limit=limit
+            )
+
+            data = []
+            for rec in records:
+                data.append({
+                    "id": str(rec.id),
+                    "symbol": rec.instrument.symbol,
+                    "company_name": rec.instrument.company.name if rec.instrument.company else None,
+                    "sector": rec.instrument.company.sector if rec.instrument.company else None,
+                    "horizon": rec.horizon,
+                    "signal": rec.signal,
+                    "setup_type": rec.setup_type,
+                    "confidence": rec.confidence,
+                    "as_of": rec.as_of.isoformat(),
+                    "entry_price": float(rec.entry_price) if rec.entry_price else None,
+                    "stop_price": float(rec.stop_price) if rec.stop_price else None,
+                    "target_price": float(rec.target_price) if rec.target_price else None,
+                    "risk_reward_ratio": float(rec.risk_reward_ratio) if rec.risk_reward_ratio else None,
+                    "supporting_factors": rec.supporting_factors,
+                    "risk_factors": rec.risk_factors,
+                })
+
+            return ToolResult(
+                success=True,
+                data={"count": len(data), "active_recommendations": data},
+                provider="RecommendationService",
+                tool_name=self.name
+            )
+
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
+                tool_name=self.name
+            )

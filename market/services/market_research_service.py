@@ -16,7 +16,15 @@ from llm.tools.implementations.market_tool import (
     GetFinancialMetricsTool,
     GetCompanyNewsTool,
     GetCompanyEventsTool,
-    GetMarketNewsTool
+    GetMarketNewsTool,
+    GetMarketContextTool,
+    GetStockOpportunitiesTool,
+    GetStockOpportunityTool,
+    GetSectorOpportunitiesTool,
+    # Module 8 — Recommendation tools
+    GetRecommendationsTool,
+    GetRecommendationTool,
+    GetActiveRecommendationsTool
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +48,14 @@ class MarketResearchService:
         self.tool_registry.register(GetCompanyNewsTool())
         self.tool_registry.register(GetCompanyEventsTool())
         self.tool_registry.register(GetMarketNewsTool())
+        self.tool_registry.register(GetMarketContextTool())
+        self.tool_registry.register(GetStockOpportunitiesTool())
+        self.tool_registry.register(GetStockOpportunityTool())
+        self.tool_registry.register(GetSectorOpportunitiesTool())
+        # Module 8 — Recommendation tools
+        self.tool_registry.register(GetRecommendationsTool())
+        self.tool_registry.register(GetRecommendationTool())
+        self.tool_registry.register(GetActiveRecommendationsTool())
         
         self.agent = MarketResearchAgent(
             provider=self.provider,

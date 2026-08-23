@@ -31,7 +31,19 @@ class MarketService:
             "HDFCBANK": {"name": "HDFC Bank Limited", "sector": "Financial Services", "industry": "Private Banking", "website": "https://www.hdfcbank.com"},
             "ICICIBANK": {"name": "ICICI Bank Limited", "sector": "Financial Services", "industry": "Private Banking", "website": "https://www.icicibank.com"},
             "SBIN": {"name": "State Bank of India", "sector": "Financial Services", "industry": "Public Banking", "website": "https://www.sbi.co.in"},
-            "BHARTIENTL": {"name": "Bharti Airtel Limited", "sector": "Telecommunications", "industry": "Telecom Services", "website": "https://www.airtel.in"}
+            "BHARTIENTL": {"name": "Bharti Airtel Limited", "sector": "Telecommunications", "industry": "Telecom Services", "website": "https://www.airtel.in"},
+            
+            # Index / Macro / Global indicators
+            "^NSEI": {"name": "Nifty 50 Index", "sector": "Index", "industry": "Index", "website": None},
+            "^NSEBANK": {"name": "Nifty Bank Index", "sector": "Index", "industry": "Index", "website": None},
+            "^GSPC": {"name": "S&P 500 Index", "sector": "Global Index", "industry": "Global Index", "website": None},
+            "^IXIC": {"name": "Nasdaq Composite Index", "sector": "Global Index", "industry": "Global Index", "website": None},
+            "^DJI": {"name": "Dow Jones Industrial Average", "sector": "Global Index", "industry": "Global Index", "website": None},
+            "^VIX": {"name": "CBOE Volatility Index", "sector": "Global Index", "industry": "Global Index", "website": None},
+            "USDINR=X": {"name": "USD/INR Exchange Rate", "sector": "Currency", "industry": "Currency", "website": None},
+            "CL=F": {"name": "Crude Oil Futures", "sector": "Commodity", "industry": "Commodity", "website": None},
+            "GC=F": {"name": "Gold Futures", "sector": "Commodity", "industry": "Commodity", "website": None},
+            "^TNX": {"name": "US 10-Year Treasury Yield", "sector": "Macro", "industry": "Interest Rate", "website": None},
         }
 
     def fetch_and_save_quote(self, symbol: str) -> MarketQuote:
@@ -70,13 +82,30 @@ class MarketService:
         )
         
         # 4. Resolve and create/update Instrument
+        if clean_symbol.startswith("^"):
+            instrument_type = "INDEX"
+            if clean_symbol in ("^NSEI", "^NSEBANK", "^CNXSC"):
+                exchange = "NSE"
+                currency = "INR"
+            else:
+                exchange = "GLOBAL"
+                currency = "USD"
+        elif "=" in clean_symbol or clean_symbol in ("CL=F", "GC=F"):
+            instrument_type = "INDEX"
+            exchange = "GLOBAL"
+            currency = "INR" if "USDINR" in clean_symbol else "USD"
+        else:
+            instrument_type = "EQUITY"
+            exchange = canonical_quote.exchange
+            currency = "INR"
+
         instrument, _ = Instrument.objects.update_or_create(
             company=company,
             symbol=clean_symbol,
-            exchange=canonical_quote.exchange,
             defaults={
-                "instrument_type": "EQUITY",
-                "currency": "INR",
+                "exchange": exchange,
+                "instrument_type": instrument_type,
+                "currency": currency,
                 "is_active": True
             }
         )
@@ -131,11 +160,27 @@ class MarketService:
         if not raw_symbol or not isinstance(raw_symbol, str):
             raise ValueError("Invalid symbol in historical metadata.")
         clean_symbol = raw_symbol.split('.')[0].strip()
-        if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-]+$", clean_symbol):
+        if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-\^=]+$", clean_symbol):
             raise ValueError(f"Invalid symbol characters: '{clean_symbol}'")
             
-        raw_exchange = meta.get("fullExchangeName", "NSE")
-        exchange = "NSE" if "NSE" in raw_exchange or "NSI" in raw_exchange else "BSE"
+        # Determine exchange, instrument type and currency
+        if clean_symbol.startswith("^"):
+            instrument_type = "INDEX"
+            if clean_symbol in ("^NSEI", "^NSEBANK", "^CNXSC"):
+                exchange = "NSE"
+                currency = "INR"
+            else:
+                exchange = "GLOBAL"
+                currency = "USD"
+        elif "=" in clean_symbol or clean_symbol in ("CL=F", "GC=F"):
+            instrument_type = "INDEX"
+            exchange = "GLOBAL"
+            currency = "INR" if "USDINR" in clean_symbol else "USD"
+        else:
+            instrument_type = "EQUITY"
+            currency = "INR"
+            raw_exchange = meta.get("fullExchangeName", "NSE")
+            exchange = "NSE" if "NSE" in raw_exchange or "NSI" in raw_exchange else "BSE"
 
         # 3. Resolve Company and Instrument
         comp_meta = self._company_metadata.get(clean_symbol, {
@@ -157,10 +202,10 @@ class MarketService:
         instrument, _ = Instrument.objects.update_or_create(
             company=company,
             symbol=clean_symbol,
-            exchange=exchange,
             defaults={
-                "instrument_type": "EQUITY",
-                "currency": "INR",
+                "exchange": exchange,
+                "instrument_type": instrument_type,
+                "currency": currency,
                 "is_active": True
             }
         )

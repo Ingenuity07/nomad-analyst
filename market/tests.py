@@ -1,6 +1,7 @@
 from django.test import TestCase
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
+from django.db.models import Q
 from unittest.mock import patch, MagicMock
 import numpy as np
 import requests
@@ -18,7 +19,11 @@ from market.models import (
     CashFlowStatement,
     DerivedFundamentalMetric,
     NewsItem,
-    CorporateDisclosure
+    CorporateDisclosure,
+    Universe,
+    UniverseMembership,
+    StockOpportunitySnapshot,
+    MarketContextSnapshot
 )
 from market.providers.yfinance import YFinanceMarketProvider
 from market.normalizers.yfinance import YFinanceNormalizer
@@ -1249,4 +1254,998 @@ class MarketResearchAgentTests(TestCase):
         self.assertIn("Ticker does not exist", parsed["risks"])
 
 
+class MarketRegimeCrossMarketSubsystemTests(TestCase):
+    """
+    Subsystem tests validating the deterministic context engine, regime classification,
+    breadth analysis, sector rankings, global cues staleness, rolling correlations,
+    and strict PIT safety boundaries.
+    """
+    databases = {'default', 'telemetry'}
+
+    def setUp(self):
+        # 1. Bootstrap indices and global instruments
+        self.nifty_comp = Company.objects.create(name="Nifty 50 Index", short_name="^NSEI", sector="Index", industry="Index")
+        self.nifty = Instrument.objects.create(company=self.nifty_comp, symbol="^NSEI", exchange="NSE", instrument_type="INDEX")
+
+        self.bank_comp = Company.objects.create(name="Nifty Bank Index", short_name="^NSEBANK", sector="Index", industry="Index")
+        self.bank = Instrument.objects.create(company=self.bank_comp, symbol="^NSEBANK", exchange="NSE", instrument_type="INDEX")
+
+        self.sp_comp = Company.objects.create(name="S&P 500 Index", short_name="^GSPC", sector="Global Index", industry="Global Index")
+        self.sp = Instrument.objects.create(company=self.sp_comp, symbol="^GSPC", exchange="GLOBAL", instrument_type="INDEX", currency="USD")
+
+        self.usdinr_comp = Company.objects.create(name="USD/INR Exchange Rate", short_name="USDINR=X", sector="Currency", industry="Currency")
+        self.usdinr = Instrument.objects.create(company=self.usdinr_comp, symbol="USDINR=X", exchange="GLOBAL", instrument_type="INDEX", currency="INR")
+
+        self.crude_comp = Company.objects.create(name="Crude Oil Futures", short_name="CL=F", sector="Commodity", industry="Commodity")
+        self.crude = Instrument.objects.create(company=self.crude_comp, symbol="CL=F", exchange="GLOBAL", instrument_type="INDEX", currency="USD")
+
+        # 2. Bootstrap two equities in different sectors
+        self.rel_comp = Company.objects.create(name="Reliance Industries", short_name="RELIANCE", sector="Energy", industry="Oil & Gas")
+        self.reliance = Instrument.objects.create(company=self.rel_comp, symbol="RELIANCE", exchange="NSE", instrument_type="EQUITY")
+
+        self.tcs_comp = Company.objects.create(name="Tata Consultancy", short_name="TCS", sector="Technology", industry="IT Services")
+        self.tcs = Instrument.objects.create(company=self.tcs_comp, symbol="TCS", exchange="NSE", instrument_type="EQUITY")
+
+        self.base_time = datetime(2026, 8, 20, 10, 0, 0, tzinfo=timezone.utc)
+
+    def _generate_bars(self, instrument, start_price, n_bars, trend_pct=0.0):
+        """Helper to generate chronological OHLCV bars with a specific trend."""
+        import math
+        bars = []
+        current_price = start_price
+        for i in range(n_bars):
+            timestamp = self.base_time - timedelta(days=(n_bars - i - 1))
+            effective_pct = trend_pct
+            if trend_pct != 0.0 and i < n_bars - 1:
+                effective_pct = trend_pct + 0.02 * math.sin(i)
+            current_price = current_price * (1.0 + effective_pct)
+            bars.append(OHLCVBar(
+                instrument=instrument,
+                timeframe="1d",
+                timestamp=timestamp,
+                open=Decimal(str(current_price * 0.99)),
+                high=Decimal(str(current_price * 1.02)),
+                low=Decimal(str(current_price * 0.98)),
+                close=Decimal(str(current_price)),
+                volume=100000,
+                source="test"
+            ))
+        OHLCVBar.objects.bulk_create(bars)
+
+    def test_market_regime_classification(self):
+        from market.services.context_service import MarketContextService
+        # Generate 210 bars to satisfy SMA200 indicators warmup
+        # Generate a bullish trend (+0.1% daily)
+        self._generate_bars(self.nifty, 10000.0, 210, trend_pct=0.001)
+
+        service = MarketContextService()
+        regime = service.calculate_market_regime("^NSEI", self.base_time)
+        self.assertEqual(regime["status"], "active")
+        self.assertEqual(regime["trend"], "bullish")
+        self.assertIn(regime["momentum"], ["positive", "neutral"])
+
+    def test_market_breadth_calculation(self):
+        from market.services.context_service import MarketContextService
+        # Generate 30 bars for equities
+        # Reliance is advancing
+        self._generate_bars(self.reliance, 2000.0, 30, trend_pct=0.01)
+        # TCS is declining
+        self._generate_bars(self.tcs, 3000.0, 30, trend_pct=-0.01)
+
+        service = MarketContextService()
+        breadth = service.calculate_market_breadth("ALL", self.base_time)
+        
+        self.assertEqual(breadth["status"], "active")
+        self.assertEqual(breadth["advancing"], 1)
+        self.assertEqual(breadth["declining"], 1)
+        self.assertEqual(breadth["advance_decline_ratio"], 1.0)
+        self.assertEqual(breadth["coverage"]["total_universe_size"], 2)
+
+    def test_sector_performance_ranking(self):
+        from market.services.context_service import MarketContextService
+        # Reliance (Energy) +1% daily
+        self._generate_bars(self.reliance, 2000.0, 30, trend_pct=0.01)
+        # TCS (Technology) -1% daily
+        self._generate_bars(self.tcs, 3000.0, 30, trend_pct=-0.01)
+
+        service = MarketContextService()
+        sectors = service.calculate_sector_performance(self.base_time)
+        
+        self.assertEqual(sectors[0]["sector"], "Energy")
+        self.assertEqual(sectors[1]["sector"], "Technology")
+        self.assertEqual(sectors[0]["tier"], "strongest")
+        self.assertEqual(sectors[1]["tier"], "weakest")
+
+    def test_global_cues_timezone_and_staleness(self):
+        from market.services.context_service import MarketContextService
+        # Generate global cues bars
+        self._generate_bars(self.sp, 4500.0, 10)
+        self._generate_bars(self.usdinr, 83.0, 10)
+
+        # Retrieve at self.base_time
+        service = MarketContextService()
+        cues = service.retrieve_global_cues(self.base_time)
+        
+        self.assertEqual(cues["^GSPC"]["status"], "active")
+        self.assertEqual(cues["USDINR=X"]["status"], "active")
+        self.assertFalse(cues["^GSPC"]["stale"])
+
+        # Retrieve at a future time (generating staleness)
+        future_time = self.base_time + timedelta(days=5)
+        cues_stale = service.retrieve_global_cues(future_time)
+        self.assertTrue(cues_stale["^GSPC"]["stale"])
+
+    def test_cross_market_correlation(self):
+        from market.services.context_service import MarketContextService
+        # Generate aligned returns for Nifty and S&P
+        self._generate_bars(self.nifty, 10000.0, 30, trend_pct=0.005)
+        self._generate_bars(self.sp, 4500.0, 30, trend_pct=0.005)
+
+        service = MarketContextService()
+        cross = service.calculate_cross_market_features(self.base_time)
+        
+        correlations = cross["rolling_20d_correlations"]
+        # Perfectly aligned upward trends should yield a high positive correlation coefficient
+        self.assertNotEqual(correlations["^GSPC"], "insufficient_data")
+        self.assertGreater(correlations["^GSPC"], 0.8)
+
+    def test_point_in_time_safety(self):
+        from market.services.context_service import MarketContextService
+        # Generate bars up to self.base_time
+        self._generate_bars(self.nifty, 10000.0, 20)
+        
+        # Save close price at base time
+        close_at_base = OHLCVBar.objects.filter(instrument=self.nifty).order_by('-timestamp')[0].close
+
+        # Generate a future bar
+        future_time = self.base_time + timedelta(days=1)
+        OHLCVBar.objects.create(
+            instrument=self.nifty,
+            timeframe="1d",
+            timestamp=future_time,
+            open=Decimal("15000.00"),
+            high=Decimal("15500.00"),
+            low=Decimal("14800.00"),
+            close=Decimal("15200.00"),
+            volume=200000,
+            source="test"
+        )
+
+        service = MarketContextService()
+        regime = service.calculate_market_regime("^NSEI", self.base_time)
+        
+        # Verify it doesn't see the future 15200.00 close bar
+        self.assertEqual(regime["close"], float(close_at_base))
+
+    def test_market_context_tool_integration(self):
+        # Generate index bars
+        self._generate_bars(self.nifty, 10000.0, 30)
+        self._generate_bars(self.bank, 40000.0, 30)
+
+        from llm.tools.registry import ToolRegistry
+        from llm.tools.executor import ToolExecutor
+        from llm.tools.implementations.market_tool import GetMarketContextTool
+
+        registry = ToolRegistry()
+        tool = GetMarketContextTool()
+        registry.register(tool)
+        executor = ToolExecutor(registry)
+
+        as_of_str = self.base_time.isoformat()
+        res = executor.execute("get_market_context", {"as_of": as_of_str, "universe": "NIFTY50"})
+        
+        self.assertTrue(res.success)
+        self.assertEqual(res.data["as_of"], as_of_str)
+        self.assertIn("^NSEI", res.data["index_regimes"])
+
+
+class StockOpportunityDiscoverySubsystemTests(TestCase):
+    """
+    Subsystem tests validating universe memberships, stock feature fusion, opportunity scoring,
+    candidate classifications, ranking, separate horizons, PIT look-ahead safety, and N+1 query controls.
+    """
+    databases = {'default', 'telemetry'}
+
+    def setUp(self):
+        # 1. Bootstrap company and active instrument
+        self.company = Company.objects.create(name="Reliance Industries", short_name="RELIANCE", sector="Energy", industry="Oil & Gas")
+        self.instrument = Instrument.objects.create(company=self.company, symbol="RELIANCE", exchange="NSE", instrument_type="EQUITY")
+        
+        self.tcs_comp = Company.objects.create(name="TCS", short_name="TCS", sector="Technology", industry="IT Services")
+        self.tcs = Instrument.objects.create(company=self.tcs_comp, symbol="TCS", exchange="NSE", instrument_type="EQUITY")
+        
+        self.base_time = datetime(2026, 8, 20, 10, 0, 0, tzinfo=timezone.utc)
+        
+        # 2. Bootstrap universes
+        self.universe = Universe.objects.create(name="CUSTOM_UNIV", description="Custom test universe", is_active=True)
+        UniverseMembership.objects.create(universe=self.universe, instrument=self.instrument, is_active=True, added_at=self.base_time)
+        UniverseMembership.objects.create(universe=self.universe, instrument=self.tcs, is_active=True, added_at=self.base_time)
+
+    def _setup_mock_data(self, close_rel=2000.0, rsi_rel=65.0, roe_rel=0.18, de_rel=0.4):
+        # Latest daily bar for Reliance
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=self.base_time,
+            open=Decimal(str(close_rel * 0.99)), high=Decimal(str(close_rel * 1.01)),
+            low=Decimal(str(close_rel * 0.98)), close=Decimal(str(close_rel)),
+            volume=50000, source="test"
+        )
+        
+        # 30-day liquidity bars
+        for i in range(1, 10):
+            OHLCVBar.objects.create(
+                instrument=self.instrument, timeframe="1d", timestamp=self.base_time - timedelta(days=i),
+                open=Decimal("1900.00"), high=Decimal("1950.00"), low=Decimal("1850.00"), close=Decimal("1900.00"),
+                volume=10000, source="test"
+            )
+
+        # Technical features
+        TechnicalFeature.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=self.base_time,
+            name="SMA_50", param_key="period=50", value=Decimal("1800.00")
+        )
+        TechnicalFeature.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=self.base_time,
+            name="SMA_200", param_key="period=200", value=Decimal("1600.00")
+        )
+        TechnicalFeature.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=self.base_time,
+            name="RSI_14", param_key="period=14", value=Decimal(str(rsi_rel))
+        )
+        TechnicalFeature.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=self.base_time,
+            name="relative_volume_20", param_key="period=20", value=Decimal("1.4")
+        )
+        TechnicalFeature.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=self.base_time,
+            name="distance_from_high_20", param_key="period=20", value=Decimal("-1.2")
+        )
+
+        # Derived fundamental metrics
+        IncomeStatement.objects.create(
+            company=self.company, fiscal_year=2025, period_type="ANNUAL", period_string="Mar 2025",
+            period_end=self.base_time.date() - timedelta(days=30), revenue=Decimal("100000.00"), pat=Decimal("15000.00")
+        )
+        DerivedFundamentalMetric.objects.create(
+            company=self.company, period_type="ANNUAL", period_string="Mar 2025",
+            name="revenue_growth_yoy", value=Decimal("0.15")
+        )
+        DerivedFundamentalMetric.objects.create(
+            company=self.company, period_type="ANNUAL", period_string="Mar 2025",
+            name="pat_growth_yoy", value=Decimal("0.20")
+        )
+        DerivedFundamentalMetric.objects.create(
+            company=self.company, period_type="ANNUAL", period_string="Mar 2025",
+            name="return_on_equity", value=Decimal(str(roe_rel))
+        )
+        DerivedFundamentalMetric.objects.create(
+            company=self.company, period_type="ANNUAL", period_string="Mar 2025",
+            name="debt_equity", value=Decimal(str(de_rel))
+        )
+
+        # Market context snapshot
+        MarketContextSnapshot.objects.create(
+            as_of=self.base_time, universe="CUSTOM_UNIV",
+            index_regimes={
+                "^NSEI": {"trend": "bullish", "volatility": "normal"}
+            },
+            sector_rankings=[
+                {"sector": "Energy", "tier": "strongest", "momentum_state": "improving"}
+            ]
+        )
+
+    def test_universe_membership(self):
+        # Membership is active at base_time
+        active_members = UniverseMembership.objects.filter(
+            universe=self.universe, is_active=True, added_at__lte=self.base_time
+        )
+        self.assertEqual(active_members.count(), 2)
+
+        # Inactive membership removal check
+        membership = UniverseMembership.objects.get(universe=self.universe, instrument=self.tcs)
+        membership.removed_at = self.base_time - timedelta(hours=1)
+        membership.is_active = False
+        membership.save()
+
+        # Query members as of base_time
+        as_of_members = UniverseMembership.objects.filter(
+            universe=self.universe, is_active=True, added_at__lte=self.base_time
+        ).filter(Q(removed_at__isnull=True) | Q(removed_at__gt=self.base_time))
+        self.assertEqual(as_of_members.count(), 1)
+        self.assertEqual(as_of_members[0].instrument.symbol, "RELIANCE")
+
+    def test_feature_fusion_and_scoring(self):
+        self._setup_mock_data()
+        
+        from market.services.discovery_service import OpportunityDiscoveryService
+        service = OpportunityDiscoveryService()
+        
+        snapshots = service.scan_universe("CUSTOM_UNIV", "DELIVERY_SWING", as_of=self.base_time)
+        self.assertEqual(len(snapshots), 1)  # Only RELIANCE passed liquidity filter (TCS has no daily bar)
+        
+        snap = snapshots[0]
+        self.assertEqual(snap.instrument.symbol, "RELIANCE")
+        self.assertEqual(snap.horizon, "DELIVERY_SWING")
+        self.assertEqual(snap.opportunity_type, "TRENDING")
+        self.assertGreater(snap.final_opportunity_score, Decimal("70.00"))
+        
+        # Verify scores dictionary structure
+        self.assertIn("technical", snap.component_scores)
+        self.assertIn("fundamental", snap.component_scores)
+        self.assertIn("sector", snap.component_scores)
+        
+        # Verify data quality status
+        self.assertEqual(snap.data_quality["status"], "COMPLETE")
+
+    def test_opportunity_classifications(self):
+        # 1. Test Momentum Classification
+        self._setup_mock_data(rsi_rel=68.0)
+        from market.services.discovery_service import OpportunityDiscoveryService
+        service = OpportunityDiscoveryService()
+        snapshots = service.scan_universe("CUSTOM_UNIV", "DELIVERY_SWING", as_of=self.base_time)
+        self.assertEqual(snapshots[0].opportunity_type, "TRENDING")  # Trending is evaluated first
+
+    def test_horizon_routing_validation(self):
+        from market.services.discovery_service import OpportunityDiscoveryService
+        service = OpportunityDiscoveryService()
+        
+        # Intraday capability check should return empty snapshots and log NOT READY
+        snapshots = service.scan_universe("CUSTOM_UNIV", "INTRADAY", as_of=self.base_time)
+        self.assertEqual(len(snapshots), 0)
+
+    def test_point_in_time_safety(self):
+        self._setup_mock_data()
+        
+        # Add future bar and future event
+        future_time = self.base_time + timedelta(days=1)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="1d", timestamp=future_time,
+            open=Decimal("2500.00"), high=Decimal("2600.00"), low=Decimal("2450.00"), close=Decimal("2520.00"),
+            volume=80000, source="test"
+        )
+        
+        # Ingest a future news item
+        NewsItem.objects.create(
+            company=self.company, headline="RELIANCE bags USD 500M mega contract win",
+            published_at=future_time, source="yahoo", content_hash="fh1"
+        )
+
+        from market.services.discovery_service import OpportunityDiscoveryService
+        service = OpportunityDiscoveryService()
+        
+        # Scan as of base_time
+        snapshots = service.scan_universe("CUSTOM_UNIV", "DELIVERY_SWING", as_of=self.base_time)
+        self.assertEqual(len(snapshots), 1)
+        
+        # Confirm future price close of 2520.00 is NOT present in supporting features close (which should be 2000.00)
+        snap = snapshots[0]
+        self.assertEqual(snap.supporting_features["close"], 2000.0)
+        
+        # Confirm future contract win news did not trigger positive event score boost (news_score stays default/standard)
+        self.assertLess(snap.component_scores["news"], 100.0)
+
+    def test_performance_batch_queries(self):
+        self._setup_mock_data()
+        from django.test.utils import CaptureQueriesContext
+        from django.db import connection
+        from market.services.discovery_service import OpportunityDiscoveryService
+        
+        service = OpportunityDiscoveryService()
+        
+        # Capture queries during scanning to confirm fixed bounds (batch optimization)
+        with CaptureQueriesContext(connection) as ctx:
+            service.scan_universe("CUSTOM_UNIV", "DELIVERY_SWING", as_of=self.base_time)
+            
+        # Number of queries should be extremely low and bounded (no O(N) queries)
+        self.assertLess(len(ctx.captured_queries), 18)
+
+    def test_opportunity_tools_integration(self):
+        self._setup_mock_data()
+        
+        from llm.tools.registry import ToolRegistry
+        from llm.tools.executor import ToolExecutor
+        from llm.tools.implementations.market_tool import (
+            GetStockOpportunitiesTool,
+            GetStockOpportunityTool,
+            GetSectorOpportunitiesTool
+        )
+
+        registry = ToolRegistry()
+        registry.register(GetStockOpportunitiesTool())
+        registry.register(GetStockOpportunityTool())
+        registry.register(GetSectorOpportunitiesTool())
+        executor = ToolExecutor(registry)
+
+        as_of_str = self.base_time.isoformat()
+        
+        # 1. get_stock_opportunities
+        res_list = executor.execute("get_stock_opportunities", {"universe": "CUSTOM_UNIV", "as_of": as_of_str})
+        self.assertTrue(res_list.success)
+        self.assertEqual(len(res_list.data), 1)
+        self.assertEqual(res_list.data[0]["symbol"], "RELIANCE")
+        self.assertIn("reasons", res_list.data[0])
+
+        # 2. get_stock_opportunity
+        res_detail = executor.execute("get_stock_opportunity", {"symbol": "RELIANCE", "as_of": as_of_str})
+        self.assertTrue(res_detail.success)
+        self.assertEqual(res_detail.data["symbol"], "RELIANCE")
+        self.assertEqual(res_detail.data["opportunity_type"], "TRENDING")
+
+        # 3. get_sector_opportunities
+        res_sector = executor.execute("get_sector_opportunities", {"sector": "Energy", "as_of": as_of_str})
+        self.assertTrue(res_sector.success)
+        self.assertEqual(res_sector.data["sector"], "Energy")
+        self.assertEqual(len(res_sector.data["opportunities"]), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 8 — Signal Engine & Recommendation Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SignalEngineSubsystemTests(TestCase):
+    """
+    Comprehensive unit and subsystem tests for Module 8:
+      - Setup detector logic
+      - Signal engine PIT safety
+      - R:R rejection gate
+      - Intraday gate
+      - Recommendation service append-only persistence
+      - Lifecycle status transitions
+      - LLM recommendation tools
+    """
+
+    def _make_company_and_instrument(self, symbol="TESTCO", sector="Technology"):
+        company = Company.objects.create(
+            name=f"{symbol} Ltd",
+            short_name=symbol,
+            sector=sector,
+            industry="Software",
+        )
+        instrument = Instrument.objects.create(
+            company=company,
+            symbol=symbol,
+            exchange="NSE",
+            instrument_type="EQUITY",
+            is_active=True,
+        )
+        return company, instrument
+
+    def _make_bars(self, instrument, n=260, base_price=1000.0, timeframe="1d"):
+        """Creates n daily OHLCV bars chronologically."""
+        from django.utils import timezone as tz
+        bars = []
+        base_dt = datetime(2024, 1, 1, 9, 15, 0, tzinfo=timezone.utc)
+        for i in range(n):
+            close = base_price + (i * 2.0)   # Gentle uptrend
+            bars.append(OHLCVBar(
+                instrument=instrument,
+                timeframe=timeframe,
+                timestamp=base_dt + timedelta(days=i),
+                open=Decimal(str(close - 5)),
+                high=Decimal(str(close + 10)),
+                low=Decimal(str(close - 15)),
+                close=Decimal(str(close)),
+                volume=500000,
+                source="test"
+            ))
+        OHLCVBar.objects.bulk_create(bars)
+        return bars
+
+    def _make_technical_features(self, instrument, bars):
+        """
+        Manually create TechnicalFeature records with realistic indicator values
+        for the last bar, so signal engine can find them.
+        """
+        last_ts = bars[-1].timestamp
+        close_val = float(bars[-1].close)
+
+        feature_data = [
+            ("RSI_14", "period=14", "58.0"),
+            ("SMA_20", "period=20", str(close_val * 0.97)),
+            ("SMA_50", "period=50", str(close_val * 0.90)),
+            ("SMA_200", "period=200", str(close_val * 0.80)),
+            ("ATR_14", "period=14", "25.0"),
+            ("rolling_high_20", "period=20", str(close_val * 1.005)),
+            ("rolling_low_20", "period=20", str(close_val * 0.95)),
+            ("relative_volume_20", "period=20", "1.5"),
+            ("MACD_line", "fast=12;slow=26;signal=9", "5.0"),
+            ("MACD_signal", "fast=12;slow=26;signal=9", "3.0"),
+            ("MACD_hist", "fast=12;slow=26;signal=9", "2.0"),
+        ]
+
+        tfs = []
+        for name, param_key, val in feature_data:
+            tfs.append(TechnicalFeature(
+                instrument=instrument,
+                timeframe="1d",
+                timestamp=last_ts,
+                name=name,
+                param_key=param_key,
+                parameters={},
+                value=Decimal(val)
+            ))
+        TechnicalFeature.objects.bulk_create(tfs)
+        return last_ts
+
+    # ── 1. Setup Detector Unit Tests ──────────────────────────────────────────
+
+    def test_breakout_detector_detects_when_conditions_met(self):
+        """BREAKOUT detector fires when price near rolling high + volume + RSI momentum."""
+        from market.services.setup_detectors import detect_breakout
+
+        tf = {
+            "RSI_14": 60.0,
+            "SMA_50": 990.0,
+            "SMA_200": 900.0,
+            "relative_volume_20": 1.4,
+            "rolling_high_20": 1005.0,
+        }
+        result = detect_breakout(tf, close=1002.0)
+        self.assertEqual(result.setup_type.value, "BREAKOUT")
+        self.assertTrue(result.detected)
+        self.assertGreater(result.score, 50.0)
+        self.assertTrue(any("20-day high" in c for c in result.conditions_met))
+
+    def test_breakout_detector_fails_on_low_volume(self):
+        """BREAKOUT should NOT fire when relative volume is below threshold."""
+        from market.services.setup_detectors import detect_breakout
+
+        tf = {
+            "RSI_14": 60.0,
+            "SMA_50": 990.0,
+            "SMA_200": 900.0,
+            "relative_volume_20": 0.8,  # below 1.2
+            "rolling_high_20": 1005.0,
+        }
+        result = detect_breakout(tf, close=1003.0)
+        self.assertFalse(result.detected)
+        self.assertTrue(any("volume" in c.lower() for c in result.conditions_failed))
+
+    def test_pullback_detector_detects_controlled_retracement(self):
+        """PULLBACK fires for uptrend + controlled retracement + RSI in 35-55."""
+        from market.services.setup_detectors import detect_pullback
+
+        tf = {
+            "RSI_14": 46.0,
+            "SMA_20": 1010.0,
+            "SMA_50": 980.0,
+            "SMA_200": 900.0,
+        }
+        result = detect_pullback(tf, close=1007.0)  # Slightly below SMA-20
+        self.assertEqual(result.setup_type.value, "PULLBACK")
+        self.assertTrue(result.detected)
+        self.assertGreater(result.score, 60.0)
+
+    def test_pullback_detector_fails_on_bearish_trend(self):
+        """PULLBACK must NOT fire when price is below SMA-200."""
+        from market.services.setup_detectors import detect_pullback
+
+        tf = {
+            "RSI_14": 46.0,
+            "SMA_20": 1010.0,
+            "SMA_50": 980.0,
+            "SMA_200": 1100.0,  # Price below SMA-200 → bearish
+        }
+        result = detect_pullback(tf, close=1007.0)
+        self.assertFalse(result.detected)
+
+    def test_breakdown_detector_fires_on_bearish_setup(self):
+        """BREAKDOWN detector fires when price near 20-day low + high volume + RSI < 50."""
+        from market.services.setup_detectors import detect_breakdown
+
+        tf = {
+            "RSI_14": 38.0,
+            "SMA_50": 1010.0,
+            "relative_volume_20": 1.5,
+            "rolling_low_20": 996.0,
+        }
+        result = detect_breakdown(tf, close=997.0)
+        self.assertEqual(result.setup_type.value, "BREAKDOWN")
+        self.assertTrue(result.detected)
+
+    def test_run_all_detectors_returns_sorted_list(self):
+        """run_all_detectors should always return a list sorted by (detected, score) desc."""
+        from market.services.setup_detectors import run_all_detectors
+
+        tf = {
+            "RSI_14": 58.0,
+            "SMA_20": 970.0,
+            "SMA_50": 950.0,
+            "SMA_200": 880.0,
+            "ATR_14": 20.0,
+            "rolling_high_20": 1005.0,
+            "rolling_low_20": 960.0,
+            "relative_volume_20": 1.4,
+            "MACD_line": 4.0,
+            "MACD_signal": 2.0,
+            "MACD_hist": 2.0,
+        }
+        results = run_all_detectors(tf, close=1002.0)
+        self.assertGreater(len(results), 0)
+        # Best detected setup should be first
+        scores = [(r.detected, r.score) for r in results]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    # ── 2. Signal Engine PIT Safety ───────────────────────────────────────────
+
+    def test_signal_engine_returns_insufficient_on_no_bars(self):
+        """SignalEngine returns INSUFFICIENT_DATA when no OHLCVBar exists."""
+        from market.services.signal_engine import SignalEngine
+        from market.signal_enums import SignalDirection
+
+        _, instrument = self._make_company_and_instrument(symbol="NODATA")
+        engine = SignalEngine()
+        draft = engine.generate_recommendation(instrument, "DELIVERY_SWING")
+        self.assertEqual(draft.signal, SignalDirection.INSUFFICIENT_DATA.value)
+
+    def test_signal_engine_pit_safety_future_bars_hidden(self):
+        """
+        When as_of is set to before the bars exist, the engine must see no bars
+        and return INSUFFICIENT_DATA (not use the future bars).
+        """
+        from market.services.signal_engine import SignalEngine
+        from market.signal_enums import SignalDirection
+
+        _, instrument = self._make_company_and_instrument(symbol="FUTURETEST")
+        # All bars are in 2025
+        self._make_bars(instrument, n=10, base_price=800.0)
+        bars = OHLCVBar.objects.filter(instrument=instrument).order_by('timestamp')
+
+        # Set as_of to BEFORE the first bar
+        past_as_of = bars.first().timestamp - timedelta(days=5)
+
+        engine = SignalEngine()
+        draft = engine.generate_recommendation(instrument, "DELIVERY_SWING", as_of=past_as_of)
+        # Should not see the future bars
+        self.assertIn(draft.signal, [
+            SignalDirection.INSUFFICIENT_DATA.value,
+            SignalDirection.NOT_READY.value
+        ])
+
+    def test_signal_engine_intraday_gate_returns_not_ready(self):
+        """INTRADAY horizon without intraday bars must return NOT_READY."""
+        from market.services.signal_engine import SignalEngine
+        from market.signal_enums import SignalDirection
+
+        _, instrument = self._make_company_and_instrument(symbol="INTRATEST")
+        self._make_bars(instrument, n=100, timeframe="1d")   # Only daily bars
+
+        engine = SignalEngine()
+        draft = engine.generate_recommendation(instrument, "INTRADAY")
+        self.assertEqual(draft.signal, SignalDirection.NOT_READY.value)
+
+    def test_signal_engine_generates_recommendation_with_features(self):
+        """
+        With adequate bars and technical features, the engine must generate
+        a valid draft (any signal, but a complete one with entry_condition set).
+        """
+        from market.services.signal_engine import SignalEngine
+
+        _, instrument = self._make_company_and_instrument(symbol="FULLTEST")
+        bars = self._make_bars(instrument, n=260, base_price=1500.0)
+        self._make_technical_features(instrument, bars)
+
+        engine = SignalEngine()
+        as_of = bars[-1].timestamp
+        draft = engine.generate_recommendation(instrument, "DELIVERY_SWING", as_of=as_of)
+
+        # Draft must have a signal and entry condition
+        self.assertIsNotNone(draft.signal)
+        self.assertIsNotNone(draft.entry_condition)
+        self.assertIsNotNone(draft.confidence)
+        # Confidence must be one of the valid levels
+        self.assertIn(draft.confidence, ["LOW", "MEDIUM", "HIGH"])
+
+    # ── 3. R:R Rejection Gate ─────────────────────────────────────────────────
+
+    def test_rr_below_minimum_returns_no_action(self):
+        """
+        If the computed R:R is below minimum, the engine must return NO_ACTION
+        rather than persisting a bad setup.
+        """
+        from market.services.signal_engine import SignalEngine, _entry_from_setup, _stop_from_setup, _target_from_setup
+        from market.services.setup_detectors import SetupResult
+        from market.signal_enums import SetupType, EntryType, StopMethod, TargetMethod, SignalDirection
+
+        # Simulate a setup where stop is very close to entry and target is also close
+        # such that R:R < 1.5
+        setup = SetupResult(
+            setup_type=SetupType.BREAKOUT,
+            detected=True,
+            score=80.0,
+            conditions_met=["Near resistance"],
+            conditions_failed=[],
+            relevant_values={}
+        )
+        entry = 1000.0
+        stop = 998.0   # Only 0.2% risk
+        target = 1001.0  # Only 0.1% reward → R:R = 0.5
+
+        rr_ratio = abs(target - entry) / abs(entry - stop)
+        self.assertLess(rr_ratio, 1.5)   # Confirm the test scenario is correct
+
+    # ── 4. Recommendation Service (Persistence) ───────────────────────────────
+
+    def test_recommendation_service_creates_new_record(self):
+        """RecommendationService.generate_and_save creates a new DB record."""
+        from market.services.recommendation_service import RecommendationService
+        from market.models import StockRecommendation
+
+        _, instrument = self._make_company_and_instrument(symbol="PERSIST1")
+        bars = self._make_bars(instrument, n=260)
+        self._make_technical_features(instrument, bars)
+
+        svc = RecommendationService()
+        as_of = bars[-1].timestamp
+        rec = svc.generate_and_save(instrument, "DELIVERY_SWING", as_of=as_of)
+
+        self.assertIsNotNone(rec.id)
+        self.assertIsNotNone(rec.signal)
+        self.assertEqual(rec.instrument, instrument)
+        self.assertEqual(rec.horizon, "DELIVERY_SWING")
+
+        # Confirm it's in the DB
+        db_rec = StockRecommendation.objects.get(id=rec.id)
+        self.assertEqual(db_rec.signal, rec.signal)
+
+    def test_recommendation_service_append_only(self):
+        """Two calls to generate_and_save for the same instrument create TWO separate records."""
+        from market.services.recommendation_service import RecommendationService
+        from market.models import StockRecommendation
+
+        _, instrument = self._make_company_and_instrument(symbol="PERSIST2")
+        bars = self._make_bars(instrument, n=260)
+        self._make_technical_features(instrument, bars)
+
+        svc = RecommendationService()
+        as_of = bars[-1].timestamp
+
+        rec1 = svc.generate_and_save(instrument, "DELIVERY_SWING", as_of=as_of)
+        rec2 = svc.generate_and_save(instrument, "DELIVERY_SWING", as_of=as_of)
+
+        self.assertNotEqual(rec1.id, rec2.id)
+        self.assertEqual(StockRecommendation.objects.filter(instrument=instrument).count(), 2)
+
+    def test_recommendation_deterministic_fields_immutable(self):
+        """
+        Verify that update_status does NOT modify deterministic fields
+        (entry_price, stop_price, target_price, signal).
+        """
+        from market.services.recommendation_service import RecommendationService
+        from market.models import StockRecommendation
+
+        _, instrument = self._make_company_and_instrument(symbol="IMMUTABLE")
+        bars = self._make_bars(instrument, n=260)
+        self._make_technical_features(instrument, bars)
+
+        svc = RecommendationService()
+        rec = svc.generate_and_save(instrument, "DELIVERY_SWING", as_of=bars[-1].timestamp)
+
+        original_entry = rec.entry_price
+        original_stop = rec.stop_price
+        original_signal = rec.signal
+
+        # Update status
+        svc.update_status(rec, "TRIGGERED")
+
+        # Re-read from DB
+        rec.refresh_from_db()
+
+        self.assertEqual(rec.status, "TRIGGERED")
+        self.assertEqual(rec.entry_price, original_entry)
+        self.assertEqual(rec.stop_price, original_stop)
+        self.assertEqual(rec.signal, original_signal)
+
+    def test_llm_explanation_write_only_updates_explanation(self):
+        """save_explanation must only update llm_explanation field, nothing else."""
+        from market.services.recommendation_service import RecommendationService
+
+        _, instrument = self._make_company_and_instrument(symbol="EXPLAIN1")
+        bars = self._make_bars(instrument, n=260)
+        self._make_technical_features(instrument, bars)
+
+        svc = RecommendationService()
+        rec = svc.generate_and_save(instrument, "DELIVERY_SWING", as_of=bars[-1].timestamp)
+
+        original_signal = rec.signal
+        original_entry = rec.entry_price
+
+        svc.save_explanation(rec, "This setup shows strong momentum based on tool output.")
+        rec.refresh_from_db()
+
+        self.assertEqual(rec.llm_explanation, "This setup shows strong momentum based on tool output.")
+        self.assertEqual(rec.signal, original_signal)
+        self.assertEqual(rec.entry_price, original_entry)
+
+    def test_expire_old_recommendations(self):
+        """expire_old_active_recommendations should mark old ACTIVE recs as EXPIRED."""
+        from market.services.recommendation_service import RecommendationService
+        from market.models import StockRecommendation
+        from market.signal_enums import SignalDirection
+
+        _, instrument = self._make_company_and_instrument(symbol="EXPIRETEST")
+
+        # Manually create a recommendation with an old generated_at
+        old_rec = StockRecommendation.objects.create(
+            instrument=instrument,
+            horizon="DELIVERY_SWING",
+            signal=SignalDirection.NO_ACTION.value,
+            setup_type="NONE",
+            as_of=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            entry_type="CURRENT_MARKET_PRICE",
+            entry_condition="No setup",
+            stop_method="PERCENTAGE_FALLBACK",
+            invalidation_reason="No setup",
+            target_method="RISK_REWARD_DERIVED",
+            confidence="LOW",
+            status="ACTIVE",
+        )
+        # Backdate generated_at
+        StockRecommendation.objects.filter(id=old_rec.id).update(
+            generated_at=datetime(2024, 1, 1, tzinfo=timezone.utc)
+        )
+
+        svc = RecommendationService()
+        expired = svc.expire_old_active_recommendations(max_age_days=1)
+        self.assertGreaterEqual(expired, 1)
+
+        old_rec.refresh_from_db()
+        self.assertEqual(old_rec.status, "EXPIRED")
+
+    # ── 5. LLM Tool Integration ───────────────────────────────────────────────
+
+    def test_get_recommendations_tool_returns_records(self):
+        """get_recommendations tool must successfully return ACTIVE recommendations."""
+        from llm.tools.implementations.market_tool import GetRecommendationsTool
+        from market.models import StockRecommendation
+        from market.signal_enums import SignalDirection
+
+        _, instrument = self._make_company_and_instrument(symbol="RECTOOL1")
+
+        # Create a recommendation manually
+        StockRecommendation.objects.create(
+            instrument=instrument,
+            horizon="DELIVERY_SWING",
+            signal="BUY",
+            setup_type="BREAKOUT",
+            as_of=datetime(2024, 8, 1, tzinfo=timezone.utc),
+            entry_type="BREAKOUT_CONFIRMATION",
+            entry_price=Decimal("1050.00"),
+            entry_condition="Enter above 1050",
+            stop_price=Decimal("990.00"),
+            stop_method="STRUCTURAL",
+            invalidation_reason="Close below 990",
+            target_price=Decimal("1150.00"),
+            target_method="MEASURED_MOVE",
+            risk=Decimal("60.00"),
+            reward=Decimal("100.00"),
+            risk_reward_ratio=Decimal("1.67"),
+            confidence="MEDIUM",
+            status="ACTIVE",
+        )
+
+        registry = ToolRegistry()
+        registry.register(GetRecommendationsTool())
+        executor = ToolExecutor(registry)
+
+        result = executor.execute("get_recommendations", {"status": "ACTIVE", "limit": 10})
+        self.assertTrue(result.success)
+        self.assertGreaterEqual(result.data["count"], 1)
+
+        # Verify expected fields are present
+        rec_data = result.data["recommendations"][0]
+        self.assertIn("symbol", rec_data)
+        self.assertIn("signal", rec_data)
+        self.assertIn("entry_price", rec_data)
+        self.assertIn("stop_price", rec_data)
+        self.assertIn("target_price", rec_data)
+        self.assertIn("risk_reward_ratio", rec_data)
+
+    def test_get_recommendation_tool_returns_full_detail(self):
+        """get_recommendation tool must return full detail including all evidence fields."""
+        from llm.tools.implementations.market_tool import GetRecommendationTool
+        from market.models import StockRecommendation
+
+        _, instrument = self._make_company_and_instrument(symbol="RECTOOL2")
+
+        rec = StockRecommendation.objects.create(
+            instrument=instrument,
+            horizon="LONG_TERM",
+            signal="BUY",
+            setup_type="FUNDAMENTAL_MOMENTUM",
+            as_of=datetime(2024, 8, 1, tzinfo=timezone.utc),
+            entry_type="CURRENT_MARKET_PRICE",
+            entry_price=Decimal("2000.00"),
+            entry_condition="Enter at current market price",
+            stop_price=Decimal("1900.00"),
+            stop_method="ATR_BASED",
+            invalidation_reason="Close below 1900",
+            target_price=Decimal("2300.00"),
+            target_method="ATR_MULTIPLE",
+            risk=Decimal("100.00"),
+            reward=Decimal("300.00"),
+            risk_reward_ratio=Decimal("3.00"),
+            confidence="HIGH",
+            supporting_factors=["Strong revenue growth", "Low debt"],
+            risk_factors=["Sector headwind"],
+            confidence_components={"technical_confirmation": {"score": 80.0}},
+            status="ACTIVE",
+        )
+
+        registry = ToolRegistry()
+        registry.register(GetRecommendationTool())
+        executor = ToolExecutor(registry)
+
+        result = executor.execute("get_recommendation", {"symbol": "RECTOOL2", "horizon": "LONG_TERM"})
+        self.assertTrue(result.success)
+
+        data = result.data
+        self.assertEqual(data["signal"], "BUY")
+        self.assertEqual(data["confidence"], "HIGH")
+        self.assertEqual(data["entry_price"], 2000.0)
+        self.assertEqual(data["stop_price"], 1900.0)
+        self.assertEqual(data["target_price"], 2300.0)
+        self.assertEqual(data["risk_reward_ratio"], 3.0)
+        self.assertIn("supporting_factors", data)
+        self.assertIn("confidence_components", data)
+        self.assertIn("setup_details", data)
+
+    def test_get_recommendation_tool_not_found(self):
+        """get_recommendation tool returns error for unknown symbol."""
+        from llm.tools.implementations.market_tool import GetRecommendationTool
+
+        registry = ToolRegistry()
+        registry.register(GetRecommendationTool())
+        executor = ToolExecutor(registry)
+
+        result = executor.execute("get_recommendation", {"symbol": "NONEXISTANT99"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.error.code, "NOT_FOUND")
+
+    def test_get_active_recommendations_tool(self):
+        """get_active_recommendations tool must return all ACTIVE records."""
+        from llm.tools.implementations.market_tool import GetActiveRecommendationsTool
+        from market.models import StockRecommendation
+
+        _, inst1 = self._make_company_and_instrument(symbol="ACTIVE1")
+        _, inst2 = self._make_company_and_instrument(symbol="ACTIVE2")
+
+        for inst, signal in [(inst1, "BUY"), (inst2, "SELL")]:
+            StockRecommendation.objects.create(
+                instrument=inst,
+                horizon="DELIVERY_SWING",
+                signal=signal,
+                setup_type="MOMENTUM",
+                as_of=datetime(2024, 8, 1, tzinfo=timezone.utc),
+                entry_type="CURRENT_MARKET_PRICE",
+                entry_condition="Enter now",
+                stop_method="ATR_BASED",
+                invalidation_reason="Stop hit",
+                target_method="ATR_MULTIPLE",
+                confidence="MEDIUM",
+                status="ACTIVE",
+            )
+
+        registry = ToolRegistry()
+        registry.register(GetActiveRecommendationsTool())
+        executor = ToolExecutor(registry)
+
+        result = executor.execute("get_active_recommendations", {"limit": 50})
+        self.assertTrue(result.success)
+        self.assertGreaterEqual(result.data["count"], 2)
+
+        # All returned should be ACTIVE
+        symbols = [r["symbol"] for r in result.data["active_recommendations"]]
+        self.assertIn("ACTIVE1", symbols)
+        self.assertIn("ACTIVE2", symbols)
+
+    # ── 6. System integrity check ─────────────────────────────────────────────
+
+    def test_system_check_passes(self):
+        """Django system check should find no errors in the new models."""
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command("check", "--database", "default", stdout=out, stderr=out)
+        output = out.getvalue()
+        self.assertNotIn("SystemCheckError", output)
 

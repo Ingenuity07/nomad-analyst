@@ -28,11 +28,11 @@ class YFinanceMarketProvider(MarketDataProvider):
     def get_quote(self, symbol: str) -> Dict[str, Any]:
         upper_symbol = symbol.strip().upper()
         
-        # Suffix handling: if symbol doesn't specify exchange suffix, default to .NS (NSE)
-        if not (upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO")):
-            yfinance_symbol = f"{upper_symbol}.NS"
-        else:
+        # Suffix handling: if symbol starts with ^, contains =, or has exchange suffix, use as-is
+        if upper_symbol.startswith("^") or "=" in upper_symbol or upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO"):
             yfinance_symbol = upper_symbol
+        else:
+            yfinance_symbol = f"{upper_symbol}.NS"
 
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol}?interval=1d&range=1d"
         headers = {
@@ -91,11 +91,11 @@ class YFinanceMarketProvider(MarketDataProvider):
     def get_historical_ohlcv(self, symbol: str, timeframe: str = "1d", start_date: datetime = None, end_date: datetime = None) -> Dict[str, Any]:
         upper_symbol = symbol.strip().upper()
         
-        # Suffix handling
-        if not (upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO")):
-            yfinance_symbol = f"{upper_symbol}.NS"
-        else:
+        # Suffix handling: if symbol starts with ^, contains =, or has exchange suffix, use as-is
+        if upper_symbol.startswith("^") or "=" in upper_symbol or upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO"):
             yfinance_symbol = upper_symbol
+        else:
+            yfinance_symbol = f"{upper_symbol}.NS"
 
         # Timeframe mapping
         timeframe_lookup = {
