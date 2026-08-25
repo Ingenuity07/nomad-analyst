@@ -1510,3 +1510,216 @@ class GetActiveRecommendationsTool(BaseTool):
                 error=ToolError(code="EXECUTION_ERROR", message=str(e), retryable=False),
                 tool_name=self.name
             )
+
+
+
+
+# ── Module 9: Intraday Data Tools ────────────────────────────────────────────
+
+
+class GetIntradayOHLCVInput(BaseModel):
+    symbol: str = Field(..., description="Stock ticker symbol (e.g. RELIANCE, TCS).")
+    timeframe: str = Field(default="5m", description="Intraday timeframe: '5m', '15m', or '1h'.")
+    limit: int = Field(default=50, description="Maximum number of bars to return (max 200).")
+    as_of: Optional[str] = Field(default=None, description="ISO 8601 UTC datetime for PIT query.")
+
+
+class GetIntradayOHLCVTool(BaseTool):
+    """Retrieve stored intraday OHLCV bars for a symbol at a given timeframe."""
+
+    @property
+    def name(self) -> str:
+        return "get_intraday_ohlcv"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve stored intraday OHLCV bars (open, high, low, close, volume) "
+            "for a stock symbol at a given timeframe (5m, 15m, 1h). "
+            "Returns only bars already in the database — does NOT fetch live data."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetIntradayOHLCVInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetIntradayOHLCVInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(self, symbol: str, timeframe: str = "5m", limit: int = 50,
+                as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        from market.models import Instrument, OHLCVBar
+        limit = min(limit, 200)
+        symbol_upper = symbol.strip().upper()
+        try:
+            instrument = Instrument.objects.get(symbol=symbol_upper)
+        except Instrument.DoesNotExist:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="SYMBOL_NOT_FOUND",
+                                message=f"Instrument '{symbol_upper}' not found.", retryable=False),
+                tool_name=self.name
+            )
+        as_of_dt = None
+        if as_of:
+            try:
+                as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        qs = OHLCVBar.objects.filter(instrument=instrument, timeframe=timeframe)
+        if as_of_dt:
+            qs = qs.filter(timestamp__lte=as_of_dt)
+        bars = list(qs.order_by("-timestamp")[:limit])
+        bars.reverse()
+        return ToolResult(
+            success=True,
+            data={
+                "symbol": symbol_upper, "timeframe": timeframe, "bar_count": len(bars),
+                "bars": [{"timestamp": b.timestamp.isoformat(), "open": float(b.open),
+                          "high": float(b.high), "low": float(b.low), "close": float(b.close),
+                          "volume": b.volume} for b in bars]
+            },
+            tool_name=self.name
+        )
+
+
+class GetIntradayDataQualityInput(BaseModel):
+    symbol: str = Field(..., description="Stock ticker symbol (e.g. RELIANCE, TCS).")
+    timeframe: str = Field(default="5m", description="Intraday timeframe: '5m', '15m', or '1h'.")
+    as_of: Optional[str] = Field(default=None, description="ISO 8601 UTC datetime for PIT assessment.")
+
+
+class GetIntradayDataQualityTool(BaseTool):
+    """Check intraday data quality (HEALTHY/STALE/INCOMPLETE/UNAVAILABLE) for a symbol."""
+
+    @property
+    def name(self) -> str:
+        return "get_intraday_data_quality"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Check the intraday data quality and freshness for a stock symbol at "
+            "a given timeframe. Returns status, lag in seconds, completeness %, and data gap count."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetIntradayDataQualityInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetIntradayDataQualityInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(self, symbol: str, timeframe: str = "5m", as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        from market.models import Instrument
+        from market.services.intraday_quality import get_data_quality
+        symbol_upper = symbol.strip().upper()
+        try:
+            instrument = Instrument.objects.get(symbol=symbol_upper)
+        except Instrument.DoesNotExist:
+            return ToolResult(success=False, data=None,
+                              error=ToolError(code="SYMBOL_NOT_FOUND",
+                                             message=f"Instrument '{symbol_upper}' not found.", retryable=False),
+                              tool_name=self.name)
+        as_of_dt = None
+        if as_of:
+            try:
+                as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        quality = get_data_quality(instrument, timeframe, as_of_dt)
+        return ToolResult(success=True,
+                          data={"symbol": symbol_upper, "timeframe": timeframe, **quality.as_dict()},
+                          tool_name=self.name)
+
+
+class GetIntradayFeaturesInput(BaseModel):
+    symbol: str = Field(..., description="Stock ticker symbol (e.g. RELIANCE, TCS).")
+    timeframe: str = Field(default="5m", description="Intraday timeframe: '5m', '15m', or '1h'.")
+    as_of: Optional[str] = Field(default=None, description="ISO 8601 UTC datetime for PIT feature query.")
+
+
+class GetIntradayFeaturesTool(BaseTool):
+    """Retrieve latest technical features (RSI, SMA, MACD, ATR etc.) for an intraday timeframe."""
+
+    @property
+    def name(self) -> str:
+        return "get_intraday_features"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve the latest calculated technical features (RSI, SMA, MACD, ATR, etc.) "
+            "for a stock symbol at an intraday timeframe (5m, 15m, 1h). "
+            "Returns the most recent feature snapshot from the database."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetIntradayFeaturesInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetIntradayFeaturesInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(self, symbol: str, timeframe: str = "5m", as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        from market.models import Instrument, TechnicalFeature
+        from django.db.models import Max
+        symbol_upper = symbol.strip().upper()
+        try:
+            instrument = Instrument.objects.get(symbol=symbol_upper)
+        except Instrument.DoesNotExist:
+            return ToolResult(success=False, data=None,
+                              error=ToolError(code="SYMBOL_NOT_FOUND",
+                                             message=f"Instrument '{symbol_upper}' not found.", retryable=False),
+                              tool_name=self.name)
+        as_of_dt = None
+        if as_of:
+            try:
+                as_of_dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        qs = TechnicalFeature.objects.filter(instrument=instrument, timeframe=timeframe)
+        if as_of_dt:
+            qs = qs.filter(timestamp__lte=as_of_dt)
+        latest_row = qs.order_by("instrument").values("instrument").annotate(max_ts=Max("timestamp")).first()
+        if not latest_row:
+            return ToolResult(success=True,
+                              data={"symbol": symbol_upper, "timeframe": timeframe,
+                                    "features": {}, "timestamp": None,
+                                    "note": "No intraday features found. Run feature calculation first."},
+                              tool_name=self.name)
+        features_qs = TechnicalFeature.objects.filter(
+            instrument=instrument, timeframe=timeframe, timestamp=latest_row["max_ts"]
+        )
+        feature_map = {f.name: float(f.value) if f.value is not None else None for f in features_qs}
+        return ToolResult(success=True,
+                          data={"symbol": symbol_upper, "timeframe": timeframe,
+                                "timestamp": latest_row["max_ts"].isoformat(), "features": feature_map},
+                          tool_name=self.name)

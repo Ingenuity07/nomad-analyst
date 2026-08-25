@@ -473,20 +473,24 @@ class SignalEngine:
         dt_as_of = _parse_as_of(as_of)
         horizon_enum = SignalHorizon(horizon)
 
-        # ── Intraday gate ─────────────────────────────────────────────────────
+        # ── Intraday gate (Module 9) ──────────────────────────────────────────
+        # The gate is now delegated to IntradayReadinessService, which checks:
+        #   1. Supported timeframe
+        #   2. Minimum bar count (per timeframe)
+        #   3. Data quality (HEALTHY or INCOMPLETE — not STALE/UNAVAILABLE)
+        #   4. Critical data gaps within tolerance
+        #   5. Technical features exist for the timeframe
+        # The default timeframe for intraday signals is 5m.
         if horizon_enum == SignalHorizon.INTRADAY:
-            # Check if intraday bars exist at all
-            has_intraday = OHLCVBar.objects.filter(
-                instrument=instrument,
-                timeframe__in=list(_INTRADAY_TIMEFRAMES),
-                timestamp__lte=dt_as_of
-            ).exists()
-
-            if not has_intraday:
+            from market.services.intraday_readiness import IntradayReadinessService
+            intraday_timeframe = "5m"   # Default intraday resolution
+            readiness = IntradayReadinessService().check_readiness(
+                instrument, intraday_timeframe, as_of=dt_as_of
+            )
+            if not readiness.is_ready:
                 return self._not_ready_draft(
                     instrument, horizon, dt_as_of,
-                    "INTRADAY: No intraday timeframe data available. "
-                    "Daily candles MUST NOT be used for intraday signals."
+                    f"INTRADAY NOT_READY [{intraday_timeframe}]: {readiness.reason}"
                 )
 
         # ── Load technical features (PIT-safe) ───────────────────────────────

@@ -169,3 +169,126 @@ def run_daily_recommendation_scan():
         logger.warning(f"Could not expire stale recommendations: {e}")
 
     return {"status": "Complete", "universes_scanned": scanned}
+
+
+@shared_task
+def run_intraday_incremental_update():
+    """
+    Celery task — runs every 5 minutes during NSE market hours.
+
+    Fetches the most recent 5m bars for all EQUITY instruments in active
+    universes. Skips run entirely if the market is currently closed.
+
+    Design rules:
+      - Idempotent: safe to call multiple times; no duplicate candles created.
+      - Market-hours-only: does NOT fetch outside NSE session.
+      - Rate-limit aware: 1.5s delay between instruments.
+      - Bounded: fetches only the last INCREMENTAL_LOOKBACK_DAYS window.
+    """
+    from datetime import datetime, timezone
+    from market.models import Universe, UniverseMembership, Instrument
+    from market.services.market_session import IndianMarketSession
+    from market.services.intraday_service import IntradayMarketDataService
+    import time as _time
+
+    now_utc = datetime.now(timezone.utc)
+    session = IndianMarketSession()
+
+    if not session.is_market_open(now_utc):
+        logger.info(
+            "run_intraday_incremental_update: market is closed. Skipping."
+        )
+        return {"status": "SKIPPED", "reason": "market_closed", "at": now_utc.isoformat()}
+
+    logger.info("run_intraday_incremental_update: market is open — starting incremental fetch.")
+
+    # Collect all active equity instruments from active universes
+    active_symbols: set[str] = set()
+    for univ in Universe.objects.filter(is_active=True):
+        members = UniverseMembership.objects.filter(
+            universe=univ, is_active=True
+        ).select_related("instrument")
+        for m in members:
+            if m.instrument.instrument_type == "EQUITY" and m.instrument.is_active:
+                active_symbols.add(m.instrument.symbol)
+
+    if not active_symbols:
+        logger.warning("run_intraday_incremental_update: no active equity instruments found.")
+        return {"status": "NO_INSTRUMENTS"}
+
+    intraday_svc = IntradayMarketDataService()
+    results = {"success": 0, "failed": 0, "new_bars": 0}
+
+    for symbol in sorted(active_symbols):
+        try:
+            result = intraday_svc.incremental_update(symbol, "5m")
+            results["new_bars"] += result.get("new_bars", 0)
+            results["success"] += 1
+        except Exception as e:
+            logger.error(
+                f"run_intraday_incremental_update: failed for {symbol}: {e}"
+            )
+            results["failed"] += 1
+        _time.sleep(1.5)
+
+    logger.info(
+        f"run_intraday_incremental_update: complete. "
+        f"success={results['success']}, failed={results['failed']}, "
+        f"new_bars={results['new_bars']}"
+    )
+    return {"status": "Complete", **results}
+
+
+@shared_task
+def run_intraday_backfill_task(symbol: str = None, timeframe: str = "5m", days_back: int = 30):
+    """
+    On-demand intraday historical backfill task.
+
+    Can be called for a specific symbol or for all active equity instruments
+    in active universes.
+
+    Parameters:
+      symbol    — if provided, backfill only this symbol; else backfill all active equities.
+      timeframe — one of '5m', '15m', '1h' (default '5m').
+      days_back — number of calendar days to backfill (provider limits apply).
+
+    This task is NOT scheduled automatically. It is triggered manually:
+      celery.send_task('market.tasks.run_intraday_backfill_task',
+                       kwargs={'symbol': 'RELIANCE', 'timeframe': '5m', 'days_back': 30})
+    """
+    from market.models import Universe, UniverseMembership
+    from market.services.intraday_service import IntradayMarketDataService
+    import time as _time
+
+    svc = IntradayMarketDataService()
+
+    if symbol:
+        symbols = [symbol.strip().upper()]
+    else:
+        active_symbols: set[str] = set()
+        for univ in Universe.objects.filter(is_active=True):
+            for m in UniverseMembership.objects.filter(
+                universe=univ, is_active=True
+            ).select_related("instrument"):
+                if m.instrument.instrument_type == "EQUITY" and m.instrument.is_active:
+                    active_symbols.add(m.instrument.symbol)
+        symbols = sorted(active_symbols)
+
+    logger.info(
+        f"run_intraday_backfill_task: backfilling {len(symbols)} symbol(s) "
+        f"[{timeframe}, {days_back}d]"
+    )
+
+    results = {"success": 0, "failed": 0, "total_new_bars": 0}
+    for sym in symbols:
+        try:
+            result = svc.backfill(sym, timeframe, days_back)
+            results["success"] += 1
+            results["total_new_bars"] += result.get("new_bars_ingested", 0)
+        except Exception as e:
+            logger.error(f"run_intraday_backfill_task: failed for {sym}: {e}")
+            results["failed"] += 1
+        _time.sleep(2.0)
+
+    logger.info(f"run_intraday_backfill_task: done. {results}")
+    return {"status": "Complete", **results}

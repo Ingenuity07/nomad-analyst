@@ -24,7 +24,11 @@ from llm.tools.implementations.market_tool import (
     # Module 8 — Recommendation tools
     GetRecommendationsTool,
     GetRecommendationTool,
-    GetActiveRecommendationsTool
+    GetActiveRecommendationsTool,
+    # Module 9 — Intraday data tools
+    GetIntradayOHLCVTool,
+    GetIntradayDataQualityTool,
+    GetIntradayFeaturesTool,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,10 @@ class MarketResearchService:
         self.tool_registry.register(GetRecommendationsTool())
         self.tool_registry.register(GetRecommendationTool())
         self.tool_registry.register(GetActiveRecommendationsTool())
+        # Module 9 — Intraday data tools
+        self.tool_registry.register(GetIntradayOHLCVTool())
+        self.tool_registry.register(GetIntradayDataQualityTool())
+        self.tool_registry.register(GetIntradayFeaturesTool())
         
         self.agent = MarketResearchAgent(
             provider=self.provider,
