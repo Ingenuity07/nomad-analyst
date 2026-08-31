@@ -576,11 +576,60 @@ class StockRecommendation(models.Model):
 
     calculation_version = models.IntegerField(default=1)
 
+    # ── Intraday-specific fields (Module 10) ──────────────────────────────────
+    # null=True, blank=True on all — zero impact on existing daily records.
+
+    # Which timeframe generated this recommendation (e.g. '5m', '15m', '1d')
+    timeframe = models.CharField(
+        max_length=10, null=True, blank=True,
+        help_text="Generating timeframe. Null for daily/delivery recommendations."
+    )
+
+    # Second target for intraday partial exits
+    target_2_price = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="Optional second target for intraday partial exit."
+    )
+    target_2_method = models.CharField(
+        max_length=25, null=True, blank=True,
+        help_text="Method used to derive target 2."
+    )
+
+    # Intraday session window at generation time
+    SESSION_WINDOW_CHOICES = (
+        ('OPENING',   'Opening (09:15-09:45)'),
+        ('MORNING',   'Morning (09:45-11:30)'),
+        ('MIDDAY',    'Midday (11:30-13:00)'),
+        ('AFTERNOON', 'Afternoon (13:00-14:30)'),
+        ('CLOSING',   'Closing (14:30-15:30)'),
+        ('OUTSIDE',   'Outside Session'),
+    )
+    session_window = models.CharField(
+        max_length=15, null=True, blank=True, choices=SESSION_WINDOW_CHOICES,
+        help_text="Session window at the time of recommendation generation."
+    )
+
+    # Strategy configuration version (for backtesting traceability)
+    strategy_version = models.CharField(
+        max_length=20, null=True, blank=True,
+        help_text="Intraday strategy config version that generated this recommendation."
+    )
+
+    # Explicit session-close expiry for intraday recommendations
+    expires_at = models.DateTimeField(
+        null=True, blank=True, db_index=True,
+        help_text="UTC datetime when this intraday recommendation expires (market close). "
+                  "Null for non-intraday recommendations."
+    )
+
     class Meta:
         indexes = [
             models.Index(fields=['instrument', 'as_of']),
             models.Index(fields=['horizon', 'signal', 'status']),
             models.Index(fields=['as_of', 'status']),
+            # Intraday lifecycle — efficient expiry batch queries
+            models.Index(fields=['instrument', 'horizon', 'status', 'expires_at'],
+                         name='rec_intraday_lifecycle_idx'),
         ]
         ordering = ['-generated_at']
         verbose_name_plural = "Stock Recommendations"
@@ -590,5 +639,3 @@ class StockRecommendation(models.Model):
             f"{self.instrument.symbol} [{self.horizon}] "
             f"{self.signal} ({self.confidence}) @ {self.as_of.date()}"
         )
-
-

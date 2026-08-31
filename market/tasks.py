@@ -292,3 +292,97 @@ def run_intraday_backfill_task(symbol: str = None, timeframe: str = "5m", days_b
 
     logger.info(f"run_intraday_backfill_task: done. {results}")
     return {"status": "Complete", **results}
+
+
+# ─── Module 10: Intraday Strategy Tasks ──────────────────────────────────────
+
+@shared_task
+def run_intraday_strategy_scan():
+    """
+    Module 10 — Intraday strategy signal scan.
+
+    Runs every 5 minutes during market hours (gated by IndianMarketSession).
+    For each active EQUITY instrument, calls IntradaySignalEngine to generate
+    an intraday recommendation draft. If signal is BUY or SELL, persists it
+    via RecommendationService.
+
+    Self-gates on market hours — safe to schedule unconditionally.
+    """
+    import time as _time
+    from django.utils import timezone
+    from market.services.market_session import IndianMarketSession
+    from market.services.intraday_signal_engine import IntradaySignalEngine
+    from market.services.recommendation_service import RecommendationService
+    from market.signal_enums import SignalDirection
+    from market.models import Instrument
+    from market.intraday_strategy_config import DEFAULT_INTRADAY_TIMEFRAME
+
+    if not IndianMarketSession.is_market_open():
+        logger.info("run_intraday_strategy_scan: market is closed. Skipping.")
+        return {"status": "SKIPPED", "reason": "market_closed"}
+
+    engine = IntradaySignalEngine()
+    svc = RecommendationService()
+    now = timezone.now()
+    timeframe = DEFAULT_INTRADAY_TIMEFRAME
+
+    instruments = list(
+        Instrument.objects.filter(is_active=True, instrument_type="EQUITY")
+        .select_related("company")[:200]
+    )
+
+    if not instruments:
+        logger.warning("run_intraday_strategy_scan: no active equity instruments found.")
+        return {"status": "NO_INSTRUMENTS"}
+
+    results = {"total": len(instruments), "actionable": 0, "skipped": 0, "failed": 0}
+
+    for inst in instruments:
+        try:
+            draft = engine.generate_recommendation(inst, timeframe=timeframe, as_of=now)
+
+            if draft.signal in (SignalDirection.BUY.value, SignalDirection.SELL.value):
+                # Persist actionable recommendation
+                rec = svc.generate_and_save(inst, draft.horizon, as_of=now)
+                # Apply intraday extras if present
+                extras = getattr(draft, "_intraday_extras", {})
+                if extras and rec:
+                    from market.models import StockRecommendation
+                    StockRecommendation.objects.filter(pk=rec.pk).update(
+                        timeframe=extras.get("timeframe"),
+                        target_2_price=extras.get("target_2_price"),
+                        target_2_method=extras.get("target_2_method"),
+                        session_window=extras.get("session_window"),
+                        strategy_version=extras.get("strategy_version"),
+                        expires_at=extras.get("expires_at"),
+                    )
+                results["actionable"] += 1
+            else:
+                results["skipped"] += 1
+
+        except Exception as e:
+            logger.error(f"run_intraday_strategy_scan: failed for {inst.symbol}: {e}")
+            results["failed"] += 1
+
+        _time.sleep(0.1)  # light throttle to avoid burst
+
+    logger.info(f"run_intraday_strategy_scan: complete. {results}")
+    return {"status": "Complete", **results}
+
+
+@shared_task
+def expire_intraday_session_recommendations():
+    """
+    Module 10 — Expire stale intraday recommendations at/after market close.
+
+    Should run at 15:35 IST daily (after market close at 15:30).
+    Marks all ACTIVE intraday recommendations whose expires_at <= now as EXPIRED.
+    No records are deleted — historical trail is preserved.
+    """
+    from django.utils import timezone
+    from market.services.intraday_lifecycle import expire_intraday_session_recommendations as _expire
+
+    now = timezone.now()
+    expired = _expire(now)
+    logger.info(f"expire_intraday_session_recommendations: marked {expired} recs as EXPIRED.")
+    return {"status": "Complete", "expired_count": expired}

@@ -52,6 +52,16 @@ class SetupType(str, Enum):
     MEAN_REVERSION = "MEAN_REVERSION"
     NONE = "NONE"
 
+    # ── Intraday-only setups (Module 10) ──────────────────────────────────────
+    # These MUST NOT be run against daily candles or used in daily detectors.
+    OPENING_RANGE_BREAKOUT = "OPENING_RANGE_BREAKOUT"
+    OPENING_RANGE_BREAKDOWN = "OPENING_RANGE_BREAKDOWN"
+    INTRADAY_MOMENTUM_CONTINUATION = "INTRADAY_MOMENTUM_CONTINUATION"
+    INTRADAY_PULLBACK = "INTRADAY_PULLBACK"
+    VWAP_RECLAIM = "VWAP_RECLAIM"
+    VWAP_REJECTION = "VWAP_REJECTION"
+    INTRADAY_RANGE_BREAKOUT = "INTRADAY_RANGE_BREAKOUT"
+
 
 class ConfidenceLevel(str, Enum):
     """

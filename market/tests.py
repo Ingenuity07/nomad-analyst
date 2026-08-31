@@ -2998,3 +2998,725 @@ class IntradayInfrastructureTests(TestCase):
         self.assertEqual(result["reason"], "market_closed")
 
 
+# ─── Module 10: Intraday Strategy Engine Tests ───────────────────────────────
+
+
+class IntradayStrategyEngineTests(TestCase):
+    """
+    Tests for Module 10: Intraday Signal & Strategy Engine.
+
+    Coverage:
+      1. Session window classification
+      2. VWAP computation
+      3. Opening range framework
+      4. Intraday detectors (7 detectors)
+      5. No-trade conditions
+      6. Cooldown gate
+      7. Lifecycle / session expiry
+      8. Daily recommendation regression (unchanged)
+      9. PIT safety for intraday bars
+    """
+
+    def _make_bar(self, symbol="TEST", timeframe="5m", timestamp=None, close=100.0,
+                  high=None, low=None, open_=None, volume=10000):
+        """Helper: create an OHLCVBar for testing."""
+        from market.models import OHLCVBar, Instrument, Company
+        company, _ = Company.objects.get_or_create(name="Test Co", defaults={"sector": "Technology"})
+        inst, _ = Instrument.objects.get_or_create(
+            symbol=symbol,
+            defaults={"company": company, "instrument_type": "EQUITY", "exchange": "NSE"}
+        )
+        if timestamp is None:
+            from market.services.market_session import IndianMarketSession
+            from market.services.market_session import IST
+            from datetime import date as _date
+            today = _date.today()
+            timestamp = datetime(today.year, today.month, today.day, 9, 30, tzinfo=IST).astimezone(timezone.utc)
+        bar = OHLCVBar.objects.create(
+            instrument=inst,
+            timeframe=timeframe,
+            timestamp=timestamp,
+            open=open_ or close * 0.998,
+            high=high or close * 1.002,
+            low=low or close * 0.997,
+            close=close,
+            volume=volume,
+        )
+        return inst, bar
+
+    def _make_bar_series(self, symbol="SERIES", n=50, base_close=500.0, timeframe="5m",
+                         session_date=None, start_hour=9, start_min=15):
+        """Helper: create a series of n bars with 5-minute spacing."""
+        from market.services.market_session import IndianMarketSession
+        from market.services.market_session import IST
+        from datetime import date as _date
+
+        if session_date is None:
+            session_date = _date.today()
+
+        bars = []
+        inst = None
+        for i in range(n):
+            total_minutes = start_hour * 60 + start_min + i * 5
+            h, m = divmod(total_minutes, 60)
+            ts = datetime(session_date.year, session_date.month, session_date.day, h, m, tzinfo=IST)
+            ts_utc = ts.astimezone(timezone.utc)
+            close = base_close + i * 0.1
+            inst, bar = self._make_bar(
+                symbol=symbol, timeframe=timeframe,
+                timestamp=ts_utc, close=close,
+                high=close * 1.003, low=close * 0.997,
+                volume=15000 + i * 100,
+            )
+            bars.append(bar)
+        return inst, bars
+
+    # ── 1. Session Window Classification ──────────────────────────────────────
+
+    def test_session_classify_opening_window(self):
+        """09:20 IST → OPENING window."""
+        from market.services.intraday_session import classify_session
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+        # Use a known weekday (Monday=0 ... Sunday=6)
+        from datetime import date
+        # Pick a Monday if today is a weekend
+        dt = datetime(today.year, today.month, today.day, 9, 20, tzinfo=IST)
+        with patch("market.services.intraday_session.IndianMarketSession.is_trading_day", return_value=True):
+            sw = classify_session(dt)
+        self.assertEqual(sw.window, "OPENING")
+        self.assertTrue(sw.is_valid_for_trading)
+
+    def test_session_classify_morning_window(self):
+        """10:00 IST → MORNING window."""
+        from market.services.intraday_session import classify_session
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+        dt = datetime(today.year, today.month, today.day, 10, 0, tzinfo=IST)
+        with patch("market.services.intraday_session.IndianMarketSession.is_trading_day", return_value=True):
+            sw = classify_session(dt)
+        self.assertEqual(sw.window, "MORNING")
+
+    def test_session_classify_midday_window(self):
+        """12:00 IST → MIDDAY window."""
+        from market.services.intraday_session import classify_session
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+        dt = datetime(today.year, today.month, today.day, 12, 0, tzinfo=IST)
+        with patch("market.services.intraday_session.IndianMarketSession.is_trading_day", return_value=True):
+            sw = classify_session(dt)
+        self.assertEqual(sw.window, "MIDDAY")
+
+    def test_session_classify_afternoon_window(self):
+        """13:30 IST → AFTERNOON window."""
+        from market.services.intraday_session import classify_session
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+        dt = datetime(today.year, today.month, today.day, 13, 30, tzinfo=IST)
+        with patch("market.services.intraday_session.IndianMarketSession.is_trading_day", return_value=True):
+            sw = classify_session(dt)
+        self.assertEqual(sw.window, "AFTERNOON")
+
+    def test_session_classify_closing_window(self):
+        """15:00 IST → CLOSING window."""
+        from market.services.intraday_session import classify_session
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+        dt = datetime(today.year, today.month, today.day, 15, 0, tzinfo=IST)
+        with patch("market.services.intraday_session.IndianMarketSession.is_trading_day", return_value=True):
+            sw = classify_session(dt)
+        self.assertEqual(sw.window, "CLOSING")
+
+    def test_session_classify_outside(self):
+        """08:00 IST → OUTSIDE window."""
+        from market.services.intraday_session import classify_session
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+        dt = datetime(today.year, today.month, today.day, 8, 0, tzinfo=IST)
+        with patch("market.services.intraday_session.IndianMarketSession.is_trading_day", return_value=True):
+            sw = classify_session(dt)
+        self.assertEqual(sw.window, "OUTSIDE")
+        self.assertFalse(sw.is_valid_for_trading)
+
+    # ── 2. VWAP Computation ───────────────────────────────────────────────────
+
+    def test_vwap_computed_from_session_bars(self):
+        """VWAP = sum(typical_price * volume) / sum(volume) — verified manually."""
+        from market.services.intraday_indicators import compute_intraday_indicators
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+
+        # Create 35 bars with known values to allow indicator calculation
+        inst, bars = self._make_bar_series("VWAPTEST", n=35, base_close=200.0, session_date=today)
+
+        ind = compute_intraday_indicators(bars, today)
+        self.assertTrue(ind.vwap_available, "VWAP should be available when session bars exist")
+        self.assertIsNotNone(ind.vwap)
+        # VWAP should be close to the average close price (~200 + small drift)
+        self.assertAlmostEqual(ind.vwap, 200.0 + 35 * 0.1 / 2, delta=5.0)
+
+    def test_vwap_unavailable_when_no_session_bars(self):
+        """VWAP should be None when no bars match the session date."""
+        from market.services.intraday_indicators import compute_intraday_indicators
+        from datetime import date
+        # Use a past date that won't match "today"
+        future_date = date(2030, 1, 2)
+
+        inst, bars = self._make_bar_series("VWAP2", n=5, base_close=100.0)
+        ind = compute_intraday_indicators(bars, future_date)
+        self.assertFalse(ind.vwap_available)
+        self.assertIsNone(ind.vwap)
+
+    # ── 3. Opening Range ──────────────────────────────────────────────────────
+
+    def test_opening_range_computed_correctly(self):
+        """OR high/low = max/min of first 3 bars (15 min for 5m timeframe)."""
+        from market.services.opening_range import compute_opening_range
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+
+        inst, bars = self._make_bar_series("ORTEST", n=10, base_close=300.0, session_date=today)
+        or_range = compute_opening_range(bars, today, "5m")
+
+        self.assertIsNotNone(or_range)
+        self.assertTrue(or_range.is_complete)
+        self.assertGreaterEqual(or_range.high, or_range.low)
+        self.assertEqual(or_range.session_date, today)
+        self.assertGreater(or_range.bars_used, 0)
+
+    def test_opening_range_incomplete_when_too_few_bars(self):
+        """OR is incomplete when fewer bars than min_or_bars_complete."""
+        from market.services.opening_range import compute_opening_range
+        from market.services.market_session import IndianMarketSession
+        from datetime import date as _date
+        from market.services.market_session import IST
+        today = _date.today()
+
+        # Only create 1 bar in OR window — 5m needs 3 for is_complete
+        ts = datetime(today.year, today.month, today.day, 9, 15, tzinfo=IST).astimezone(timezone.utc)
+        inst, bar = self._make_bar("ORTEST2", "5m", ts, close=400.0)
+        or_range = compute_opening_range([bar], today, "5m")
+
+        if or_range:
+            self.assertFalse(or_range.is_complete)
+
+    def test_or_above_high_method(self):
+        """above_or_high returns True when price is sufficiently above OR high."""
+        from market.services.opening_range import OpeningRange
+        from datetime import date
+        or_r = OpeningRange(
+            high=200.0, low=195.0, range_size=5.0, range_pct=2.5,
+            total_volume=50000, bars_used=3, session_date=date.today(), is_complete=True
+        )
+        self.assertTrue(or_r.above_or_high(201.0))
+        self.assertFalse(or_r.above_or_high(199.0))
+
+    def test_measured_move_target_up(self):
+        """Measured move = entry + OR range."""
+        from market.services.opening_range import OpeningRange
+        from datetime import date
+        or_r = OpeningRange(
+            high=200.0, low=195.0, range_size=5.0, range_pct=2.5,
+            total_volume=50000, bars_used=3, session_date=date.today(), is_complete=True
+        )
+        target = or_r.measured_move_target_up(201.0)
+        self.assertAlmostEqual(target, 206.0, places=1)
+
+    # ── 4. Intraday Detectors ─────────────────────────────────────────────────
+
+    def _make_indicators(self, **kwargs):
+        """Build an IntradayIndicators with default bullish values."""
+        from market.services.intraday_indicators import IntradayIndicators
+        defaults = {
+            "ema_fast": 205.0, "ema_slow": 200.0,
+            "rsi": 60.0, "atr": 3.0, "adx": 18.0,
+            "relative_volume": 1.5, "vwap": 202.0, "vwap_available": True,
+            "close": 207.0, "high": 208.0, "low": 204.0, "open": 204.5,
+            "macd_line": 0.5, "macd_signal": 0.3, "macd_hist": 0.2,
+            "current_volume": 15000, "avg_volume": 10000, "bar_count": 35,
+        }
+        defaults.update(kwargs)
+        return IntradayIndicators(**defaults)
+
+    def _make_or_range(self, high=200.0, low=195.0, complete=True):
+        from market.services.opening_range import OpeningRange
+        from datetime import date
+        return OpeningRange(
+            high=high, low=low, range_size=high - low,
+            range_pct=(high - low) / low * 100,
+            total_volume=50000, bars_used=3,
+            session_date=date.today(), is_complete=complete,
+        )
+
+    def test_or_breakout_detected_when_conditions_met(self):
+        """OR breakout fires when price above OR high + volume + RSI."""
+        from market.services.intraday_detectors import detect_or_breakout
+        ind = self._make_indicators(close=202.0, rsi=58.0, relative_volume=1.5)
+        or_range = self._make_or_range(high=201.0, low=196.0)
+        result = detect_or_breakout(ind, or_range, "MORNING")
+        self.assertTrue(result.detected)
+        self.assertGreater(result.score, 50.0)
+
+    def test_or_breakout_not_detected_below_high(self):
+        """OR breakout NOT fired when price below OR high."""
+        from market.services.intraday_detectors import detect_or_breakout
+        ind = self._make_indicators(close=199.0, rsi=55.0, relative_volume=1.5)
+        or_range = self._make_or_range(high=201.0)
+        result = detect_or_breakout(ind, or_range, "MORNING")
+        self.assertFalse(result.detected)
+
+    def test_or_breakout_not_detected_without_volume(self):
+        """OR breakout NOT fired without volume confirmation."""
+        from market.services.intraday_detectors import detect_or_breakout
+        ind = self._make_indicators(close=203.0, rsi=60.0, relative_volume=0.8)
+        or_range = self._make_or_range(high=201.0)
+        result = detect_or_breakout(ind, or_range, "MORNING")
+        self.assertFalse(result.detected)
+
+    def test_or_breakout_not_detected_incomplete_or(self):
+        """OR breakout blocked when OR is incomplete."""
+        from market.services.intraday_detectors import detect_or_breakout
+        ind = self._make_indicators(close=203.0, rsi=60.0, relative_volume=1.5)
+        or_range = self._make_or_range(high=201.0, complete=False)
+        result = detect_or_breakout(ind, or_range, "MORNING")
+        self.assertFalse(result.detected)
+        self.assertIn("not yet formed", result.conditions_failed[0])
+
+    def test_or_breakdown_detected(self):
+        """OR breakdown fires when price below OR low + distribution volume."""
+        from market.services.intraday_detectors import detect_or_breakdown
+        ind = self._make_indicators(close=193.0, rsi=42.0, relative_volume=1.4,
+                                     ema_fast=196.0, ema_slow=198.0)
+        or_range = self._make_or_range(high=202.0, low=196.0)
+        result = detect_or_breakdown(ind, or_range, "MORNING")
+        self.assertTrue(result.detected)
+
+    def test_momentum_continuation_detected(self):
+        """Momentum continuation fires with EMA trend, RSI 55-72, and volume."""
+        from market.services.intraday_detectors import detect_momentum_continuation
+        ind = self._make_indicators(close=207.0, rsi=62.0, relative_volume=1.3)
+        result = detect_momentum_continuation(ind, "MORNING")
+        self.assertTrue(result.detected)
+
+    def test_momentum_continuation_blocked_no_ema_trend(self):
+        """Momentum continuation blocked when EMA9 < EMA21."""
+        from market.services.intraday_detectors import detect_momentum_continuation
+        ind = self._make_indicators(close=207.0, rsi=62.0, relative_volume=1.3,
+                                     ema_fast=195.0, ema_slow=205.0)
+        result = detect_momentum_continuation(ind, "MORNING")
+        self.assertFalse(result.detected)
+
+    def test_intraday_pullback_detected(self):
+        """Pullback fires when price retracing to EMA zone, RSI 35-55."""
+        from market.services.intraday_detectors import detect_intraday_pullback
+        # EMA9 > EMA21, price between them, RSI in pullback zone
+        ind = self._make_indicators(
+            ema_fast=202.0, ema_slow=198.0, close=200.5, rsi=47.0,
+            vwap=201.0, vwap_available=True, relative_volume=1.0
+        )
+        result = detect_intraday_pullback(ind, "MORNING")
+        self.assertTrue(result.detected)
+
+    def test_vwap_reclaim_detected(self):
+        """VWAP reclaim fires when price crosses above VWAP with volume."""
+        from market.services.intraday_detectors import detect_vwap_reclaim
+        ind = self._make_indicators(close=203.0, vwap=202.0, vwap_available=True,
+                                     relative_volume=1.4, rsi=52.0)
+        result = detect_vwap_reclaim(ind, prev_bar_close=201.5, session_window="MORNING")
+        self.assertTrue(result.detected)
+
+    def test_vwap_reclaim_blocked_no_vwap(self):
+        """VWAP reclaim blocked when VWAP is unavailable."""
+        from market.services.intraday_detectors import detect_vwap_reclaim
+        ind = self._make_indicators(vwap=None, vwap_available=False)
+        result = detect_vwap_reclaim(ind, session_window="MORNING")
+        self.assertFalse(result.detected)
+        self.assertIn("unavailable", result.conditions_failed[0])
+
+    def test_vwap_rejection_detected(self):
+        """VWAP rejection fires when price moves below VWAP after testing it."""
+        from market.services.intraday_detectors import detect_vwap_rejection
+        ind = self._make_indicators(close=199.5, vwap=200.0, vwap_available=True,
+                                     relative_volume=1.3, rsi=48.0)
+        result = detect_vwap_rejection(ind, prev_bar_close=200.2, session_window="MORNING")
+        self.assertTrue(result.detected)
+
+    def test_intraday_range_breakout_detected(self):
+        """Range breakout fires when ADX < 20 + price breaks 20-bar high + volume."""
+        from market.services.intraday_detectors import detect_intraday_range_breakout
+        from market.services.intraday_indicators import IntradayIndicators
+
+        ind = self._make_indicators(close=210.0, adx=15.0, relative_volume=1.5, rsi=55.0)
+
+        # Create mock bars with highs all below 210 (close > range_high)
+        from unittest.mock import MagicMock
+        mock_bars = [MagicMock(high=205.0) for _ in range(25)]
+        mock_bars.append(MagicMock(high=210.0))  # current bar high
+
+        result = detect_intraday_range_breakout(ind, mock_bars, "MORNING")
+        self.assertTrue(result.detected)
+
+    def test_intraday_range_breakout_blocked_trending_market(self):
+        """Range breakout blocked when ADX >= 20 (already trending)."""
+        from market.services.intraday_detectors import detect_intraday_range_breakout
+        ind = self._make_indicators(close=210.0, adx=28.0, relative_volume=1.5, rsi=55.0)
+        from unittest.mock import MagicMock
+        mock_bars = [MagicMock(high=205.0) for _ in range(25)]
+        result = detect_intraday_range_breakout(ind, mock_bars, "MORNING")
+        self.assertFalse(result.detected)
+
+    # ── 5. No-trade Conditions ────────────────────────────────────────────────
+
+    def test_engine_returns_not_ready_when_readiness_fails(self):
+        """IntradaySignalEngine returns NOT_READY when readiness service fails."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.signal_enums import SignalDirection
+
+        inst, _ = self._make_bar_series("NOTREADY", n=5)
+        engine = IntradaySignalEngine()
+        with patch("market.services.intraday_signal_engine.IntradayReadinessService") as MockReady:
+            mock_readiness = MagicMock()
+            mock_readiness.is_ready = False
+            mock_readiness.reason = "Insufficient bars"
+            MockReady.return_value.check_readiness.return_value = mock_readiness
+            draft = engine.generate_recommendation(inst, "5m")
+
+        self.assertEqual(draft.signal, SignalDirection.NOT_READY.value)
+
+    def test_engine_returns_no_action_outside_session(self):
+        """IntradaySignalEngine returns NO_ACTION when session is OUTSIDE."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.signal_enums import SignalDirection
+        from market.services.intraday_session import SessionWindow
+        from datetime import date
+
+        inst, bars = self._make_bar_series("OUTSIDEST", n=40)
+        engine = IntradaySignalEngine()
+
+        outside_sw = SessionWindow(
+            window="OUTSIDE", minutes_elapsed=-1, minutes_remaining=-1,
+            is_valid_for_trading=False, session_date=date.today()
+        )
+
+        # Pass as_of well after last bar so all 40 bars are visible to PIT query
+        as_of_dt = bars[-1].timestamp + timedelta(minutes=5)
+
+        with patch("market.services.intraday_signal_engine.IntradayReadinessService") as MockReady, \
+             patch("market.services.intraday_signal_engine.classify_session", return_value=outside_sw):
+            mock_readiness = MagicMock()
+            mock_readiness.is_ready = True
+            MockReady.return_value.check_readiness.return_value = mock_readiness
+            draft = engine.generate_recommendation(inst, "5m", as_of=as_of_dt)
+
+        self.assertEqual(draft.signal, SignalDirection.NO_ACTION.value)
+        self.assertIn("Outside trading session", draft.entry_condition)
+
+    def test_engine_returns_no_action_on_dead_tape(self):
+        """NO_ACTION when relative volume < MIN_TAPE_VOLUME."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.signal_enums import SignalDirection
+        from market.services.intraday_indicators import IntradayIndicators
+        from market.services.intraday_session import SessionWindow
+        from datetime import date
+
+        inst, bars = self._make_bar_series("DEADTAPE", n=40)
+        engine = IntradaySignalEngine()
+
+        morning_sw = SessionWindow("MORNING", 60, 180, True, date.today())
+        dead_ind = IntradayIndicators(relative_volume=0.3, atr=2.0, close=100.0, bar_count=40)
+
+        # Pass as_of well after last bar so all 40 bars are visible to PIT query
+        as_of_dt = bars[-1].timestamp + timedelta(minutes=5)
+
+        with patch("market.services.intraday_signal_engine.IntradayReadinessService") as MockReady, \
+             patch("market.services.intraday_signal_engine.classify_session", return_value=morning_sw), \
+             patch("market.services.intraday_signal_engine.compute_intraday_indicators", return_value=dead_ind):
+            mock_readiness = MagicMock()
+            mock_readiness.is_ready = True
+            MockReady.return_value.check_readiness.return_value = mock_readiness
+            draft = engine.generate_recommendation(inst, "5m", as_of=as_of_dt)
+
+        self.assertEqual(draft.signal, SignalDirection.NO_ACTION.value)
+        self.assertIn("dead tape", draft.entry_condition)
+
+    # ── 6. Cooldown Gate ─────────────────────────────────────────────────────
+
+    def test_cooldown_blocks_duplicate_signal(self):
+        """Cooldown is active when an identical intraday rec was recently generated."""
+        from market.services.intraday_cooldown import is_in_cooldown
+        from market.models import StockRecommendation
+
+        inst, _ = self._make_bar("COOLTEST")
+        rec_time = datetime.now(timezone.utc)
+
+        # Create a recent ACTIVE intraday rec
+        StockRecommendation.objects.create(
+            instrument=inst,
+            horizon="INTRADAY",
+            signal="BUY",
+            setup_type="OPENING_RANGE_BREAKOUT",
+            as_of=rec_time,
+            entry_type="BREAKOUT_CONFIRMATION",
+            entry_condition="test",
+            stop_method="ATR_BASED",
+            invalidation_reason="test",
+            target_method="ATR_MULTIPLE",
+            confidence="MEDIUM",
+            status="ACTIVE",
+        )
+
+        # Capture as_of AFTER creation so generated_at <= as_of is guaranteed
+        as_of = datetime.now(timezone.utc) + timedelta(seconds=1)
+        self.assertTrue(is_in_cooldown(inst, "BUY", "OPENING_RANGE_BREAKOUT", as_of, cooldown_minutes=30))
+
+    def test_cooldown_allows_different_setup(self):
+        """Cooldown does NOT block a materially different setup type."""
+        from market.services.intraday_cooldown import is_in_cooldown
+        from market.models import StockRecommendation
+
+        inst, _ = self._make_bar("COOLDIFF")
+        rec_time = datetime.now(timezone.utc)
+
+        StockRecommendation.objects.create(
+            instrument=inst, horizon="INTRADAY", signal="BUY",
+            setup_type="OPENING_RANGE_BREAKOUT", as_of=rec_time,
+            entry_type="BREAKOUT_CONFIRMATION", entry_condition="test",
+            stop_method="ATR_BASED", invalidation_reason="test",
+            target_method="ATR_MULTIPLE", confidence="MEDIUM",
+            status="ACTIVE",
+        )
+
+        # Different setup type — should NOT be blocked
+        as_of = datetime.now(timezone.utc) + timedelta(seconds=1)
+        self.assertFalse(is_in_cooldown(inst, "BUY", "VWAP_RECLAIM", as_of, cooldown_minutes=30))
+
+    def test_cooldown_allows_after_window_expires(self):
+        """Cooldown does NOT block when previous rec is older than cooldown window."""
+        from market.services.intraday_cooldown import is_in_cooldown
+        from market.models import StockRecommendation
+
+        inst, _ = self._make_bar("COOLOLD")
+        old_time = datetime.now(timezone.utc) - timedelta(minutes=60)
+
+        # Create and then backdate generated_at via update() to bypass auto_now_add
+        rec = StockRecommendation.objects.create(
+            instrument=inst, horizon="INTRADAY", signal="BUY",
+            setup_type="OPENING_RANGE_BREAKOUT", as_of=old_time,
+            entry_type="BREAKOUT_CONFIRMATION", entry_condition="test",
+            stop_method="ATR_BASED", invalidation_reason="test",
+            target_method="ATR_MULTIPLE", confidence="MEDIUM",
+            status="ACTIVE",
+        )
+        # Force generated_at to old_time (bypasses auto_now_add for testing)
+        StockRecommendation.objects.filter(pk=rec.pk).update(generated_at=old_time)
+
+        now = datetime.now(timezone.utc)
+        # 30-min cooldown — rec is 60 min old — should NOT be blocked
+        self.assertFalse(is_in_cooldown(inst, "BUY", "OPENING_RANGE_BREAKOUT", now, cooldown_minutes=30))
+
+    # ── 7. Lifecycle / Session Expiry ─────────────────────────────────────────
+
+    def test_expire_marks_active_intraday_recs_expired(self):
+        """expire_intraday_session_recommendations marks past-expires_at recs as EXPIRED."""
+        from market.services.intraday_lifecycle import expire_intraday_session_recommendations
+        from market.models import StockRecommendation
+
+        inst, _ = self._make_bar("EXPTEST")
+        past_expiry = datetime.now(timezone.utc) - timedelta(hours=1)
+        now = datetime.now(timezone.utc)
+
+        rec = StockRecommendation.objects.create(
+            instrument=inst, horizon="INTRADAY", signal="BUY",
+            setup_type="OPENING_RANGE_BREAKOUT", as_of=past_expiry,
+            entry_type="BREAKOUT_CONFIRMATION", entry_condition="test",
+            stop_method="ATR_BASED", invalidation_reason="test",
+            target_method="ATR_MULTIPLE", confidence="HIGH",
+            status="ACTIVE",
+            expires_at=past_expiry,
+        )
+
+        count = expire_intraday_session_recommendations(now)
+        self.assertEqual(count, 1)
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, "EXPIRED")
+
+    def test_expire_does_not_touch_non_intraday_recs(self):
+        """Expiry MUST NOT affect DELIVERY_SWING or LONG_TERM recommendations."""
+        from market.services.intraday_lifecycle import expire_intraday_session_recommendations
+        from market.models import StockRecommendation
+
+        inst, _ = self._make_bar("EXPDELIV")
+        past_expiry = datetime.now(timezone.utc) - timedelta(hours=1)
+        now = datetime.now(timezone.utc)
+
+        # Create a DELIVERY_SWING rec with no expires_at (should not be touched)
+        rec = StockRecommendation.objects.create(
+            instrument=inst, horizon="DELIVERY_SWING", signal="BUY",
+            setup_type="BREAKOUT", as_of=past_expiry,
+            entry_type="BREAKOUT_CONFIRMATION", entry_condition="test",
+            stop_method="ATR_BASED", invalidation_reason="test",
+            target_method="ATR_MULTIPLE", confidence="HIGH",
+            status="ACTIVE",
+        )
+
+        count = expire_intraday_session_recommendations(now)
+        self.assertEqual(count, 0)  # delivery rec untouched
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, "ACTIVE")
+
+    def test_session_expiry_computes_correct_utc_time(self):
+        """compute_session_expiry returns 15:30 IST = 10:00 UTC."""
+        from market.services.intraday_lifecycle import compute_session_expiry
+        from datetime import date
+
+        test_date = date(2026, 8, 25)  # Monday
+        expires_at = compute_session_expiry(test_date, "5m")
+
+        # 15:30 IST = UTC+5:30, so 15:30 - 5:30 = 10:00 UTC
+        self.assertEqual(expires_at.hour, 10)
+        self.assertEqual(expires_at.minute, 0)
+
+    # ── 8. Daily Recommendation Regression ───────────────────────────────────
+
+    def test_daily_detectors_not_affected_by_new_intraday_setups(self):
+        """Daily setup_detectors.run_all_detectors should NOT include intraday setup types."""
+        from market.services.setup_detectors import run_all_detectors
+        from market.signal_enums import SetupType
+
+        INTRADAY_SETUP_VALUES = {
+            SetupType.OPENING_RANGE_BREAKOUT.value,
+            SetupType.OPENING_RANGE_BREAKDOWN.value,
+            SetupType.INTRADAY_MOMENTUM_CONTINUATION.value,
+            SetupType.INTRADAY_PULLBACK.value,
+            SetupType.VWAP_RECLAIM.value,
+            SetupType.VWAP_REJECTION.value,
+            SetupType.INTRADAY_RANGE_BREAKOUT.value,
+        }
+
+        # Run daily detectors with some valid tf_dict
+        tf_dict = {
+            "RSI_14": 58.0, "SMA_50": 190.0, "SMA_200": 180.0, "ATR_14": 4.0,
+            "SMA_20": 192.0, "MACD_12_26_9": 0.5, "BB_UPPER_20": 205.0,
+            "BB_LOWER_20": 180.0, "ADX_14": 25.0,
+        }
+        results = run_all_detectors(tf_dict, close=195.0)
+
+        for r in results:
+            self.assertNotIn(r.setup_type.value, INTRADAY_SETUP_VALUES,
+                             f"Daily detector returned intraday setup: {r.setup_type.value}")
+
+    # ── 9. PIT Safety for Intraday Bars ──────────────────────────────────────
+
+    def test_pit_safety_future_bars_invisible_to_engine(self):
+        """Bars with timestamp > as_of must NOT be loaded by IntradaySignalEngine."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.signal_enums import SignalDirection
+
+        inst, bars = self._make_bar_series("PITSAFE10", n=5)
+        future_bar_time = bars[-1].timestamp + timedelta(hours=2)
+
+        # Create a future bar
+        future_bar = OHLCVBar.objects.create(
+            instrument=inst, timeframe="5m", timestamp=future_bar_time,
+            open=900.0, high=910.0, low=895.0, close=905.0, volume=99999
+        )
+
+        engine = IntradaySignalEngine()
+        past_as_of = bars[-1].timestamp  # Query at time of last valid bar
+
+        with patch("market.services.intraday_signal_engine.IntradayReadinessService") as MockReady:
+            mock_r = MagicMock()
+            mock_r.is_ready = True
+            MockReady.return_value.check_readiness.return_value = mock_r
+
+            draft = engine.generate_recommendation(inst, "5m", as_of=past_as_of)
+
+        # Engine should not see the future bar — if it did, close would be 905
+        if draft.setup_details:
+            indicators = draft.setup_details.get("intraday_indicators", {})
+            close_seen = indicators.get("close")
+            if close_seen is not None:
+                self.assertNotAlmostEqual(close_seen, 905.0, delta=0.5,
+                                          msg="Future bar close value leaked into PIT-safe query")
+
+    # ── 10. Intraday Strategy Config ──────────────────────────────────────────
+
+    def test_strategy_config_has_required_attributes(self):
+        """intraday_strategy_config module has all required config attributes."""
+        from market import intraday_strategy_config as cfg
+        self.assertIsNotNone(cfg.STRATEGY_VERSION)
+        self.assertIsInstance(cfg.SUPPORTED_INTRADAY_TIMEFRAMES, list)
+        self.assertIn("5m", cfg.SUPPORTED_INTRADAY_TIMEFRAMES)
+        self.assertIn("15m", cfg.SUPPORTED_INTRADAY_TIMEFRAMES)
+        self.assertIsInstance(cfg.MIN_RISK_REWARD_INTRADAY, float)
+        self.assertGreater(cfg.MIN_RISK_REWARD_INTRADAY, 1.0)
+        self.assertIsInstance(cfg.COOLDOWN_MINUTES, int)
+        self.assertGreater(cfg.COOLDOWN_MINUTES, 0)
+        self.assertIsInstance(cfg.SETUP_SESSION_FILTERS, dict)
+
+    def test_setup_session_filters_no_opening_window_for_or(self):
+        """OPENING_RANGE_BREAKOUT must NOT fire during OPENING window — OR not yet formed."""
+        from market.intraday_strategy_config import SETUP_SESSION_FILTERS
+        self.assertNotIn("OPENING", SETUP_SESSION_FILTERS.get("OPENING_RANGE_BREAKOUT", set()))
+
+    # ── 11. Model Intraday Fields ─────────────────────────────────────────────
+
+    def test_stock_recommendation_intraday_fields_nullable(self):
+        """New intraday fields on StockRecommendation accept null — daily records unaffected."""
+        from market.models import StockRecommendation
+        inst, _ = self._make_bar("FIELDTEST")
+        rec = StockRecommendation.objects.create(
+            instrument=inst, horizon="DELIVERY_SWING", signal="BUY",
+            setup_type="BREAKOUT", as_of=datetime.now(timezone.utc),
+            entry_type="BREAKOUT_CONFIRMATION", entry_condition="test",
+            stop_method="ATR_BASED", invalidation_reason="test",
+            target_method="ATR_MULTIPLE", confidence="LOW", status="ACTIVE",
+        )
+        # All intraday fields should be null for daily recs
+        self.assertIsNone(rec.timeframe)
+        self.assertIsNone(rec.target_2_price)
+        self.assertIsNone(rec.target_2_method)
+        self.assertIsNone(rec.session_window)
+        self.assertIsNone(rec.strategy_version)
+        self.assertIsNone(rec.expires_at)
+
+    def test_stock_recommendation_can_store_intraday_fields(self):
+        """New intraday fields can be set and retrieved."""
+        from market.models import StockRecommendation
+        inst, _ = self._make_bar("FIELDTEST2")
+        expiry = datetime.now(timezone.utc) + timedelta(hours=6)
+        rec = StockRecommendation.objects.create(
+            instrument=inst, horizon="INTRADAY", signal="BUY",
+            setup_type="OPENING_RANGE_BREAKOUT", as_of=datetime.now(timezone.utc),
+            entry_type="BREAKOUT_CONFIRMATION", entry_condition="test",
+            stop_method="STRUCTURAL", invalidation_reason="test",
+            target_method="MEASURED_MOVE", confidence="HIGH", status="ACTIVE",
+            timeframe="5m",
+            target_2_price=215.0,
+            target_2_method="ATR_MULTIPLE",
+            session_window="MORNING",
+            strategy_version="1.0",
+            expires_at=expiry,
+        )
+        rec.refresh_from_db()
+        self.assertEqual(rec.timeframe, "5m")
+        self.assertEqual(rec.session_window, "MORNING")
+        self.assertEqual(rec.strategy_version, "1.0")
+        self.assertIsNotNone(rec.expires_at)
+        self.assertIsNotNone(rec.target_2_price)

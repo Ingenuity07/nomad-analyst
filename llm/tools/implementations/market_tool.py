@@ -1723,3 +1723,166 @@ class GetIntradayFeaturesTool(BaseTool):
                           data={"symbol": symbol_upper, "timeframe": timeframe,
                                 "timestamp": latest_row["max_ts"].isoformat(), "features": feature_map},
                           tool_name=self.name)
+
+
+# ─── Module 10 — Intraday Recommendation Tools ───────────────────────────────
+
+class GetIntradayRecommendationsInput(BaseModel):
+    symbol: Optional[str] = Field(default=None, description="Stock ticker symbol (e.g. RELIANCE).")
+    timeframe: Optional[str] = Field(default=None, description="Timeframe filter: '5m' or '15m'.")
+    setup_type: Optional[str] = Field(default=None, description="Setup type filter (e.g. 'OPENING_RANGE_BREAKOUT').")
+    direction: Optional[str] = Field(default=None, description="Signal direction: 'BUY' or 'SELL'.")
+    confidence: Optional[str] = Field(default=None, description="Confidence filter: 'HIGH', 'MEDIUM', or 'LOW'.")
+    status: Optional[str] = Field(default=None, description="Status filter: 'ACTIVE', 'EXPIRED', 'TRIGGERED', etc.")
+    session_window: Optional[str] = Field(default=None, description="Session window: 'OPENING', 'MORNING', 'MIDDAY', 'AFTERNOON', 'CLOSING'.")
+    as_of: Optional[str] = Field(default=None, description="ISO 8601 date string to filter by session date.")
+    limit: int = Field(default=20, description="Maximum number of records (max 50).")
+
+
+class GetIntradayRecommendationsTool(BaseTool):
+    """List intraday recommendations with optional filters."""
+
+    @property
+    def name(self) -> str:
+        return "get_intraday_recommendations"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve intraday (INTRADAY horizon) stock recommendations with optional filters. "
+            "Supports filtering by symbol, timeframe (5m/15m), setup type, direction (BUY/SELL), "
+            "confidence, status, session window, and date. "
+            "The LLM may read and explain these recommendations but CANNOT modify signal, "
+            "entry_price, stop_price, target_price, or confidence."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetIntradayRecommendationsInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetIntradayRecommendationsInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(self, symbol=None, timeframe=None, setup_type=None, direction=None,
+                confidence=None, status=None, session_window=None, as_of=None,
+                limit=20, **kwargs) -> ToolResult:
+        from llm.tools.implementations.intraday_tool import get_intraday_recommendations
+        result = get_intraday_recommendations(
+            symbol=symbol, timeframe=timeframe, setup_type=setup_type,
+            direction=direction, confidence=confidence, status=status,
+            session_window=session_window, as_of=as_of, limit=limit,
+        )
+        if "error" in result:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="INTRADAY_RECS_ERROR", message=result["error"], retryable=False),
+                tool_name=self.name,
+            )
+        return ToolResult(success=True, data=result, tool_name=self.name)
+
+
+class GetIntradayRecommendationInput(BaseModel):
+    recommendation_id: Optional[str] = Field(default=None, description="UUID of the recommendation.")
+    symbol: Optional[str] = Field(default=None, description="Stock ticker — returns latest active intraday rec.")
+
+
+class GetIntradayRecommendationTool(BaseTool):
+    """Full detail for a single intraday recommendation."""
+
+    @property
+    def name(self) -> str:
+        return "get_intraday_recommendation"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve full details for a single intraday recommendation by UUID or latest active for a symbol. "
+            "Includes setup_details, confidence_components, intraday indicators, OR range context, "
+            "supporting and risk factors. Provide either recommendation_id or symbol."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetIntradayRecommendationInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetIntradayRecommendationInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(self, recommendation_id=None, symbol=None, **kwargs) -> ToolResult:
+        from llm.tools.implementations.intraday_tool import get_intraday_recommendation
+        result = get_intraday_recommendation(recommendation_id=recommendation_id, symbol=symbol)
+        if "error" in result:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="INTRADAY_REC_NOT_FOUND", message=result["error"], retryable=False),
+                tool_name=self.name,
+            )
+        return ToolResult(success=True, data=result, tool_name=self.name)
+
+
+class GetIntradaySetupsInput(BaseModel):
+    symbol: str = Field(..., description="Stock ticker symbol (e.g. RELIANCE, TCS).")
+    timeframe: str = Field(default="5m", description="Intraday timeframe: '5m' or '15m'.")
+    as_of: Optional[str] = Field(default=None, description="ISO 8601 UTC datetime. Defaults to now.")
+
+
+class GetIntradaySetupsTool(BaseTool):
+    """Run intraday setup detectors and return scored results — read-only diagnostic."""
+
+    @property
+    def name(self) -> str:
+        return "get_intraday_setups"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Run all intraday setup detectors for a symbol and return their scores. "
+            "Useful for diagnosing which setups are forming and why they did/did not fire. "
+            "Does NOT persist any recommendation — purely diagnostic. "
+            "Returns: detected setups, scores, conditions met/failed, indicators, OR range, session window."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetIntradaySetupsInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetIntradaySetupsInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(self, symbol: str, timeframe: str = "5m", as_of: Optional[str] = None, **kwargs) -> ToolResult:
+        from llm.tools.implementations.intraday_tool import get_intraday_setups
+        result = get_intraday_setups(symbol=symbol, timeframe=timeframe, as_of=as_of)
+        if "error" in result:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="INTRADAY_SETUPS_ERROR", message=result["error"], retryable=False),
+                tool_name=self.name,
+            )
+        return ToolResult(success=True, data=result, tool_name=self.name)
