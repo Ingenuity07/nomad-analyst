@@ -168,7 +168,11 @@ export interface StockDetailResponse {
   latest_snapshot: MarketSnapshot | null;
   active_recommendation: StockRecommendation | null;
   latest_opportunity: StockOpportunitySnapshot | null;
-  as_of: string;
+  data_freshness?: {
+    status: string;
+    timestamp: string | null;
+  };
+  as_of?: string;
 }
 
 export interface OHLCVBar {
@@ -327,6 +331,7 @@ export interface StockOpportunitySnapshot {
   final_opportunity_score: number | string;
   component_scores: Record<string, number>;
   supporting_features: Record<string, any>;
+  reasons?: string[];
   risks: string[];
   data_quality: Record<string, any>;
   created_at?: string;
