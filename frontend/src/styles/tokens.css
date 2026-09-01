@@ -1,0 +1,117 @@
+:root {
+  /* ═════════════════════════════════════════════════════════════════════════
+     1. SURFACES & BACKGROUNDS
+     ═════════════════════════════════════════════════════════════════════════ */
+  --bg-app: #080B11;               /* Deep obsidian primary workspace canvas */
+  --bg-surface: #0E131F;           /* Container surface, panels, workspaces */
+  --bg-surface-elevated: #141B2B;  /* Hover rows, active controls, dropdown menus */
+  --bg-surface-subtle: #101624;    /* Table header backgrounds, sidebar stripes */
+  --bg-surface-sunken: #06080E;    /* Input fields, search bars, code blocks */
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     2. BORDERS & STRUCTURAL DIVIDERS
+     ═════════════════════════════════════════════════════════════════════════ */
+  --border-subtle: #1B2436;        /* Structural cell dividers, panel outlines */
+  --border-medium: #28354D;        /* Card headers, group separators */
+  --border-strong: #3B4B69;        /* Active tabs, selected list items */
+  --border-focus: #3B82F6;         /* High-visibility keyboard focus ring */
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     3. TYPOGRAPHY & TEXT HIERARCHY
+     ═════════════════════════════════════════════════════════════════════════ */
+  --text-primary: #F8FAFC;         /* High-contrast headers, stock prices, primary values */
+  --text-secondary: #94A3B8;       /* Field labels, column titles, narrative copy */
+  --text-muted: #64748B;           /* Timestamps, source attributions, metadata */
+  --text-disabled: #475569;        /* Inactive states, disabled controls */
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     4. BRAND & ACCENT
+     ═════════════════════════════════════════════════════════════════════════ */
+  --brand-primary: #3B82F6;        /* Controlled institutional sapphire */
+  --brand-hover: #2563EB;
+  --brand-subtle: rgba(59, 130, 246, 0.08);
+  --brand-border: rgba(59, 130, 246, 0.25);
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     5. SEMANTIC FINANCIAL PALETTE (RESTRAINED)
+     ═════════════════════════════════════════════════════════════════════════ */
+  /* Positive / Bullish / Target Hit */
+  --positive: #10B981;             /* Emerald */
+  --positive-hover: #059669;
+  --positive-bg: rgba(16, 185, 129, 0.08);
+  --positive-border: rgba(16, 185, 129, 0.20);
+
+  /* Negative / Bearish / Stop Hit */
+  --negative: #EF4444;             /* Crimson */
+  --negative-hover: #DC2626;
+  --negative-bg: rgba(239, 68, 68, 0.08);
+  --negative-border: rgba(239, 68, 68, 0.20);
+
+  /* Warning / Stale Data / Small Sample Alert */
+  --warning: #F59E0B;              /* Amber */
+  --warning-hover: #D97706;
+  --warning-bg: rgba(245, 158, 11, 0.08);
+  --warning-border: rgba(245, 158, 11, 0.20);
+
+  /* Neutral / Informational / Triggered Level */
+  --neutral-state: #64748B;        /* Slate */
+  --neutral-bg: rgba(100, 116, 139, 0.08);
+  --neutral-border: rgba(100, 116, 139, 0.20);
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     6. FONT FAMILIES, SIZES & WEIGHTS
+     ═════════════════════════════════════════════════════════════════════════ */
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Roboto Mono', 'SF Mono', 'Fira Code', monospace;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  --text-2xs: 0.625rem;   /* 10px: Micro badge labels, chart tick labels */
+  --text-xs: 0.6875rem;   /* 11px: Table column headers, small status tags */
+  --text-sm: 0.8125rem;   /* 13px: Standard table cells, metadata, inputs */
+  --text-base: 0.875rem;  /* 14px: Primary body text, button labels */
+  --text-md: 1.0rem;      /* 16px: Card titles, panel sub-headers */
+  --text-lg: 1.25rem;     /* 20px: Group headers, large metric values */
+  --text-xl: 1.5rem;      /* 24px: Key stock price display */
+  --text-2xl: 1.875rem;   /* 30px: Top-level workspace titles */
+
+  --leading-tight: 1.2;
+  --leading-normal: 1.45;
+  --leading-relaxed: 1.6;
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     7. SPACING SCALE (4px Baseline)
+     ═════════════════════════════════════════════════════════════════════════ */
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     8. GEOMETRY, RADII & SHADOWS
+     ═════════════════════════════════════════════════════════════════════════ */
+  --radius-xs: 2px;
+  --radius-sm: 4px;       /* Badges, micro tags, small buttons */
+  --radius-md: 6px;       /* Form inputs, buttons, standard panels */
+  --radius-lg: 8px;       /* Modals, drawers, major containers */
+
+  --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-medium: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.7);
+
+  /* ═════════════════════════════════════════════════════════════════════════
+     9. MOTION & TRANSITIONS
+     ═════════════════════════════════════════════════════════════════════════ */
+  --transition-fast: 100ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-normal: 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
