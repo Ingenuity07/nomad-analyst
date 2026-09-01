@@ -18,7 +18,7 @@ export const MarketPageShell: React.FC = () => {
           This workspace will host the live Index Strip (NIFTY 50, SENSEX, BANK NIFTY), Advance/Decline Breadth Barometer, Sector Rotation Matrix, and Market Regime indicators.
         </p>
         <div style={{ marginTop: 'var(--space-4)', padding: 'var(--space-3)', backgroundColor: 'var(--bg-surface-subtle)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-subtle)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-          API Endpoint: GET /api/v1/market/overview/?universe=NIFTY50 • Status: {isLoading ? 'Fetching backend...' : `Connected (${data?.indices.length || 0} indices)`}
+          API Endpoint: GET /api/v1/market/overview/?universe=NIFTY50 • Status: {isLoading ? 'Fetching backend...' : `Connected (${data?.indices?.length || 0} indices)`}
         </div>
       </Card>
     </PageContainer>

@@ -4,7 +4,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from '@/lib/queryClient';
 import { AppShell } from '@/components/layout/AppShell';
 
-import { MarketPageShell } from '@/pages/MarketPageShell';
+import { MarketPage } from '@/pages/MarketPage';
 import { IntradayPageShell } from '@/pages/IntradayPageShell';
 import { DeliveryPageShell } from '@/pages/DeliveryPageShell';
 import { StocksPageShell } from '@/pages/StocksPageShell';
@@ -22,7 +22,7 @@ export const App: React.FC = () => {
         <Routes>
           <Route path="/" element={<AppShell />}>
             <Route index element={<Navigate to="/market" replace />} />
-            <Route path="market" element={<MarketPageShell />} />
+            <Route path="market" element={<MarketPage />} />
             <Route path="intraday" element={<IntradayPageShell />} />
             <Route path="delivery" element={<DeliveryPageShell />} />
             <Route path="stocks" element={<StocksPageShell />} />

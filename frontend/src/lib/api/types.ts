@@ -42,42 +42,68 @@ export interface MarketIndexItem {
 }
 
 export interface MarketBreadth {
-  advances: number;
-  declines: number;
-  unchanged: number;
-  advance_decline_ratio: number;
+  advances?: number;
+  declines?: number;
+  unchanged?: number;
+  advancing?: number;
+  declining?: number;
+  advance_decline_ratio?: number;
+  breadth_regime?: string;
+  coverage?: {
+    total_universe_size: number;
+    active_coverage_size: number;
+    coverage_ratio: number;
+    missing_symbols: string[];
+  };
+  participation?: {
+    pct_above_sma20?: number;
+    pct_above_sma50?: number;
+    pct_above_sma200?: number;
+  };
   pct_above_50_sma?: number;
   pct_above_200_sma?: number;
+  new_highs_count?: number;
+  new_lows_count?: number;
 }
 
 export interface IndexRegime {
   symbol: string;
-  trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
-  sma_50: number | null;
-  sma_200: number | null;
-  distance_from_52w_high: number | null;
-  volatility_regime: 'LOW' | 'NORMAL' | 'ELEVATED' | 'HIGH';
+  status?: string;
+  trend?: 'BULLISH' | 'BEARISH' | 'NEUTRAL' | string;
+  regime?: string;
+  sma_50?: number | null;
+  sma_200?: number | null;
+  distance_from_52w_high?: number | null;
+  volatility_regime?: 'LOW' | 'NORMAL' | 'ELEVATED' | 'HIGH' | string;
+  error?: string;
 }
 
 export interface SectorRanking {
   sector: string;
-  change_percent: number;
-  relative_strength_score: number;
+  change_percent?: number;
+  average_return?: number;
+  relative_return_vs_nifty?: number;
+  average_rsi?: number;
+  average_volatility?: number;
+  relative_strength_score?: number;
   rank: number;
-  trend: 'LEADER' | 'IMPROVING' | 'WEAKENING' | 'LAGGING';
+  trend?: 'LEADER' | 'IMPROVING' | 'WEAKENING' | 'LAGGING' | string;
+  momentum_state?: string;
+  tier?: string;
 }
 
 export interface GlobalCue {
   name: string;
   symbol: string;
-  price: number;
-  change_percent: number;
-  impact_bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  price?: number | null;
+  change_percent?: number | null;
+  impact_bias?: 'BULLISH' | 'BEARISH' | 'NEUTRAL' | string;
 }
 
 export interface DataFreshness {
-  source: string;
-  last_updated: string;
+  source?: string;
+  last_updated?: string;
+  timestamp?: string;
   status: 'LIVE' | 'STALE' | 'INCOMPLETE' | 'UNAVAILABLE';
 }
 
@@ -85,13 +111,14 @@ export interface MarketOverviewResponse {
   as_of: string;
   universe: string;
   market_session: MarketSessionInfo;
-  indices: MarketIndexItem[];
-  breadth: MarketBreadth;
-  index_regimes: IndexRegime[];
-  sector_rankings: SectorRanking[];
-  global_cues: GlobalCue[];
-  recent_news: NewsItem[];
-  data_freshness: DataFreshness;
+  indices?: MarketIndexItem[];
+  breadth?: MarketBreadth;
+  index_regimes?: Record<string, IndexRegime> | IndexRegime[];
+  sector_rankings?: SectorRanking[];
+  global_cues?: Record<string, any> | GlobalCue[];
+  cross_market_cues?: Record<string, any>;
+  recent_news?: NewsItem[];
+  data_freshness?: DataFreshness;
 }
 
 // ── Stocks & Instruments ─────────────────────────────────────────────────────
