@@ -1,49 +1,152 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from '@/lib/queryClient';
 import { AppShell } from '@/components/layout/AppShell';
+import { ErrorBoundary } from '@/components/common/ErrorBoundary';
+import { PageLoadingFallback } from '@/components/common/PageLoadingFallback';
 
-import { MarketPage } from '@/pages/MarketPage';
-import { MarketIntelligencePage } from '@/pages/MarketIntelligencePage';
-import { IntradayPage } from '@/pages/IntradayPage';
-import { DeliveryPage } from '@/pages/DeliveryPage';
-import { StocksPageShell } from '@/pages/StocksPageShell';
-import { StockDetailPage } from '@/pages/StockDetailPage';
-import { RecommendationsPage } from '@/pages/RecommendationsPage';
-import { ResearchPage } from '@/pages/ResearchPage';
-import { FundamentalsPage } from '@/pages/FundamentalsPage';
-import { BacktestsPage } from '@/pages/BacktestsPage';
-import { WatchlistPage } from '@/pages/WatchlistPage';
-import { AlertsPage } from '@/pages/AlertsPage';
-import { DesignSystemShowcase } from '@/pages/DesignSystemShowcase';
+// Route-level code splitting for major workspace pages
+const MarketPage = lazy(() => import('@/pages/MarketPage'));
+const MarketIntelligencePage = lazy(() => import('@/pages/MarketIntelligencePage'));
+const IntradayPage = lazy(() => import('@/pages/IntradayPage'));
+const DeliveryPage = lazy(() => import('@/pages/DeliveryPage'));
+const StocksDirectoryPage = lazy(() => import('@/pages/StocksDirectoryPage'));
+const StockDetailPage = lazy(() => import('@/pages/StockDetailPage'));
+const FundamentalsPage = lazy(() => import('@/pages/FundamentalsPage'));
+const RecommendationsPage = lazy(() => import('@/pages/RecommendationsPage'));
+const ResearchPage = lazy(() => import('@/pages/ResearchPage'));
+const BacktestsPage = lazy(() => import('@/pages/BacktestsPage'));
+const WatchlistPage = lazy(() => import('@/pages/WatchlistPage'));
+const AlertsPage = lazy(() => import('@/pages/AlertsPage'));
+const DesignSystemShowcase = lazy(() => import('@/pages/DesignSystemShowcase'));
 
 export const App: React.FC = () => {
   return (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<AppShell />}>
-            <Route index element={<Navigate to="/market" replace />} />
-            <Route path="market" element={<MarketPage />} />
-            <Route path="market-intelligence" element={<MarketIntelligencePage />} />
-            <Route path="sectors" element={<MarketIntelligencePage />} />
-            <Route path="intraday" element={<IntradayPage />} />
-            <Route path="delivery" element={<DeliveryPage />} />
-            <Route path="stocks" element={<StocksPageShell />} />
-            <Route path="stocks/:symbol" element={<StockDetailPage />} />
-            <Route path="fundamentals" element={<FundamentalsPage />} />
-            <Route path="recommendations" element={<RecommendationsPage />} />
-            <Route path="research" element={<ResearchPage />} />
-            <Route path="backtests" element={<BacktestsPage />} />
-            <Route path="watchlist" element={<WatchlistPage />} />
-            <Route path="alerts" element={<AlertsPage />} />
-            <Route path="design-system" element={<DesignSystemShowcase />} />
-            <Route path="*" element={<Navigate to="/market" replace />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/" element={<AppShell />}>
+              <Route index element={<Navigate to="/market" replace />} />
+              <Route
+                path="market"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <MarketPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="market-intelligence"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <MarketIntelligencePage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="sectors"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <MarketIntelligencePage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="intraday"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <IntradayPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="delivery"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <DeliveryPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="stocks"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <StocksDirectoryPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="stocks/:symbol"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <StockDetailPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="fundamentals"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <FundamentalsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="recommendations"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <RecommendationsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="research"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <ResearchPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="backtests"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <BacktestsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="watchlist"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <WatchlistPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="alerts"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <AlertsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="design-system"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <DesignSystemShowcase />
+                  </Suspense>
+                }
+              />
+              <Route path="*" element={<Navigate to="/market" replace />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 };
 export default App;

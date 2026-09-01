@@ -119,3 +119,5 @@ export const FundamentalsPage: React.FC = () => {
     </PageContainer>
   );
 };
+export default FundamentalsPage;
+

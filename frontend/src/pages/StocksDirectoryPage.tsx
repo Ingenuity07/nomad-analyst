@@ -4,7 +4,7 @@ import { PageContainer } from '@/components/layout/PageContainer';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 
-export const StocksPageShell: React.FC = () => {
+export const StocksDirectoryPage: React.FC = () => {
   const navigate = useNavigate();
 
   return (
@@ -12,11 +12,11 @@ export const StocksPageShell: React.FC = () => {
       title="Stocks & Research Directory"
       subtitle="Search and analyze audited balance sheets, technical indicator trees, and interactive charts"
     >
-      <Card header="Stock Directory Workspace (FE-5 Target)">
+      <Card header="Stock Directory & Research Terminal Access">
         <p style={{ color: 'var(--text-secondary)', fontSize: 'var(--text-sm)', lineHeight: 1.6 }}>
           Type any NSE symbol in the top header search bar or select a quick demonstration profile below:
         </p>
-        <div style={{ display: 'flex', gap: 'var(--space-3)', marginTop: 'var(--space-4)' }}>
+        <div style={{ display: 'flex', gap: 'var(--space-3)', marginTop: 'var(--space-4)', flexWrap: 'wrap' }}>
           <Button variant="secondary" onClick={() => navigate('/stocks/RELIANCE')}>
             Open RELIANCE Terminal →
           </Button>
@@ -31,3 +31,4 @@ export const StocksPageShell: React.FC = () => {
     </PageContainer>
   );
 };
+export default StocksDirectoryPage;

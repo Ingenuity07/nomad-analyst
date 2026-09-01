@@ -107,3 +107,5 @@ export const MarketIntelligencePage: React.FC = () => {
     </PageContainer>
   );
 };
+export default MarketIntelligencePage;
+

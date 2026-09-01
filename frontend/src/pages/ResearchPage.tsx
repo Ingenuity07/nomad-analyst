@@ -199,3 +199,5 @@ export const ResearchPage: React.FC = () => {
     </PageContainer>
   );
 };
+export default ResearchPage;
+

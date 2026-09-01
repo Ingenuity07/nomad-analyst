@@ -199,3 +199,5 @@ export const DesignSystemShowcase: React.FC = () => {
     </PageContainer>
   );
 };
+export default DesignSystemShowcase;
+
