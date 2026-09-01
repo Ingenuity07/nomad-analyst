@@ -5,6 +5,7 @@ import { queryClient } from '@/lib/queryClient';
 import { AppShell } from '@/components/layout/AppShell';
 
 import { MarketPage } from '@/pages/MarketPage';
+import { MarketIntelligencePage } from '@/pages/MarketIntelligencePage';
 import { IntradayPage } from '@/pages/IntradayPage';
 import { DeliveryPage } from '@/pages/DeliveryPage';
 import { StocksPageShell } from '@/pages/StocksPageShell';
@@ -24,6 +25,8 @@ export const App: React.FC = () => {
           <Route path="/" element={<AppShell />}>
             <Route index element={<Navigate to="/market" replace />} />
             <Route path="market" element={<MarketPage />} />
+            <Route path="market-intelligence" element={<MarketIntelligencePage />} />
+            <Route path="sectors" element={<MarketIntelligencePage />} />
             <Route path="intraday" element={<IntradayPage />} />
             <Route path="delivery" element={<DeliveryPage />} />
             <Route path="stocks" element={<StocksPageShell />} />

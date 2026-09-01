@@ -10,6 +10,7 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { to: '/market', label: 'Market Overview', icon: '📊' },
+  { to: '/market-intelligence', label: 'Market & Sectors', icon: '🌐' },
   { to: '/intraday', label: 'Intraday Scanner', icon: '⚡' },
   { to: '/delivery', label: 'Opportunities', icon: '🎯' },
   { to: '/stocks', label: 'Stocks & Research', icon: '📈' },

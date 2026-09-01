@@ -38,7 +38,10 @@ export interface MarketIndexItem {
   price: number | null;
   change: number | null;
   change_percent: number | null;
-  timestamp: string | null;
+  timestamp?: string | null;
+  regime?: string;
+  trend_slope?: number | null;
+  above_sma_200?: boolean | null;
 }
 
 export interface MarketBreadth {
@@ -98,6 +101,27 @@ export interface GlobalCue {
   price?: number | null;
   change_percent?: number | null;
   impact_bias?: 'BULLISH' | 'BEARISH' | 'NEUTRAL' | string;
+}
+
+export interface GlobalCueItem {
+  name: string;
+  close?: number | null;
+  daily_change_percent?: number | null;
+  last_timestamp?: string | null;
+  stale?: boolean;
+}
+
+export type CrossMarketCues = Record<string, GlobalCueItem | any>;
+
+export interface StockSummary {
+  id: string;
+  symbol: string;
+  company_name?: string;
+  name?: string;
+  exchange: string;
+  instrument_type?: string;
+  is_active?: boolean;
+  company?: Company | null;
 }
 
 export interface DataFreshness {
@@ -334,6 +358,7 @@ export interface StockOpportunitySnapshot {
   horizon: 'INTRADAY' | 'DELIVERY_SWING' | 'DELIVERY_POSITIONAL' | string;
   opportunity_type: string;
   final_opportunity_score: number | string;
+  final_score?: number | string;
   component_scores: Record<string, number>;
   supporting_features: Record<string, any>;
   reasons?: string[];
