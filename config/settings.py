@@ -44,7 +44,7 @@ SECRET_KEY = 'django-insecure-qs+p#ex#4di*v=m6uqjim74r4a3r5ar&o*2^nk!n#8+1sivr3a
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 CORS_ALLOW_ALL_ORIGINS = True
 
@@ -265,12 +265,15 @@ LOGGING = {
 # REST Framework API Documentation
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_PAGINATION_CLASS': 'market.pagination.StandardResultsSetPagination',
+    'PAGE_SIZE': 20,
+    'EXCEPTION_HANDLER': 'market.api_exceptions.custom_api_exception_handler',
 }
 
 SPECTACULAR_SETTINGS = {
-    'TITLE': 'Nomad API',
-    'DESCRIPTION': 'Interactive API documentation for Nomad Prospecting and Tool Platform.',
-    'VERSION': '3.0.0',
+    'TITLE': 'Nomad Analyst API',
+    'DESCRIPTION': 'Interactive REST API documentation for Nomad Analyst Equity Intelligence Platform.',
+    'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
 }
 
