@@ -25,6 +25,7 @@ export function useRunBacktest() {
     mutationFn: (payload: BacktestRunPayload) =>
       apiClient<BacktestRun>(ENDPOINTS.BACKTEST_RUN, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       }),
   });

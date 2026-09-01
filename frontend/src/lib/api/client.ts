@@ -73,8 +73,17 @@ export async function apiClient<T>(endpoint: string, options: RequestOptions = {
       return {} as T;
     }
 
-    const isJson = response.headers.get('content-type')?.includes('application/json');
-    const data = isJson ? await response.json() : await response.text();
+    const contentType = response.headers?.get
+      ? response.headers.get('content-type')
+      : (response.headers as any)?.['content-type'] || (response.headers as any)?.['Content-Type'] || 'application/json';
+    const isJson = contentType ? contentType.includes('application/json') : true;
+    const data = isJson && typeof response.json === 'function'
+      ? await response.json()
+      : typeof response.text === 'function'
+      ? await response.text()
+      : typeof response.json === 'function'
+      ? await response.json()
+      : {};
 
     if (!response.ok) {
       if (isJson && data && typeof data === 'object' && 'error' in data) {

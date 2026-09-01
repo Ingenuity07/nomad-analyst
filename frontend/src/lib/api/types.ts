@@ -474,11 +474,11 @@ export interface BacktestRunPayload {
   horizon: string;
   start_date: string;
   end_date: string;
-  cost_mode?: 'ZERO' | 'REALISTIC' | 'CONSERVATIVE';
+  cost_mode?: 'NO_COST' | 'REALISTIC' | 'CUSTOM' | string;
   brokerage_pct?: number;
   stt_pct?: number;
   slippage_bps?: number;
-  ambiguity_policy?: 'CONSERVATIVE' | 'AGGRESSIVE' | 'IGNORE';
+  ambiguity_policy?: 'CONSERVATIVE' | 'OPTIMISTIC' | 'EXCLUDE' | string;
 }
 
 // ── AI Research ──────────────────────────────────────────────────────────────
