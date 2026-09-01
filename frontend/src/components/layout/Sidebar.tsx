@@ -13,6 +13,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/intraday', label: 'Intraday Scanner', icon: '⚡' },
   { to: '/delivery', label: 'Opportunities', icon: '🎯' },
   { to: '/stocks', label: 'Stocks & Research', icon: '📈' },
+  { to: '/fundamentals', label: 'Fundamentals', icon: '🏛️' },
   { to: '/recommendations', label: 'Recommendations', icon: '💡' },
   { to: '/research', label: 'AI Intelligence', icon: '🤖' },
   { to: '/backtests', label: 'Backtesting Lab', icon: '🧪' },

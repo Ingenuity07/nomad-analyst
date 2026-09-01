@@ -127,9 +127,14 @@ export interface Company {
   id: string;
   name: string;
   short_name: string;
+  legal_name?: string | null;
   sector: string;
   industry: string;
+  sub_industry?: string | null;
+  description?: string | null;
+  website?: string | null;
   isin?: string;
+  is_active?: boolean;
 }
 
 export interface Instrument {

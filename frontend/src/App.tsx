@@ -11,6 +11,7 @@ import { StocksPageShell } from '@/pages/StocksPageShell';
 import { StockDetailPage } from '@/pages/StockDetailPage';
 import { RecommendationsPage } from '@/pages/RecommendationsPage';
 import { ResearchPage } from '@/pages/ResearchPage';
+import { FundamentalsPage } from '@/pages/FundamentalsPage';
 import { BacktestsPage } from '@/pages/BacktestsPage';
 import { WatchlistPageShell } from '@/pages/WatchlistPageShell';
 import { DesignSystemShowcase } from '@/pages/DesignSystemShowcase';
@@ -27,6 +28,7 @@ export const App: React.FC = () => {
             <Route path="delivery" element={<DeliveryPage />} />
             <Route path="stocks" element={<StocksPageShell />} />
             <Route path="stocks/:symbol" element={<StockDetailPage />} />
+            <Route path="fundamentals" element={<FundamentalsPage />} />
             <Route path="recommendations" element={<RecommendationsPage />} />
             <Route path="research" element={<ResearchPage />} />
             <Route path="backtests" element={<BacktestsPage />} />
