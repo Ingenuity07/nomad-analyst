@@ -19,6 +19,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/research', label: 'AI Intelligence', icon: '🤖' },
   { to: '/backtests', label: 'Backtesting Lab', icon: '🧪' },
   { to: '/watchlist', label: 'Watchlists', icon: '⭐' },
+  { to: '/alerts', label: 'Command Center', icon: '🚨' },
   { to: '/design-system', label: 'Design System', icon: '🎨', tag: 'DEV' },
 ];
 

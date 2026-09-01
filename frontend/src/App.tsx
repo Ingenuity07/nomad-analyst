@@ -15,6 +15,7 @@ import { ResearchPage } from '@/pages/ResearchPage';
 import { FundamentalsPage } from '@/pages/FundamentalsPage';
 import { BacktestsPage } from '@/pages/BacktestsPage';
 import { WatchlistPage } from '@/pages/WatchlistPage';
+import { AlertsPage } from '@/pages/AlertsPage';
 import { DesignSystemShowcase } from '@/pages/DesignSystemShowcase';
 
 export const App: React.FC = () => {
@@ -36,6 +37,7 @@ export const App: React.FC = () => {
             <Route path="research" element={<ResearchPage />} />
             <Route path="backtests" element={<BacktestsPage />} />
             <Route path="watchlist" element={<WatchlistPage />} />
+            <Route path="alerts" element={<AlertsPage />} />
             <Route path="design-system" element={<DesignSystemShowcase />} />
             <Route path="*" element={<Navigate to="/market" replace />} />
           </Route>
