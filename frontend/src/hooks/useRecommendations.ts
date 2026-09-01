@@ -6,6 +6,7 @@ import { StockRecommendation, PaginatedResponse } from '@/lib/api/types';
 export function useRecommendations(params: {
   horizon?: string;
   signal?: string;
+  setup_type?: string;
   status?: string;
   confidence?: string;
   sector?: string;
