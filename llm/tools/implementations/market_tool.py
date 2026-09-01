@@ -1886,3 +1886,209 @@ class GetIntradaySetupsTool(BaseTool):
                 tool_name=self.name,
             )
         return ToolResult(success=True, data=result, tool_name=self.name)
+
+
+
+# ─── Module 11 — Recommendation Outcome & Backtesting Tools ──────────────────
+
+class GetRecommendationOutcomeInput(BaseModel):
+    recommendation_id: str = Field(description="UUID of the StockRecommendation to look up.")
+    evaluation_version: int = Field(default=1, description="Evaluation version (default: 1).")
+
+
+class GetRecommendationOutcomeTool(BaseTool):
+    """Read-only tool: retrieve the outcome record for a completed recommendation."""
+
+    @property
+    def name(self) -> str:
+        return "get_recommendation_outcome"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve the full outcome record for a recommendation: whether entry was "
+            "triggered, how it exited (target/stop/expiry/ambiguous), net P&L, R-multiple, "
+            "MFE, MAE, and holding duration. "
+            "Read-only. Use recommendation_id (UUID) to look up the outcome. "
+            "LLM must NOT alter outcome records or strategy parameters based on results."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetRecommendationOutcomeInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetRecommendationOutcomeInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(
+        self,
+        recommendation_id: str,
+        evaluation_version: int = 1,
+        **kwargs,
+    ) -> ToolResult:
+        from llm.tools.implementations.outcome_tool import get_recommendation_outcome
+        result = get_recommendation_outcome(
+            recommendation_id=recommendation_id,
+            evaluation_version=evaluation_version,
+        )
+        if "error" in result:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="OUTCOME_NOT_FOUND", message=result["error"], retryable=False),
+                tool_name=self.name,
+            )
+        return ToolResult(success=True, data=result, tool_name=self.name)
+
+
+class GetStrategyPerformanceInput(BaseModel):
+    setup_type: Optional[str] = Field(default=None, description="Filter by setup type.")
+    timeframe: Optional[str] = Field(default=None, description="Filter by timeframe (e.g. '5m').")
+    direction: Optional[str] = Field(default=None, description="Filter by direction: BUY or SELL.")
+    horizon: Optional[str] = Field(default=None, description="Filter by horizon (e.g. INTRADAY).")
+    strategy_version: Optional[str] = Field(default=None, description="Filter by strategy version.")
+    start_date: Optional[str] = Field(default=None, description="Start date YYYY-MM-DD (inclusive).")
+    end_date: Optional[str] = Field(default=None, description="End date YYYY-MM-DD (inclusive).")
+    limit: int = Field(default=500, description="Max outcomes to include.")
+
+
+class GetStrategyPerformanceTool(BaseTool):
+    """Read-only tool: retrieve aggregated strategy performance metrics."""
+
+    @property
+    def name(self) -> str:
+        return "get_strategy_performance"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve aggregated strategy performance metrics from outcome records. "
+            "Filterable by setup_type, timeframe, direction, horizon, strategy_version, "
+            "start_date, end_date. "
+            "Returns win_rate, avg_return_pct, avg_r, expectancy, profit_factor, "
+            "max_drawdown_r, and dimension slices (by setup, timeframe, direction, regime, sector). "
+            "IMPORTANT: always read and communicate statistical_warnings. "
+            "win_rate is a historical frequency, NOT a guarantee of future profit."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetStrategyPerformanceInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetStrategyPerformanceInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(
+        self,
+        setup_type: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        direction: Optional[str] = None,
+        horizon: Optional[str] = None,
+        strategy_version: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 500,
+        **kwargs,
+    ) -> ToolResult:
+        from llm.tools.implementations.outcome_tool import get_strategy_performance
+        result = get_strategy_performance(
+            setup_type=setup_type,
+            timeframe=timeframe,
+            direction=direction,
+            horizon=horizon,
+            strategy_version=strategy_version,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+        if "error" in result:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="PERFORMANCE_ERROR", message=result["error"], retryable=False),
+                tool_name=self.name,
+            )
+        return ToolResult(success=True, data=result, tool_name=self.name)
+
+
+class GetBacktestResultInput(BaseModel):
+    run_id: Optional[str] = Field(default=None, description="Specific backtest run_id to retrieve.")
+    universe_name: Optional[str] = Field(default=None, description="Filter by universe name.")
+    timeframe: Optional[str] = Field(default=None, description="Filter by timeframe.")
+    horizon: Optional[str] = Field(default=None, description="Filter by horizon.")
+    limit: int = Field(default=10, description="Max runs to list when run_id not specified.")
+
+
+class GetBacktestResultTool(BaseTool):
+    """Read-only tool: retrieve backtest run results."""
+
+    @property
+    def name(self) -> str:
+        return "get_backtest_result"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve backtest run results by run_id or list recent runs. "
+            "Returns the full configuration, performance report, and data quality warnings. "
+            "IMPORTANT: always communicate data_quality_warnings to the user — "
+            "they document fundamental limitations like unavailable historical fundamentals/news. "
+            "Backtest results reflect historical data only. They cannot predict future performance."
+        )
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return GetBacktestResultInput.model_json_schema()
+
+    @property
+    def input_schema(self):
+        return GetBacktestResultInput
+
+    @property
+    def category(self) -> str:
+        return "market"
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def execute(
+        self,
+        run_id: Optional[str] = None,
+        universe_name: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        horizon: Optional[str] = None,
+        limit: int = 10,
+        **kwargs,
+    ) -> ToolResult:
+        from llm.tools.implementations.outcome_tool import get_backtest_result
+        result = get_backtest_result(
+            run_id=run_id,
+            universe_name=universe_name,
+            timeframe=timeframe,
+            horizon=horizon,
+            limit=limit,
+        )
+        if "error" in result:
+            return ToolResult(
+                success=False, data=None,
+                error=ToolError(code="BACKTEST_NOT_FOUND", message=result["error"], retryable=False),
+                tool_name=self.name,
+            )
+        return ToolResult(success=True, data=result, tool_name=self.name)

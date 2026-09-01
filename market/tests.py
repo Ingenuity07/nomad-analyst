@@ -3720,3 +3720,1064 @@ class IntradayStrategyEngineTests(TestCase):
         self.assertEqual(rec.strategy_version, "1.0")
         self.assertIsNotNone(rec.expires_at)
         self.assertIsNotNone(rec.target_2_price)
+
+
+# =============================================================================
+# Module 11 — Recommendation Outcome Tracking & Backtesting Foundation
+# =============================================================================
+
+class OutcomeTrackingTests(TestCase):
+    """
+    Tests for Module 11: Recommendation Outcome Tracking & Backtesting Foundation.
+
+    Areas covered:
+      1.  EntryEvaluator — BUY/SELL trigger, no trigger, exact boundary
+      2.  ExitEvaluator — stop hit, target hit, not hit, same-bar ambiguity
+      3.  Same-bar ambiguity — CONSERVATIVE / OPTIMISTIC / EXCLUDE policies
+      4.  Session expiry — expires_at handling
+      5.  Max holding duration kill-switch
+      6.  MFE / MAE calculation — BUY and SELL
+      7.  P&L — long, short, NO_COST, REALISTIC, slippage
+      8.  R-multiple — positive, negative, zero-risk edge case
+      9.  Cost model — NO_COST / REALISTIC / slippage
+      10. Performance metrics — win rate, expectancy, profit factor, drawdown
+      11. Statistical warnings — small sample, insufficient sample
+      12. Dimension slices — by setup/timeframe/direction
+      13. RecommendationOutcome model — fields, constraints, idempotency
+      14. BacktestRun model — creation, config serialisation
+      15. Lifecycle — ACTIVE→TRIGGERED→TARGET_HIT/STOPPED/EXPIRED/AMBIGUOUS
+      16. PIT safety — future bars excluded from evaluation
+      17. Idempotency — same bar evaluated twice, same rec twice
+      18. Historical data limitation warnings
+      19. Daily recommendation regression (Modules 1–10 unaffected)
+      20. AmbiguityPolicy enum and ExitReason enum completeness
+    """
+
+    def setUp(self):
+        """Create shared test fixtures: instrument, bars, and recommendation template."""
+        from market.models import StockRecommendation, RecommendationOutcome, BacktestRun
+
+        self.company = Company.objects.create(
+            name="Outcome Test Corp",
+            sector="Technology", industry="Software",
+        )
+        self.instrument = Instrument.objects.create(
+            symbol="OUT1", company=self.company, instrument_type="EQUITY",
+            is_active=True, lot_size=1,
+        )
+
+        # Base timestamps (all UTC)
+        self.t0 = datetime(2026, 8, 1, 4, 0, 0, tzinfo=timezone.utc)  # 09:30 IST
+
+        # Build a sequence of 10 intraday bars (5m each)
+        self.bars = []
+        for i in range(10):
+            bar = OHLCVBar.objects.create(
+                instrument=self.instrument,
+                timeframe="5m",
+                timestamp=self.t0 + timedelta(minutes=5 * i),
+                open=Decimal("100.00"),
+                high=Decimal("102.00"),
+                low=Decimal("98.00"),
+                close=Decimal("101.00"),
+                volume=10000,
+            )
+            self.bars.append(bar)
+
+        # Standard BUY recommendation at t0
+        self.rec_buy = StockRecommendation.objects.create(
+            instrument=self.instrument,
+            horizon="INTRADAY",
+            signal="BUY",
+            setup_type="OPENING_RANGE_BREAKOUT",
+            as_of=self.t0,
+            entry_type="BREAKOUT_CONFIRMATION",
+            entry_price=Decimal("101.50"),   # above all bar highs=102 → triggers bar 0
+            entry_condition="Buy above 101.50",
+            stop_price=Decimal("97.00"),
+            stop_method="ATR_BASED",
+            invalidation_reason="Close below 97",
+            target_price=Decimal("108.00"),
+            target_method="ATR_MULTIPLE",
+            risk=Decimal("4.50"),
+            reward=Decimal("6.50"),
+            risk_reward_ratio=Decimal("1.44"),
+            confidence="HIGH",
+            confidence_components={},
+            market_context={"regime": "BULLISH"},
+            sector_context={"sector": "Technology"},
+            supporting_factors=[],
+            risk_factors=[],
+            setup_details={},
+            data_quality={},
+            status="ACTIVE",
+            timeframe="5m",
+            strategy_version="1.0",
+        )
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _make_bars(self, ohlc_sequence, start_time=None, timeframe="5m"):
+        """Create OHLCVBar list from (open, high, low, close) tuples.
+
+        Default start_time offsets by 2 hours from t0 to avoid conflict with
+        setUp bars (which occupy t0 to t0+45m).
+        """
+        t = start_time or (self.t0 + timedelta(hours=2))
+        result = []
+        for i, (o, h, l, c) in enumerate(ohlc_sequence):
+            bar = OHLCVBar.objects.create(
+                instrument=self.instrument,
+                timeframe=timeframe,
+                timestamp=t + timedelta(minutes=5 * i),
+                open=Decimal(str(o)), high=Decimal(str(h)),
+                low=Decimal(str(l)), close=Decimal(str(c)),
+                volume=10000,
+            )
+            result.append(bar)
+        return result
+
+    def _make_rec(self, signal="BUY", entry=101.5, stop=97.0, target=108.0,
+                  horizon="INTRADAY", setup_type="OPENING_RANGE_BREAKOUT",
+                  expires_at=None, timeframe="5m"):
+        from market.models import StockRecommendation
+        return StockRecommendation.objects.create(
+            instrument=self.instrument,
+            horizon=horizon,
+            signal=signal,
+            setup_type=setup_type,
+            as_of=self.t0,
+            entry_type="BREAKOUT_CONFIRMATION",
+            entry_price=Decimal(str(entry)),
+            entry_condition=f"entry at {entry}",
+            stop_price=Decimal(str(stop)),
+            stop_method="ATR_BASED",
+            invalidation_reason="n/a",
+            target_price=Decimal(str(target)),
+            target_method="ATR_MULTIPLE",
+            risk=Decimal("4.00"),
+            reward=Decimal("6.00"),
+            risk_reward_ratio=Decimal("1.5"),
+            confidence="MEDIUM",
+            confidence_components={},
+            market_context={"regime": "SIDEWAYS"},
+            sector_context={"sector": "Energy"},
+            supporting_factors=[],
+            risk_factors=[],
+            setup_details={},
+            data_quality={},
+            status="ACTIVE",
+            timeframe=timeframe,
+            strategy_version="1.0",
+            expires_at=expires_at,
+        )
+
+    # =========================================================================
+    # 1. EntryEvaluator
+    # =========================================================================
+
+    def test_entry_buy_triggered(self):
+        """BUY: entry triggers when bar.high >= entry_price."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="BUY", entry=101.0)
+        bars = self._make_bars([(100, 102, 98, 101)])  # high=102 >= 101
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertTrue(result.triggered)
+        self.assertEqual(result.trigger_bar_index, 0)
+        self.assertAlmostEqual(result.trigger_price, 102.0)
+
+    def test_entry_sell_triggered(self):
+        """SELL: entry triggers when bar.low <= entry_price."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="SELL", entry=99.0, stop=103.0, target=93.0)
+        bars = self._make_bars([(100, 101, 98, 100)])  # low=98 <= 99
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertTrue(result.triggered)
+        self.assertAlmostEqual(result.trigger_price, 98.0)
+
+    def test_entry_not_triggered(self):
+        """Entry price never reached → triggered=False."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="BUY", entry=110.0)  # bars only go to 102
+        bars = self._make_bars([(100, 102, 98, 101), (100, 102, 98, 101)])
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertFalse(result.triggered)
+        self.assertEqual(result.bars_scanned, 2)
+
+    def test_entry_exact_boundary_buy(self):
+        """BUY entry triggers on exact equality: bar.high == entry_price."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="BUY", entry=102.0)
+        bars = self._make_bars([(100, 102, 98, 101)])  # high exactly 102
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertTrue(result.triggered)
+
+    def test_entry_exact_boundary_sell(self):
+        """SELL entry triggers on exact equality: bar.low == entry_price."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="SELL", entry=98.0, stop=103.0, target=93.0)
+        bars = self._make_bars([(100, 101, 98, 100)])  # low exactly 98
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertTrue(result.triggered)
+
+    def test_entry_no_entry_price(self):
+        """Rec with entry_price=None → untriggered, no crash."""
+        from market.services.outcome_engine import EntryEvaluator
+        from market.models import StockRecommendation
+        rec = self._make_rec(signal="BUY", entry=100.0)
+        rec.entry_price = None
+        rec.save()
+        bars = self._make_bars([(100, 102, 98, 101)])
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertFalse(result.triggered)
+
+    def test_entry_triggers_on_second_bar(self):
+        """Entry triggers on bar index 1, not 0."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="BUY", entry=105.0)
+        bars = self._make_bars([
+            (100, 102, 98, 101),  # bar 0: high=102 < 105 → no trigger
+            (103, 106, 100, 105), # bar 1: high=106 >= 105 → trigger
+        ])
+        result = EntryEvaluator().evaluate(rec, bars)
+        self.assertTrue(result.triggered)
+        self.assertEqual(result.trigger_bar_index, 1)
+
+    # =========================================================================
+    # 2. ExitEvaluator — target hit
+    # =========================================================================
+
+    def test_exit_target_hit_buy(self):
+        """BUY target hit: bar.high >= target_price."""
+        from market.services.outcome_engine import EntryEvaluator, ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(105, 109, 104, 108)])  # high=109 >= 108
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after)
+        self.assertEqual(result.exit_reason, "TARGET_HIT")
+        self.assertTrue(result.target_hit)
+        self.assertFalse(result.stop_hit)
+
+    def test_exit_stop_hit_buy(self):
+        """BUY stop hit: bar.low <= stop_price."""
+        from market.services.outcome_engine import EntryEvaluator, ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=110.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(99, 101, 94, 98)])  # low=94 <= 95
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after)
+        self.assertEqual(result.exit_reason, "STOP_HIT")
+        self.assertTrue(result.stop_hit)
+        self.assertFalse(result.target_hit)
+
+    def test_exit_target_hit_sell(self):
+        """SELL target hit: bar.low <= target_price (target is below entry for SELL)."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="SELL", entry=100.0, stop=105.0, target=93.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(97, 99, 92, 94)])  # low=92 <= 93
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after)
+        self.assertEqual(result.exit_reason, "TARGET_HIT")
+        self.assertTrue(result.target_hit)
+
+    def test_exit_stop_hit_sell(self):
+        """SELL stop hit: bar.high >= stop_price."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="SELL", entry=100.0, stop=105.0, target=90.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(103, 106, 101, 104)])  # high=106 >= 105
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after)
+        self.assertEqual(result.exit_reason, "STOP_HIT")
+        self.assertTrue(result.stop_hit)
+
+    def test_exit_neither_hit(self):
+        """Neither stop nor target triggered → EXPIRED_MAX_DURATION when bars exhausted."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=90.0, target=120.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        # All bars in safe zone
+        bars_after = self._make_bars([(100, 105, 95, 102), (100, 105, 95, 102)])
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after, max_holding_bars=200)
+        self.assertEqual(result.exit_reason, "EXPIRED_MAX_DURATION")
+        self.assertFalse(result.target_hit)
+        self.assertFalse(result.stop_hit)
+
+    def test_exit_no_entry(self):
+        """ExitEvaluator with entry_triggered=False → NO_ENTRY."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=False, trigger_bar_index=None,
+            trigger_timestamp=None, trigger_price=None, bars_scanned=0
+        )
+        result = ExitEvaluator().evaluate(rec, entry_result, [])
+        self.assertEqual(result.exit_reason, "NO_ENTRY")
+
+    # =========================================================================
+    # 3. Same-bar ambiguity
+    # =========================================================================
+
+    def test_ambiguity_detected(self):
+        """Both stop and target touched in same bar → AMBIGUOUS_INTRABAR."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        # Bar has both high >= target AND low <= stop in same bar
+        bars_after = self._make_bars([(100, 110, 93, 103)])  # h=110>=108, l=93<=95
+        result = ExitEvaluator().evaluate(
+            rec, entry_result, bars_after, ambiguity_policy="CONSERVATIVE"
+        )
+        self.assertEqual(result.exit_reason, "AMBIGUOUS_INTRABAR")
+        self.assertTrue(result.ambiguous_intrabar)
+        self.assertIsNone(result.target_hit)
+        self.assertIsNone(result.stop_hit)
+
+    def test_ambiguity_policy_conservative_stop_wins(self):
+        """CONSERVATIVE: ambiguous bar → exit_price = stop_price."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(100, 110, 93, 103)])
+        result = ExitEvaluator().evaluate(
+            rec, entry_result, bars_after, ambiguity_policy="CONSERVATIVE"
+        )
+        self.assertEqual(result.exit_price, 95.0)   # stop_price wins
+
+    def test_ambiguity_policy_optimistic_target_wins(self):
+        """OPTIMISTIC: ambiguous bar → exit_price = target_price."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(100, 110, 93, 103)])
+        result = ExitEvaluator().evaluate(
+            rec, entry_result, bars_after, ambiguity_policy="OPTIMISTIC"
+        )
+        self.assertEqual(result.exit_price, 108.0)  # target_price wins
+
+    def test_ambiguity_policy_exclude(self):
+        """EXCLUDE: ambiguous bar → exit_price = None."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(100, 110, 93, 103)])
+        result = ExitEvaluator().evaluate(
+            rec, entry_result, bars_after, ambiguity_policy="EXCLUDE"
+        )
+        self.assertIsNone(result.exit_price)
+        self.assertTrue(result.ambiguous_intrabar)
+
+    def test_target_only_no_ambiguity(self):
+        """Target reached but low > stop → no ambiguity, clean TARGET_HIT."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(105, 110, 98, 109)])  # low=98 > stop=95
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after)
+        self.assertEqual(result.exit_reason, "TARGET_HIT")
+        self.assertFalse(result.ambiguous_intrabar)
+
+    def test_stop_only_no_ambiguity(self):
+        """Stop reached but high < target → no ambiguity, clean STOP_HIT."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=108.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        bars_after = self._make_bars([(99, 103, 93, 98)])  # high=103 < target=108
+        result = ExitEvaluator().evaluate(rec, entry_result, bars_after)
+        self.assertEqual(result.exit_reason, "STOP_HIT")
+        self.assertFalse(result.ambiguous_intrabar)
+
+    # =========================================================================
+    # 4. Session expiry
+    # =========================================================================
+
+    def test_exit_session_expiry(self):
+        """Intraday rec with expires_at: bar at/after expiry → EXPIRED_SESSION."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        # Use an offset start time to avoid bar timestamp conflict with setUp bars (t0..t0+45min)
+        bar_start = self.t0 + timedelta(hours=3)
+        expires_at = bar_start
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0,
+                             target=120.0, expires_at=expires_at)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        # Bar timestamp == expires_at → session close
+        bar = OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=bar_start,
+            open=Decimal("101"), high=Decimal("105"),
+            low=Decimal("99"), close=Decimal("103"), volume=1000,
+        )
+        result = ExitEvaluator().evaluate(rec, entry_result, [bar])
+        self.assertEqual(result.exit_reason, "EXPIRED_SESSION")
+
+    # =========================================================================
+    # 5. Max holding duration kill-switch
+    # =========================================================================
+
+    def test_exit_max_holding_bars(self):
+        """Position held for max_holding_bars without exit → EXPIRED_MAX_DURATION."""
+        from market.services.outcome_engine import ExitEvaluator, EntryResult
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=90.0, target=120.0)
+        entry_result = EntryResult(
+            triggered=True, trigger_bar_index=0,
+            trigger_timestamp=self.t0, trigger_price=100.0, bars_scanned=1
+        )
+        # 5 safe bars, max_holding_bars=3 → kill after bar index 3
+        bars = self._make_bars([(100, 105, 95, 102)] * 5)
+        result = ExitEvaluator().evaluate(
+            rec, entry_result, bars, max_holding_bars=3
+        )
+        self.assertEqual(result.exit_reason, "EXPIRED_MAX_DURATION")
+
+    # =========================================================================
+    # 6. MFE / MAE
+    # =========================================================================
+
+    def test_mfe_mae_buy(self):
+        """MFE and MAE computed correctly for a BUY trade."""
+        from market.services.outcome_engine import MFEMAECalculator
+        bars = self._make_bars([
+            (100, 105, 99, 103),  # MFE candidate: (105-100)/100*100 = 5%
+            (103, 103, 97, 100),  # MAE candidate: (100-97)/100*100 = 3%
+        ])
+        result = MFEMAECalculator().calculate("BUY", 100.0, bars)
+        self.assertAlmostEqual(result.max_favorable_excursion, 5.0, places=2)
+        self.assertAlmostEqual(result.max_adverse_excursion, 3.0, places=2)
+
+    def test_mfe_mae_sell(self):
+        """MFE and MAE for a SELL trade (favorable is downward)."""
+        from market.services.outcome_engine import MFEMAECalculator
+        bars = self._make_bars([
+            (100, 102, 94, 97),   # MFE: (100-94)/100*100 = 6%, MAE: (102-100)/100*100 = 2%
+        ])
+        result = MFEMAECalculator().calculate("SELL", 100.0, bars)
+        self.assertAlmostEqual(result.max_favorable_excursion, 6.0, places=2)
+        self.assertAlmostEqual(result.max_adverse_excursion, 2.0, places=2)
+
+    def test_mfe_mae_no_bars(self):
+        """Empty bars → None values, no crash."""
+        from market.services.outcome_engine import MFEMAECalculator
+        result = MFEMAECalculator().calculate("BUY", 100.0, [])
+        self.assertIsNone(result.max_favorable_excursion)
+        self.assertIsNone(result.max_adverse_excursion)
+
+    # =========================================================================
+    # 7. P&L calculations
+    # =========================================================================
+
+    def test_pnl_long_win_no_cost(self):
+        """BUY winner: net_pnl_absolute = exit - entry (no cost)."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        result = PnLCalculator().calculate(
+            signal="BUY", actual_entry_price=100.0, actual_exit_price=110.0,
+            stop_price=95.0, cost_config=CostConfig.no_cost()
+        )
+        self.assertAlmostEqual(result.gross_pnl_absolute, 10.0, places=2)
+        self.assertAlmostEqual(result.net_pnl_absolute, 10.0, places=2)
+        self.assertEqual(result.cost_absolute, 0.0)
+
+    def test_pnl_long_loss_no_cost(self):
+        """BUY loser: net_pnl_absolute is negative."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        result = PnLCalculator().calculate(
+            signal="BUY", actual_entry_price=100.0, actual_exit_price=95.0,
+            stop_price=95.0, cost_config=CostConfig.no_cost()
+        )
+        self.assertAlmostEqual(result.net_pnl_absolute, -5.0, places=2)
+
+    def test_pnl_short_win_no_cost(self):
+        """SELL winner: entry > exit → positive P&L."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        result = PnLCalculator().calculate(
+            signal="SELL", actual_entry_price=100.0, actual_exit_price=90.0,
+            stop_price=105.0, cost_config=CostConfig.no_cost()
+        )
+        self.assertAlmostEqual(result.net_pnl_absolute, 10.0, places=2)
+
+    def test_pnl_with_realistic_cost(self):
+        """REALISTIC cost reduces net P&L below gross."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        cfg = CostConfig.realistic_nse_equity()
+        result = PnLCalculator().calculate(
+            signal="BUY", actual_entry_price=100.0, actual_exit_price=110.0,
+            stop_price=95.0, cost_config=cfg
+        )
+        self.assertGreater(result.gross_pnl_absolute, result.net_pnl_absolute)
+        self.assertGreater(result.cost_absolute, 0.0)
+
+    def test_pnl_slippage_worsens_entry_buy(self):
+        """BUY slippage: actual entry is higher than raw price."""
+        from market.services.cost_model import SlippageModel, CostConfig
+        cfg = CostConfig(mode="REALISTIC", brokerage_percent=0.0,
+                        stt_percent=0.0, slippage_bps=10.0)  # 10 bps
+        adj = SlippageModel.apply_entry_slippage(100.0, "BUY", cfg)
+        self.assertAlmostEqual(adj, 100.1, places=4)
+
+    def test_pnl_slippage_worsens_entry_sell(self):
+        """SELL slippage: actual entry is lower than raw price."""
+        from market.services.cost_model import SlippageModel, CostConfig
+        cfg = CostConfig(mode="REALISTIC", brokerage_percent=0.0,
+                        stt_percent=0.0, slippage_bps=10.0)
+        adj = SlippageModel.apply_entry_slippage(100.0, "SELL", cfg)
+        self.assertAlmostEqual(adj, 99.9, places=4)
+
+    def test_pnl_no_cost_zero_slippage(self):
+        """NO_COST config → slippage = 0."""
+        from market.services.cost_model import SlippageModel, CostConfig
+        adj = SlippageModel.apply_entry_slippage(100.0, "BUY", CostConfig.no_cost())
+        self.assertEqual(adj, 100.0)
+
+    # =========================================================================
+    # 8. R-multiple
+    # =========================================================================
+
+    def test_r_multiple_positive(self):
+        """Winner: R > 0."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        result = PnLCalculator().calculate(
+            signal="BUY", actual_entry_price=100.0, actual_exit_price=110.0,
+            stop_price=95.0, cost_config=CostConfig.no_cost()
+        )
+        # risk = 100 - 95 = 5; R = 10 / 5 = 2.0
+        self.assertAlmostEqual(result.r_multiple, 2.0, places=2)
+
+    def test_r_multiple_negative(self):
+        """Loser: R < 0."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        result = PnLCalculator().calculate(
+            signal="BUY", actual_entry_price=100.0, actual_exit_price=95.0,
+            stop_price=95.0, cost_config=CostConfig.no_cost()
+        )
+        self.assertLess(result.r_multiple, 0.0)
+
+    def test_r_multiple_no_stop(self):
+        """No stop_price → r_multiple=None, no crash."""
+        from market.services.outcome_engine import PnLCalculator
+        from market.services.cost_model import CostConfig
+        result = PnLCalculator().calculate(
+            signal="BUY", actual_entry_price=100.0, actual_exit_price=110.0,
+            stop_price=None, cost_config=CostConfig.no_cost()
+        )
+        self.assertIsNone(result.r_multiple)
+
+    # =========================================================================
+    # 9. Cost model structure
+    # =========================================================================
+
+    def test_cost_config_no_cost_serialise(self):
+        """NO_COST config round-trips through to_dict/from_dict."""
+        from market.services.cost_model import CostConfig
+        cfg = CostConfig.no_cost()
+        restored = CostConfig.from_dict(cfg.to_dict())
+        self.assertEqual(restored.mode, "NO_COST")
+        self.assertEqual(restored.slippage_bps, 0.0)
+
+    def test_cost_config_realistic_fields(self):
+        """REALISTIC config has non-zero brokerage and slippage."""
+        from market.services.cost_model import CostConfig
+        cfg = CostConfig.realistic_nse_equity()
+        self.assertEqual(cfg.mode, "REALISTIC")
+        self.assertGreater(cfg.brokerage_percent, 0.0)
+        self.assertGreater(cfg.slippage_bps, 0.0)
+
+    def test_cost_compute_roundtrip(self):
+        """Total cost is positive for REALISTIC mode."""
+        from market.services.cost_model import compute_total_cost, CostConfig
+        cost = compute_total_cost(100.0, 110.0, "BUY", CostConfig.realistic_nse_equity())
+        self.assertGreater(cost, 0.0)
+
+    def test_cost_no_cost_zero(self):
+        """NO_COST → compute_total_cost returns 0.0."""
+        from market.services.cost_model import compute_total_cost, CostConfig
+        cost = compute_total_cost(100.0, 110.0, "BUY", CostConfig.no_cost())
+        self.assertEqual(cost, 0.0)
+
+    # =========================================================================
+    # 10 & 11. Performance metrics + statistical warnings
+    # =========================================================================
+
+    def _make_outcome_stub(self, entry_triggered, exit_reason,
+                           net_pnl_pct=None, r_multiple=None,
+                           ambiguous=False, hold_bars=None,
+                           setup_type="OPENING_RANGE_BREAKOUT",
+                           timeframe="5m", direction="BUY"):
+        """Create a lightweight stub that mimics a RecommendationOutcome."""
+
+        class RecStub:
+            pass
+
+        class OutcomeStub:
+            pass
+
+        rec = RecStub()
+        rec.setup_type = setup_type
+        rec.timeframe  = timeframe
+        rec.signal     = direction
+        rec.market_context = {"regime": "BULLISH"}
+        rec.sector_context = {"sector": "Technology"}
+
+        out = OutcomeStub()
+        out.recommendation       = rec
+        out.entry_triggered      = entry_triggered
+        out.exit_reason          = exit_reason
+        out.net_pnl_percent      = net_pnl_pct
+        out.r_multiple           = r_multiple
+        out.ambiguous_intrabar   = ambiguous
+        out.holding_duration_bars = hold_bars
+        return out
+
+    def test_performance_basic_wins_losses(self):
+        """Basic win/loss counts compute correctly."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", net_pnl_pct=5.0, r_multiple=2.0),
+            self._make_outcome_stub(True, "TARGET_HIT", net_pnl_pct=3.0, r_multiple=1.5),
+            self._make_outcome_stub(True, "STOP_HIT",   net_pnl_pct=-4.0, r_multiple=-1.0),
+            self._make_outcome_stub(False, "NO_ENTRY"),
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertEqual(report.total_signals, 4)
+        self.assertEqual(report.triggered, 3)
+        self.assertEqual(report.untriggered, 1)
+        self.assertEqual(report.wins, 2)
+        self.assertEqual(report.losses, 1)
+
+    def test_performance_small_sample_warning(self):
+        """< 10 triggered trades → SMALL_SAMPLE_WARNING in statistical_warnings."""
+        from market.services.performance_metrics import StrategyPerformanceService, SMALL_SAMPLE_WARNING
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0),
+            self._make_outcome_stub(True, "STOP_HIT", r_multiple=-1.0),
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertTrue(
+            any(SMALL_SAMPLE_WARNING in w for w in report.statistical_warnings)
+        )
+        # win_rate should be null (too few samples)
+        self.assertIsNone(report.win_rate)
+
+    def test_performance_win_rate_with_enough_samples(self):
+        """10+ triggered trades → win_rate computed."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = []
+        for _ in range(7):
+            outcomes.append(self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0))
+        for _ in range(3):
+            outcomes.append(self._make_outcome_stub(True, "STOP_HIT", r_multiple=-1.0))
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertIsNotNone(report.win_rate)
+        self.assertAlmostEqual(report.win_rate, 70.0, places=0)
+
+    def test_performance_expectancy_requires_30_samples(self):
+        """< 30 triggered → expectancy is None."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0)
+            for _ in range(15)
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertIsNone(report.expectancy)
+
+    def test_performance_max_drawdown_computed(self):
+        """Max drawdown computed when ≥2 trades with R values."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0),
+            self._make_outcome_stub(True, "STOP_HIT",   r_multiple=-1.0),
+            self._make_outcome_stub(True, "TARGET_HIT", r_multiple=1.5),
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertIsNotNone(report.max_drawdown_r)
+        self.assertLessEqual(report.max_drawdown_r, 0.0)  # drawdown is negative
+
+    def test_performance_ambiguous_conservative(self):
+        """CONSERVATIVE policy: ambiguous → counted as loss."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "AMBIGUOUS_INTRABAR", ambiguous=True, r_multiple=-0.5),
+            self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0),
+            # Fill to 10 for win_rate to appear
+            *[self._make_outcome_stub(True, "TARGET_HIT", r_multiple=1.5) for _ in range(8)],
+        ]
+        report = StrategyPerformanceService().compute(outcomes, ambiguity_policy="CONSERVATIVE")
+        self.assertEqual(report.ambiguous, 1)
+        self.assertEqual(report.losses, 1)  # ambiguous counted as loss
+
+    def test_performance_ambiguous_exclude(self):
+        """EXCLUDE policy: ambiguous counted in ambiguous but NOT in wins or losses."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "AMBIGUOUS_INTRABAR", ambiguous=True),
+            *[self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0) for _ in range(9)],
+        ]
+        report = StrategyPerformanceService().compute(outcomes, ambiguity_policy="EXCLUDE")
+        self.assertEqual(report.ambiguous, 1)
+        self.assertEqual(report.losses, 0)
+
+    # =========================================================================
+    # 12. Dimension slices
+    # =========================================================================
+
+    def test_performance_by_setup_type(self):
+        """by_setup_type is populated with correct keys."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", setup_type="OPENING_RANGE_BREAKOUT"),
+            self._make_outcome_stub(True, "STOP_HIT", setup_type="VWAP_RECLAIM"),
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertIn("OPENING_RANGE_BREAKOUT", report.by_setup_type)
+        self.assertIn("VWAP_RECLAIM", report.by_setup_type)
+
+    def test_performance_by_direction(self):
+        """by_direction slice created for BUY and SELL."""
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", direction="BUY"),
+            self._make_outcome_stub(True, "STOP_HIT", direction="SELL"),
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        self.assertIn("BUY", report.by_direction)
+        self.assertIn("SELL", report.by_direction)
+
+    def test_performance_report_serialises(self):
+        """PerformanceReport.to_dict() returns a JSON-serialisable dict."""
+        import json
+        from market.services.performance_metrics import StrategyPerformanceService
+        outcomes = [
+            self._make_outcome_stub(True, "TARGET_HIT", r_multiple=2.0),
+        ]
+        report = StrategyPerformanceService().compute(outcomes)
+        d = report.to_dict()
+        # Should not raise
+        json.dumps(d)
+
+    # =========================================================================
+    # 13. RecommendationOutcome model
+    # =========================================================================
+
+    def test_outcome_model_fields_nullable(self):
+        """RecommendationOutcome: all optional fields accept null."""
+        from market.models import RecommendationOutcome
+        outcome = RecommendationOutcome.objects.create(
+            recommendation=self.rec_buy,
+            evaluation_version=1,
+            entry_triggered=False,
+            exit_reason="NO_ENTRY",
+            bars_evaluated=0,
+        )
+        self.assertIsNone(outcome.actual_entry_price)
+        self.assertIsNone(outcome.r_multiple)
+        self.assertIsNone(outcome.max_favorable_excursion)
+
+    def test_outcome_model_unique_constraint(self):
+        """Second outcome for same (rec, version) raises IntegrityError."""
+        from market.models import RecommendationOutcome
+        from django.db import IntegrityError
+        RecommendationOutcome.objects.create(
+            recommendation=self.rec_buy,
+            evaluation_version=1,
+            entry_triggered=False,
+            exit_reason="NO_ENTRY",
+            bars_evaluated=0,
+        )
+        with self.assertRaises(IntegrityError):
+            RecommendationOutcome.objects.create(
+                recommendation=self.rec_buy,
+                evaluation_version=1,  # same version
+                entry_triggered=False,
+                exit_reason="NO_ENTRY",
+                bars_evaluated=0,
+            )
+
+    def test_outcome_second_version_allowed(self):
+        """Different evaluation_version for same rec is allowed."""
+        from market.models import RecommendationOutcome
+        RecommendationOutcome.objects.create(
+            recommendation=self.rec_buy, evaluation_version=1,
+            entry_triggered=False, exit_reason="NO_ENTRY", bars_evaluated=0,
+        )
+        # version=2 should not raise
+        out2 = RecommendationOutcome.objects.create(
+            recommendation=self.rec_buy, evaluation_version=2,
+            entry_triggered=True, exit_reason="TARGET_HIT", bars_evaluated=5,
+        )
+        self.assertEqual(out2.evaluation_version, 2)
+
+    # =========================================================================
+    # 14. BacktestRun model
+    # =========================================================================
+
+    def test_backtest_run_creation(self):
+        """BacktestRun created with correct fields."""
+        from market.models import BacktestRun
+        from market.services.backtest_config import BacktestConfig
+        from datetime import date
+        config = BacktestConfig(
+            universe_name="TEST_UNIV",
+            timeframe="5m",
+            horizon="INTRADAY",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 8, 1),
+        )
+        run = BacktestRun.objects.create(
+            run_id="test-run-001",
+            config=config.to_dict(),
+            status="PENDING",
+            universe_name=config.universe_name,
+            timeframe=config.timeframe,
+            horizon=config.horizon,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            strategy_version=config.strategy_version,
+        )
+        self.assertEqual(run.status, "PENDING")
+        self.assertEqual(run.timeframe, "5m")
+
+    def test_backtest_config_roundtrip(self):
+        """BacktestConfig.to_dict() / from_dict() are inverse operations."""
+        from market.services.backtest_config import BacktestConfig
+        from market.services.cost_model import CostConfig
+        from datetime import date
+        config = BacktestConfig(
+            universe_name="NIFTY50",
+            timeframe="5m",
+            horizon="INTRADAY",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            cost_config=CostConfig.realistic_nse_equity(),
+            ambiguity_policy="CONSERVATIVE",
+        )
+        restored = BacktestConfig.from_dict(config.to_dict())
+        self.assertEqual(restored.universe_name, "NIFTY50")
+        self.assertEqual(restored.cost_config.mode, "REALISTIC")
+        self.assertEqual(restored.ambiguity_policy, "CONSERVATIVE")
+
+    # =========================================================================
+    # 15. Lifecycle transitions via OutcomeService
+    # =========================================================================
+
+    def test_outcome_service_no_entry_marks_expired(self):
+        """OutcomeService: untriggered rec after expiry → EXPIRED status + NO_ENTRY outcome."""
+        from market.services.outcome_service import RecommendationOutcomeService
+        from market.models import RecommendationOutcome
+        rec = self._make_rec(signal="BUY", entry=200.0,  # price never reached
+                             expires_at=self.t0 - timedelta(minutes=1))  # already expired
+        svc = RecommendationOutcomeService()
+        # Bars that never reach 200
+        bars = self._make_bars([(100, 102, 98, 101), (100, 102, 98, 101)])
+        outcome = svc.evaluate_single(rec, as_of=self.t0 + timedelta(hours=1), bars=bars)
+        self.assertIsNotNone(outcome)
+        self.assertFalse(outcome.entry_triggered)
+        self.assertEqual(outcome.exit_reason, "NO_ENTRY")
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, "EXPIRED")
+
+    def test_outcome_service_target_hit_updates_status(self):
+        """OutcomeService: target reached → rec status = TARGET_HIT."""
+        from market.services.outcome_service import RecommendationOutcomeService
+        from market.models import RecommendationOutcome
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=90.0, target=105.0)
+        svc = RecommendationOutcomeService()
+        bars = self._make_bars([
+            (100, 101, 99, 100),  # entry triggers (high=101 >= 100)
+            (101, 107, 100, 106), # target hit (high=107 >= 105)
+        ])
+        outcome = svc.evaluate_single(rec, as_of=self.t0 + timedelta(hours=2), bars=bars)
+        self.assertIsNotNone(outcome)
+        self.assertTrue(outcome.entry_triggered)
+        self.assertEqual(outcome.exit_reason, "TARGET_HIT")
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, "TARGET_HIT")
+
+    def test_outcome_service_stop_hit_updates_status(self):
+        """OutcomeService: stop triggered → rec status = STOPPED."""
+        from market.services.outcome_service import RecommendationOutcomeService
+        rec = self._make_rec(signal="BUY", entry=100.0, stop=95.0, target=115.0)
+        svc = RecommendationOutcomeService()
+        bars = self._make_bars([
+            (100, 101, 99, 100),  # entry triggers
+            (99, 100, 93, 97),    # stop hit (low=93 <= 95)
+        ])
+        outcome = svc.evaluate_single(rec, as_of=self.t0 + timedelta(hours=2), bars=bars)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.exit_reason, "STOP_HIT")
+        rec.refresh_from_db()
+        self.assertEqual(rec.status, "STOPPED")
+
+    # =========================================================================
+    # 16. Idempotency
+    # =========================================================================
+
+    def test_outcome_service_idempotent_same_rec(self):
+        """Calling evaluate_single twice on same rec returns None on second call."""
+        from market.services.outcome_service import RecommendationOutcomeService
+        from market.models import RecommendationOutcome
+        rec = self._make_rec(signal="BUY", entry=200.0,
+                             expires_at=self.t0 - timedelta(minutes=1))
+        svc = RecommendationOutcomeService()
+        bars = self._make_bars([(100, 102, 98, 101)])
+        outcome1 = svc.evaluate_single(rec, as_of=self.t0 + timedelta(hours=1), bars=bars)
+        outcome2 = svc.evaluate_single(rec, as_of=self.t0 + timedelta(hours=1), bars=bars)
+        self.assertIsNotNone(outcome1)
+        self.assertIsNone(outcome2)  # second call returns None (already evaluated)
+        # Only one outcome record exists
+        self.assertEqual(
+            RecommendationOutcome.objects.filter(recommendation=rec).count(), 1
+        )
+
+    # =========================================================================
+    # 17. PIT safety
+    # =========================================================================
+
+    def test_pit_entry_eval_future_bars_excluded(self):
+        """EntryEvaluator only evaluates bars passed in — PIT safety is caller's responsibility."""
+        from market.services.outcome_engine import EntryEvaluator
+        rec = self._make_rec(signal="BUY", entry=105.0)
+        # Only pass bars up to as_of — no future bars
+        past_bars = self._make_bars([(100, 102, 98, 101)])
+        result = EntryEvaluator().evaluate(rec, past_bars)
+        # Entry price 105 > bar high 102 → not triggered (future bar not seen)
+        self.assertFalse(result.triggered)
+
+    # =========================================================================
+    # 18. Historical data limitation warnings
+    # =========================================================================
+
+    def test_historical_data_warnings_in_outcome(self):
+        """Outcome records include historical data limitation warnings."""
+        from market.services.outcome_service import RecommendationOutcomeService, DQ_HIST_NEWS
+        from market.models import RecommendationOutcome
+        rec = self._make_rec(signal="BUY", entry=200.0,
+                             expires_at=self.t0 - timedelta(minutes=1))
+        svc = RecommendationOutcomeService()
+        bars = self._make_bars([(100, 102, 98, 101)])
+        outcome = svc.evaluate_single(rec, as_of=self.t0 + timedelta(hours=1), bars=bars)
+        self.assertIsNotNone(outcome)
+        self.assertIn(DQ_HIST_NEWS, outcome.data_quality_warnings)
+
+    # =========================================================================
+    # 19. Signal enum completeness
+    # =========================================================================
+
+    def test_ambiguous_intrabar_in_recommendation_status_enum(self):
+        """AMBIGUOUS_INTRABAR is in RecommendationStatus enum."""
+        from market.signal_enums import RecommendationStatus
+        self.assertIn("AMBIGUOUS_INTRABAR", [s.value for s in RecommendationStatus])
+
+    def test_exit_reason_enum_values(self):
+        """ExitReason has all required values."""
+        from market.signal_enums import ExitReason
+        required = {
+            "TARGET_HIT", "STOP_HIT", "EXPIRED_SESSION",
+            "EXPIRED_MAX_DURATION", "AMBIGUOUS_INTRABAR", "NO_ENTRY",
+        }
+        actual = {r.value for r in ExitReason}
+        self.assertTrue(required.issubset(actual))
+
+    def test_ambiguity_policy_enum_values(self):
+        """AmbiguityPolicy has CONSERVATIVE, OPTIMISTIC, EXCLUDE."""
+        from market.signal_enums import AmbiguityPolicy
+        self.assertIn("CONSERVATIVE", [p.value for p in AmbiguityPolicy])
+        self.assertIn("OPTIMISTIC", [p.value for p in AmbiguityPolicy])
+        self.assertIn("EXCLUDE", [p.value for p in AmbiguityPolicy])
+
+    # =========================================================================
+    # 20. Regression — daily recommendations unaffected
+    # =========================================================================
+
+    def test_daily_rec_status_choices_include_ambiguous(self):
+        """StockRecommendation STATUS_CHOICES includes AMBIGUOUS_INTRABAR."""
+        from market.models import StockRecommendation
+        status_values = [s[0] for s in StockRecommendation.STATUS_CHOICES]
+        self.assertIn("AMBIGUOUS_INTRABAR", status_values)
+
+    def test_daily_rec_existing_statuses_unchanged(self):
+        """Original status choices (ACTIVE, TRIGGERED, etc.) still present."""
+        from market.models import StockRecommendation
+        status_values = [s[0] for s in StockRecommendation.STATUS_CHOICES]
+        for status in ("ACTIVE", "TRIGGERED", "TARGET_HIT", "STOPPED", "EXPIRED"):
+            self.assertIn(status, status_values)
+
+    def test_daily_rec_unaffected_by_outcome_model(self):
+        """A daily recommendation can be created without any outcome-related fields."""
+        from market.models import StockRecommendation
+        daily_co = Company.objects.create(
+            name="Daily Co", sector="Finance", industry="Banking"
+        )
+        daily_inst = Instrument.objects.create(
+            symbol="DAILY1", company=daily_co, instrument_type="EQUITY",
+            is_active=True, lot_size=1
+        )
+        rec = StockRecommendation.objects.create(
+            instrument=daily_inst,
+            horizon="DELIVERY_SWING",
+            signal="BUY",
+            setup_type="BREAKOUT",
+            as_of=self.t0,
+            entry_type="BREAKOUT_CONFIRMATION",
+            entry_price=Decimal("500.00"),
+            entry_condition="Buy above 500",
+            stop_price=Decimal("480.00"),
+            stop_method="STRUCTURAL",
+            invalidation_reason="Close below 480",
+            target_price=Decimal("540.00"),
+            target_method="MEASURED_MOVE",
+            risk=Decimal("20.00"),
+            reward=Decimal("40.00"),
+            risk_reward_ratio=Decimal("2.0"),
+            confidence="HIGH",
+            confidence_components={},
+            market_context={},
+            sector_context={},
+            supporting_factors=[],
+            risk_factors=[],
+            setup_details={},
+            data_quality={},
+            status="ACTIVE",
+        )
+        # Daily rec has no intraday-specific fields set
+        self.assertIsNone(rec.timeframe)
+        self.assertIsNone(rec.expires_at)
+        self.assertIsNone(rec.strategy_version)
+        self.assertEqual(rec.horizon, "DELIVERY_SWING")

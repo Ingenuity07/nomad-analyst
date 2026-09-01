@@ -92,6 +92,41 @@ class RecommendationStatus(str, Enum):
     EXPIRED = "EXPIRED"        # Validity period elapsed without trigger
     INVALIDATED = "INVALIDATED"  # Setup conditions violated (market data changed)
     CANCELLED = "CANCELLED"    # Manually/programmatically cancelled
+    # Module 11: same-bar ambiguity — stop AND target touched in same OHLC bar
+    AMBIGUOUS_INTRABAR = "AMBIGUOUS_INTRABAR"
+
+
+class ExitReason(str, Enum):
+    """
+    Reason a position was exited or considered closed.
+
+    Used in RecommendationOutcome to record WHY the position ended.
+    AMBIGUOUS_INTRABAR is set when both stop and target are touched in the
+    same OHLC bar and bar-level ordering cannot be determined.
+    """
+    TARGET_HIT           = "TARGET_HIT"
+    TARGET_2_HIT         = "TARGET_2_HIT"         # Intraday partial target 2
+    STOP_HIT             = "STOP_HIT"
+    EXPIRED_SESSION      = "EXPIRED_SESSION"       # Intraday: session close
+    EXPIRED_MAX_DURATION = "EXPIRED_MAX_DURATION"  # Held too long (kill switch)
+    AMBIGUOUS_INTRABAR   = "AMBIGUOUS_INTRABAR"    # Both stop+target in same bar
+    CANCELLED            = "CANCELLED"             # Manually cancelled
+    NO_ENTRY             = "NO_ENTRY"              # Entry was never triggered
+
+
+class AmbiguityPolicy(str, Enum):
+    """
+    Policy for resolving same-bar ambiguity (stop and target touched in one bar).
+
+    CONSERVATIVE: Treat as stop hit — worst case for the strategy.
+                  This is the DEFAULT for honest backtesting.
+    OPTIMISTIC:   Treat as target hit — best case (use only for sensitivity).
+    EXCLUDE:      Exclude ambiguous outcomes from win rate and R calculations.
+                  Ambiguous outcomes are still recorded.
+    """
+    CONSERVATIVE = "CONSERVATIVE"   # Stop wins (default)
+    OPTIMISTIC   = "OPTIMISTIC"     # Target wins
+    EXCLUDE      = "EXCLUDE"        # Exclude from aggregates
 
 
 class EntryType(str, Enum):
@@ -152,3 +187,9 @@ CONFIDENCE_THRESHOLD = {
     ConfidenceLevel.MEDIUM: 45.0,
     ConfidenceLevel.LOW: 0.0,
 }
+
+# ─── Module 11: Outcome tracking constants ───────────────────────────────────
+# Minimum sample count before statistical warnings are suppressed
+MIN_SAMPLE_FOR_STATS = 30
+# Sample below this: SMALL_SAMPLE_WARNING is appended to any report
+SMALL_SAMPLE_WARNING_THRESHOLD = 10

@@ -33,6 +33,10 @@ from llm.tools.implementations.market_tool import (
     GetIntradayRecommendationsTool,
     GetIntradayRecommendationTool,
     GetIntradaySetupsTool,
+    # Module 11 — Outcome tracking & backtesting tools
+    GetRecommendationOutcomeTool,
+    GetStrategyPerformanceTool,
+    GetBacktestResultTool,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +76,10 @@ class MarketResearchService:
         self.tool_registry.register(GetIntradayRecommendationsTool())
         self.tool_registry.register(GetIntradayRecommendationTool())
         self.tool_registry.register(GetIntradaySetupsTool())
+        # Module 11 — Outcome tracking & backtesting tools
+        self.tool_registry.register(GetRecommendationOutcomeTool())
+        self.tool_registry.register(GetStrategyPerformanceTool())
+        self.tool_registry.register(GetBacktestResultTool())
         
         self.agent = MarketResearchAgent(
             provider=self.provider,

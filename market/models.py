@@ -499,6 +499,8 @@ class StockRecommendation(models.Model):
         ('EXPIRED', 'Expired'),
         ('INVALIDATED', 'Invalidated'),
         ('CANCELLED', 'Cancelled'),
+        # Module 11: stop AND target both touched in same OHLC bar
+        ('AMBIGUOUS_INTRABAR', 'Ambiguous Intrabar'),
     )
     ENTRY_TYPE_CHOICES = (
         ('BREAKOUT_CONFIRMATION', 'Breakout Confirmation'),
@@ -568,7 +570,7 @@ class StockRecommendation(models.Model):
     data_quality = models.JSONField(default=dict)
 
     # ── Lifecycle (only mutable fields) ──────────────────────────────────────
-    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='ACTIVE')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     status_updated_at = models.DateTimeField(null=True, blank=True)
 
     # ── LLM explanation (written separately, after deterministic fields are frozen) ─
@@ -639,3 +641,224 @@ class StockRecommendation(models.Model):
             f"{self.instrument.symbol} [{self.horizon}] "
             f"{self.signal} ({self.confidence}) @ {self.as_of.date()}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 11 — Recommendation Outcome Tracking & Backtesting
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class RecommendationOutcome(models.Model):
+    """
+    Immutable outcome record for a recommendation. Created once after the
+    recommendation lifecycle completes (entry triggered or not, exit reached).
+
+    CRITICAL DESIGN RULES:
+      1. NEVER update a row after it is written. Create a new row with an
+         incremented evaluation_version if re-evaluation is needed.
+      2. All price fields are ACTUAL market prices (from bar OHLC), not
+         theoretical prices.
+      3. pnl fields are post-cost (net). gross_pnl fields are pre-cost.
+      4. This model is the source of truth for backtesting and live tracking.
+    """
+    EXIT_REASON_CHOICES = (
+        ('TARGET_HIT',           'Target Hit'),
+        ('TARGET_2_HIT',         'Target 2 Hit'),
+        ('STOP_HIT',             'Stop Hit'),
+        ('EXPIRED_SESSION',      'Expired: Session Close'),
+        ('EXPIRED_MAX_DURATION', 'Expired: Max Duration'),
+        ('AMBIGUOUS_INTRABAR',   'Ambiguous: Same-Bar Stop+Target'),
+        ('CANCELLED',            'Cancelled'),
+        ('NO_ENTRY',             'No Entry Triggered'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Link to the recommendation being evaluated (1:1 per evaluation version)
+    recommendation = models.ForeignKey(
+        StockRecommendation, on_delete=models.CASCADE,
+        related_name='outcomes'
+    )
+    evaluation_version = models.IntegerField(
+        default=1,
+        help_text="Allows re-evaluation without destroying prior outcome records."
+    )
+    evaluated_at = models.DateTimeField(auto_now_add=True)
+
+    # ── Entry ───────────────────────────────────────────────────────────────
+    entry_triggered     = models.BooleanField()
+    entry_timestamp     = models.DateTimeField(null=True, blank=True)
+    actual_entry_price  = models.DecimalField(
+        max_digits=12, decimal_places=4, null=True, blank=True,
+        help_text="Actual bar price at which entry was triggered."
+    )
+
+    # ── Exit ───────────────────────────────────────────────────────────────
+    exit_reason         = models.CharField(
+        max_length=25, choices=EXIT_REASON_CHOICES, null=True, blank=True
+    )
+    exit_timestamp      = models.DateTimeField(null=True, blank=True)
+    actual_exit_price   = models.DecimalField(
+        max_digits=12, decimal_places=4, null=True, blank=True
+    )
+
+    # ── P&L (null when entry not triggered) ─────────────────────────────────
+    gross_pnl_absolute  = models.DecimalField(
+        max_digits=14, decimal_places=4, null=True, blank=True,
+        help_text="Pre-cost P&L in currency units."
+    )
+    gross_pnl_percent   = models.DecimalField(
+        max_digits=10, decimal_places=4, null=True, blank=True,
+        help_text="Pre-cost P&L as percent of entry price."
+    )
+    cost_absolute       = models.DecimalField(
+        max_digits=14, decimal_places=4, null=True, blank=True,
+        help_text="Total transaction cost (brokerage + STT + slippage)."
+    )
+    net_pnl_absolute    = models.DecimalField(
+        max_digits=14, decimal_places=4, null=True, blank=True,
+        help_text="Post-cost P&L in currency units."
+    )
+    net_pnl_percent     = models.DecimalField(
+        max_digits=10, decimal_places=4, null=True, blank=True,
+        help_text="Post-cost P&L as percent of entry price."
+    )
+
+    # ── R-multiple ────────────────────────────────────────────────────────────
+    risk_amount         = models.DecimalField(
+        max_digits=12, decimal_places=4, null=True, blank=True,
+        help_text="Actual risk = |actual_entry_price - stop_price|."
+    )
+    r_multiple          = models.DecimalField(
+        max_digits=10, decimal_places=4, null=True, blank=True,
+        help_text="Net P&L divided by risk amount. Positive = winner."
+    )
+
+    # ── Outcome flags ─────────────────────────────────────────────────────────
+    target_hit          = models.BooleanField(
+        null=True, help_text="True=target hit, False=not hit, None=ambiguous."
+    )
+    stop_hit            = models.BooleanField(
+        null=True, help_text="True=stop hit, False=not hit, None=ambiguous."
+    )
+    ambiguous_intrabar  = models.BooleanField(
+        default=False,
+        help_text="True when stop and target were both touched in the same bar."
+    )
+
+    # ── Excursion (percent of entry) ──────────────────────────────────────
+    max_favorable_excursion = models.DecimalField(
+        max_digits=10, decimal_places=4, null=True, blank=True,
+        help_text="Max favorable excursion as % of entry. Always positive."
+    )
+    max_adverse_excursion = models.DecimalField(
+        max_digits=10, decimal_places=4, null=True, blank=True,
+        help_text="Max adverse excursion as % of entry. Always positive."
+    )
+
+    # ── Duration ─────────────────────────────────────────────────────────────
+    holding_duration_bars    = models.IntegerField(
+        null=True, blank=True,
+        help_text="Number of bars from entry trigger to exit."
+    )
+    holding_duration_seconds = models.BigIntegerField(
+        null=True, blank=True,
+        help_text="Wall-clock duration from entry to exit in seconds."
+    )
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    bars_evaluated           = models.IntegerField(
+        default=0, help_text="Total bars processed during evaluation."
+    )
+    data_quality_warnings    = models.JSONField(
+        default=list,
+        help_text="List of data quality warnings encountered during evaluation."
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['recommendation', 'evaluation_version'],
+                         name='outcome_rec_version_idx'),
+            models.Index(fields=['exit_reason'], name='outcome_exit_reason_idx'),
+            models.Index(fields=['evaluated_at'], name='outcome_evaluated_at_idx'),
+        ]
+        # One outcome per (recommendation, evaluation_version)
+        constraints = [
+            models.UniqueConstraint(
+                fields=['recommendation', 'evaluation_version'],
+                name='unique_outcome_rec_version'
+            )
+        ]
+        ordering = ['-evaluated_at']
+
+    def __str__(self):
+        rec = self.recommendation
+        return (
+            f"Outcome({rec.instrument.symbol} {rec.signal} "
+            f"exit={self.exit_reason} r={self.r_multiple})"
+        )
+
+
+class BacktestRun(models.Model):
+    """
+    Persisted record of a backtest execution.
+
+    A BacktestRun captures the full configuration used, date range,
+    strategy version, and serialised results. Re-running with the same
+    configuration must produce identical results (determinism guarantee).
+
+    BacktestRuns are NEVER auto-scheduled. They must be explicitly triggered.
+    """
+    STATUS_CHOICES = (
+        ('PENDING',  'Pending'),
+        ('RUNNING',  'Running'),
+        ('COMPLETE', 'Complete'),
+        ('FAILED',   'Failed'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    run_id = models.CharField(
+        max_length=100, unique=True,
+        help_text="Human-readable slug identifying this backtest run."
+    )
+
+    # Configuration snapshot — frozen at run start
+    config = models.JSONField(help_text="Serialised BacktestConfig used for this run.")
+
+    # Run metadata
+    status      = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING')
+    started_at  = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    # Dimension slices (denormalised for easy querying)
+    universe_name    = models.CharField(max_length=100)
+    timeframe        = models.CharField(max_length=10)
+    horizon          = models.CharField(max_length=20)
+    start_date       = models.DateField()
+    end_date         = models.DateField()
+    strategy_version = models.CharField(max_length=20)
+
+    # Results (written on completion)
+    result                = models.JSONField(
+        null=True, blank=True,
+        help_text="Serialised PerformanceReport produced by this run."
+    )
+    data_quality_warnings = models.JSONField(
+        default=list,
+        help_text="Data quality warnings encountered during the run."
+    )
+    error_message = models.TextField(
+        null=True, blank=True,
+        help_text="Error details if status=FAILED."
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['universe_name', 'timeframe', 'horizon']),
+            models.Index(fields=['started_at']),
+        ]
+        ordering = ['-started_at']
+
+    def __str__(self):
+        return f"BacktestRun({self.run_id} status={self.status})"

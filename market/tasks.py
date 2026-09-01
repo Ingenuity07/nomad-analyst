@@ -386,3 +386,38 @@ def expire_intraday_session_recommendations():
     expired = _expire(now)
     logger.info(f"expire_intraday_session_recommendations: marked {expired} recs as EXPIRED.")
     return {"status": "Complete", "expired_count": expired}
+
+
+# ─── Module 11 — Recommendation Outcome Tracking ─────────────────────────────
+
+@shared_task
+def evaluate_recommendation_outcomes():
+    """
+    Module 11 — Live outcome evaluation for active recommendations.
+
+    Evaluates all ACTIVE StockRecommendations against newly available market
+    bar data. Runs every 5 minutes during market hours.
+
+    Processing is idempotent: running twice on the same bar data produces
+    the same outcome record (no duplicates).
+
+    CRITICAL: This task does NOT run full historical backtests. For backtesting,
+    use BacktestRunner.run() explicitly.
+    """
+    from django.utils import timezone
+    from market.services.market_session import IndianMarketSession
+    from market.services.outcome_service import RecommendationOutcomeService
+
+    now = timezone.now()
+
+    # Self-gate: only run during market hours (extended slightly for evaluation)
+    session = IndianMarketSession()
+    if not session.is_market_open(now):
+        logger.info("evaluate_recommendation_outcomes: market closed, skipping.")
+        return {"status": "SKIPPED", "reason": "market_closed"}
+
+    svc = RecommendationOutcomeService()
+    summary = svc.evaluate_active_recommendations(as_of=now)
+
+    logger.info(f"evaluate_recommendation_outcomes: complete. {summary}")
+    return {"status": "Complete", **summary}
