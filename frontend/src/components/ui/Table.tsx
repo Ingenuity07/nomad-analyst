@@ -3,7 +3,7 @@ import React from 'react';
 export interface TableColumn<T> {
   key: string;
   header: string;
-  render?: (item: T) => React.ReactNode;
+  render?: (item: T, index: number) => React.ReactNode;
   align?: 'left' | 'center' | 'right';
   isNumeric?: boolean;
   width?: string;
@@ -64,7 +64,7 @@ export function Table<T>({
               </td>
             </tr>
           ) : (
-            data.map((item) => (
+            data.map((item, index) => (
               <tr
                 key={keyExtractor(item)}
                 onClick={() => onRowClick && onRowClick(item)}
@@ -94,7 +94,7 @@ export function Table<T>({
                         fontVariantNumeric: col.isNumeric ? 'tabular-nums' : undefined,
                       }}
                     >
-                      {col.render ? col.render(item) : val !== undefined && val !== null ? String(val) : '—'}
+                      {col.render ? col.render(item, index) : val !== undefined && val !== null ? String(val) : '—'}
                     </td>
                   );
                 })}

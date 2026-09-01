@@ -322,14 +322,14 @@ export interface StockOpportunitySnapshot {
   sector: string;
   as_of: string;
   universe: string;
-  horizon: 'INTRADAY' | 'DELIVERY_SWING' | 'DELIVERY_POSITIONAL';
+  horizon: 'INTRADAY' | 'DELIVERY_SWING' | 'DELIVERY_POSITIONAL' | string;
   opportunity_type: string;
-  final_opportunity_score: number;
+  final_opportunity_score: number | string;
   component_scores: Record<string, number>;
   supporting_features: Record<string, any>;
   risks: string[];
   data_quality: Record<string, any>;
-  created_at: string;
+  created_at?: string;
 }
 
 export interface StockRecommendation {

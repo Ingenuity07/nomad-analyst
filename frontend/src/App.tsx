@@ -6,7 +6,7 @@ import { AppShell } from '@/components/layout/AppShell';
 
 import { MarketPage } from '@/pages/MarketPage';
 import { IntradayPageShell } from '@/pages/IntradayPageShell';
-import { DeliveryPageShell } from '@/pages/DeliveryPageShell';
+import { DeliveryPage } from '@/pages/DeliveryPage';
 import { StocksPageShell } from '@/pages/StocksPageShell';
 import { StockDetailPageShell } from '@/pages/StockDetailPageShell';
 import { RecommendationsPageShell } from '@/pages/RecommendationsPageShell';
@@ -24,7 +24,7 @@ export const App: React.FC = () => {
             <Route index element={<Navigate to="/market" replace />} />
             <Route path="market" element={<MarketPage />} />
             <Route path="intraday" element={<IntradayPageShell />} />
-            <Route path="delivery" element={<DeliveryPageShell />} />
+            <Route path="delivery" element={<DeliveryPage />} />
             <Route path="stocks" element={<StocksPageShell />} />
             <Route path="stocks/:symbol" element={<StockDetailPageShell />} />
             <Route path="recommendations" element={<RecommendationsPageShell />} />
