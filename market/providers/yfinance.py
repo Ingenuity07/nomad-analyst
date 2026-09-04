@@ -1,5 +1,6 @@
 import logging
 import requests
+import urllib.parse
 from typing import Dict, Any
 from market.providers.base import MarketDataProvider
 from market.exceptions import (
@@ -34,7 +35,9 @@ class YFinanceMarketProvider(MarketDataProvider):
         else:
             yfinance_symbol = f"{upper_symbol}.NS"
 
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol}?interval=1d&range=1d"
+        # URL-encode the symbol path segment to handle special characters (e.g. M&M.NS → M%26M.NS)
+        yfinance_symbol_encoded = urllib.parse.quote(yfinance_symbol, safe='')
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol_encoded}?interval=1d&range=1d"
         headers = {
             "User-Agent": self.user_agent,
             "Accept": "application/json"
@@ -112,12 +115,14 @@ class YFinanceMarketProvider(MarketDataProvider):
         if not interval:
             raise ValueError(f"Unsupported timeframe: '{timeframe}'")
 
+        # URL-encode the symbol path segment to handle special characters (e.g. M&M.NS → M%26M.NS)
+        yfinance_symbol_encoded = urllib.parse.quote(yfinance_symbol, safe='')
         if start_date and end_date:
             period1 = int(start_date.timestamp())
             period2 = int(end_date.timestamp())
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol}?interval={interval}&period1={period1}&period2={period2}"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol_encoded}?interval={interval}&period1={period1}&period2={period2}"
         else:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol}?interval={interval}&range=1y"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yfinance_symbol_encoded}?interval={interval}&range=1y"
 
         headers = {
             "User-Agent": self.user_agent,

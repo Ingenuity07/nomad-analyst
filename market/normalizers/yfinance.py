@@ -28,7 +28,7 @@ class YFinanceNormalizer(BaseNormalizer):
             
             # Strip suffix (.NS or .BO)
             clean_symbol = raw_symbol.split('.')[0].strip()
-            if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-\^=]+$", clean_symbol):
+            if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-\^=&]+$", clean_symbol):
                 raise ValueError(f"Invalid symbol characters: '{clean_symbol}'")
                 
             # 2. Validate Exchange

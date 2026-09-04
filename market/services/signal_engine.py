@@ -566,14 +566,14 @@ class SignalEngine:
                     sector_context = sec_item
                     break
 
-        # ── Fundamental data (PIT-safe) ───────────────────────────────────────
+        # ── Fundamental data (strict PIT-safe using filing_date) ──────────────
         company = instrument.company
         fundamental_data: Dict[str, Any] = {}
         if company:
             visible_stmts = IncomeStatement.objects.filter(
                 company=company,
                 period_type="ANNUAL",
-                period_end__lte=dt_as_of.date()
+                filing_date__lte=dt_as_of.date()
             ).values_list('period_string', flat=True)
 
             if visible_stmts:

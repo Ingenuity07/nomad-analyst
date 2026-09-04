@@ -176,12 +176,12 @@ class OpportunityDiscoveryService:
         # Latest MarketContextSnapshot
         mkt_snapshot = MarketContextSnapshot.objects.filter(as_of__lte=dt_as_of).order_by('-as_of').first()
         
-        # Latest visible Fundamental metrics (respecting PIT constraints)
+        # Latest visible Fundamental metrics (respecting strict PIT filing_date constraints)
         companies = [inst.company for inst in instruments]
         visible_statements = IncomeStatement.objects.filter(
             company__in=companies,
             period_type="ANNUAL",
-            period_end__lte=dt_as_of.date()
+            filing_date__lte=dt_as_of.date()
         )
         
         company_visible_periods = {}

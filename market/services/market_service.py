@@ -23,27 +23,74 @@ class MarketService:
         self.provider = provider or YFinanceMarketProvider()
         self.normalizer = normalizer or YFinanceNormalizer()
         
-        # Sector and metadata mapping for common Indian stocks
+        # Sector and metadata mapping for all NIFTY 50 constituents + indices.
+        # Source: data/universe/nifty50_constituents_2026-09-03.json
+        # Extended to cover all 50 equities so that fetch_and_save_historical_ohlcv
+        # does not overwrite bootstrapped Company records with "Unknown" sector/industry.
         self._company_metadata = {
-            "RELIANCE": {"name": "Reliance Industries Limited", "sector": "Energy", "industry": "Oil & Gas", "website": "https://www.ril.com"},
-            "TCS": {"name": "Tata Consultancy Services Limited", "sector": "Technology", "industry": "IT Services", "website": "https://www.tcs.com"},
-            "INFY": {"name": "Infosys Limited", "sector": "Technology", "industry": "IT Services", "website": "https://www.infosys.com"},
-            "HDFCBANK": {"name": "HDFC Bank Limited", "sector": "Financial Services", "industry": "Private Banking", "website": "https://www.hdfcbank.com"},
-            "ICICIBANK": {"name": "ICICI Bank Limited", "sector": "Financial Services", "industry": "Private Banking", "website": "https://www.icicibank.com"},
-            "SBIN": {"name": "State Bank of India", "sector": "Financial Services", "industry": "Public Banking", "website": "https://www.sbi.co.in"},
-            "BHARTIENTL": {"name": "Bharti Airtel Limited", "sector": "Telecommunications", "industry": "Telecom Services", "website": "https://www.airtel.in"},
-            
-            # Index / Macro / Global indicators
-            "^NSEI": {"name": "Nifty 50 Index", "sector": "Index", "industry": "Index", "website": None},
-            "^NSEBANK": {"name": "Nifty Bank Index", "sector": "Index", "industry": "Index", "website": None},
-            "^GSPC": {"name": "S&P 500 Index", "sector": "Global Index", "industry": "Global Index", "website": None},
-            "^IXIC": {"name": "Nasdaq Composite Index", "sector": "Global Index", "industry": "Global Index", "website": None},
-            "^DJI": {"name": "Dow Jones Industrial Average", "sector": "Global Index", "industry": "Global Index", "website": None},
-            "^VIX": {"name": "CBOE Volatility Index", "sector": "Global Index", "industry": "Global Index", "website": None},
-            "USDINR=X": {"name": "USD/INR Exchange Rate", "sector": "Currency", "industry": "Currency", "website": None},
-            "CL=F": {"name": "Crude Oil Futures", "sector": "Commodity", "industry": "Commodity", "website": None},
-            "GC=F": {"name": "Gold Futures", "sector": "Commodity", "industry": "Commodity", "website": None},
-            "^TNX": {"name": "US 10-Year Treasury Yield", "sector": "Macro", "industry": "Interest Rate", "website": None},
+            # ── NIFTY 50 Equities ─────────────────────────────────────────────
+            "ADANIENT":   {"name": "Adani Enterprises Limited",                    "sector": "Diversified",          "industry": "Diversified Conglomerate",          "website": "https://www.adanienterprises.com"},
+            "ADANIPORTS": {"name": "Adani Ports and Special Economic Zone Limited", "sector": "Infrastructure",       "industry": "Port & Logistics",                  "website": "https://www.adaniports.com"},
+            "APOLLOHOSP": {"name": "Apollo Hospitals Enterprise Limited",           "sector": "Healthcare",           "industry": "Hospitals & Healthcare Services",    "website": "https://www.apollohospitals.com"},
+            "ASIANPAINT": {"name": "Asian Paints Limited",                          "sector": "Consumer Staples",     "industry": "Paints & Coatings",                 "website": "https://www.asianpaints.com"},
+            "AXISBANK":   {"name": "Axis Bank Limited",                             "sector": "Financial Services",   "industry": "Private Banking",                   "website": "https://www.axisbank.com"},
+            "BAJAJ-AUTO": {"name": "Bajaj Auto Limited",                            "sector": "Automobile",           "industry": "2-3 Wheelers",                      "website": "https://www.bajajauto.com"},
+            "BAJFINANCE": {"name": "Bajaj Finance Limited",                         "sector": "Financial Services",   "industry": "Non-Banking Financial Company",     "website": "https://www.bajajfinserv.in"},
+            "BAJAJFINSV": {"name": "Bajaj Finserv Limited",                         "sector": "Financial Services",   "industry": "Diversified Financial Services",    "website": "https://www.bajajfinserv.in"},
+            "BPCL":       {"name": "Bharat Petroleum Corporation Limited",          "sector": "Energy",               "industry": "Oil & Gas Refining & Marketing",    "website": "https://www.bharatpetroleum.in"},
+            "BHARTIARTL": {"name": "Bharti Airtel Limited",                         "sector": "Telecommunications",   "industry": "Telecom Services",                  "website": "https://www.airtel.in"},
+            "BRITANNIA":  {"name": "Britannia Industries Limited",                  "sector": "Consumer Staples",     "industry": "Food Products",                     "website": "https://www.britannia.co.in"},
+            "CIPLA":      {"name": "Cipla Limited",                                 "sector": "Pharmaceutical",       "industry": "Pharmaceuticals",                   "website": "https://www.cipla.com"},
+            "COALINDIA":  {"name": "Coal India Limited",                            "sector": "Metals & Mining",      "industry": "Coal & Consumable Fuels",           "website": "https://www.coalindia.in"},
+            "DIVISLAB":   {"name": "Divi's Laboratories Limited",                   "sector": "Pharmaceutical",       "industry": "Pharmaceuticals",                   "website": "https://www.divislab.com"},
+            "DRREDDY":    {"name": "Dr. Reddy's Laboratories Limited",              "sector": "Pharmaceutical",       "industry": "Pharmaceuticals",                   "website": "https://www.drreddys.com"},
+            "EICHERMOT":  {"name": "Eicher Motors Limited",                         "sector": "Automobile",           "industry": "2-3 Wheelers",                      "website": "https://www.eichermotors.com"},
+            "GRASIM":     {"name": "Grasim Industries Limited",                     "sector": "Diversified",          "industry": "Diversified Industrials",           "website": "https://www.grasim.com"},
+            "HCLTECH":    {"name": "HCL Technologies Limited",                      "sector": "Technology",           "industry": "IT Services & Consulting",          "website": "https://www.hcltech.com"},
+            "HDFCBANK":   {"name": "HDFC Bank Limited",                             "sector": "Financial Services",   "industry": "Private Banking",                   "website": "https://www.hdfcbank.com"},
+            "HDFCLIFE":   {"name": "HDFC Life Insurance Company Limited",           "sector": "Financial Services",   "industry": "Insurance",                         "website": "https://www.hdfclife.com"},
+            "HEROMOTOCO": {"name": "Hero MotoCorp Limited",                         "sector": "Automobile",           "industry": "2-3 Wheelers",                      "website": "https://www.heromotocorp.com"},
+            "HINDALCO":   {"name": "Hindalco Industries Limited",                   "sector": "Metals & Mining",      "industry": "Aluminium",                         "website": "https://www.hindalco.com"},
+            "HINDUNILVR": {"name": "Hindustan Unilever Limited",                    "sector": "Consumer Staples",     "industry": "Personal Products",                 "website": "https://www.hul.co.in"},
+            "ICICIBANK":  {"name": "ICICI Bank Limited",                            "sector": "Financial Services",   "industry": "Private Banking",                   "website": "https://www.icicibank.com"},
+            "INDUSINDBK": {"name": "IndusInd Bank Limited",                         "sector": "Financial Services",   "industry": "Private Banking",                   "website": "https://www.indusind.com"},
+            "INFY":       {"name": "Infosys Limited",                               "sector": "Technology",           "industry": "IT Services & Consulting",          "website": "https://www.infosys.com"},
+            "ITC":        {"name": "ITC Limited",                                   "sector": "Consumer Staples",     "industry": "Tobacco",                           "website": "https://www.itcportal.com"},
+            "JSWSTEEL":   {"name": "JSW Steel Limited",                             "sector": "Metals & Mining",      "industry": "Steel",                             "website": "https://www.jsw.in/steel"},
+            "KOTAKBANK":  {"name": "Kotak Mahindra Bank Limited",                   "sector": "Financial Services",   "industry": "Private Banking",                   "website": "https://www.kotak.com"},
+            "LT":         {"name": "Larsen & Toubro Limited",                       "sector": "Infrastructure",       "industry": "Engineering & Construction",         "website": "https://www.larsentoubro.com"},
+            "M&M":        {"name": "Mahindra & Mahindra Limited",                   "sector": "Automobile",           "industry": "Cars & Utility Vehicles",           "website": "https://www.mahindra.com"},
+            "MARUTI":     {"name": "Maruti Suzuki India Limited",                   "sector": "Automobile",           "industry": "Cars & Utility Vehicles",           "website": "https://www.marutisuzuki.com"},
+            "NESTLEIND":  {"name": "Nestle India Limited",                          "sector": "Consumer Staples",     "industry": "Food Products",                     "website": "https://www.nestle.in"},
+            "NTPC":       {"name": "NTPC Limited",                                  "sector": "Power",                "industry": "Electric Utilities",                "website": "https://www.ntpc.co.in"},
+            "ONGC":       {"name": "Oil and Natural Gas Corporation Limited",       "sector": "Energy",               "industry": "Oil & Gas Exploration & Production", "website": "https://www.ongcindia.com"},
+            "POWERGRID":  {"name": "Power Grid Corporation of India Limited",       "sector": "Power",                "industry": "Electric Utilities",                "website": "https://www.powergridindia.com"},
+            "RELIANCE":   {"name": "Reliance Industries Limited",                   "sector": "Energy",               "industry": "Oil & Gas - Integrated",            "website": "https://www.ril.com"},
+            "SBILIFE":    {"name": "SBI Life Insurance Company Limited",            "sector": "Financial Services",   "industry": "Insurance",                         "website": "https://www.sbilife.co.in"},
+            "SHRIRAMFIN": {"name": "Shriram Finance Limited",                       "sector": "Financial Services",   "industry": "Non-Banking Financial Company",     "website": "https://www.shriramfinance.in"},
+            "SBIN":       {"name": "State Bank of India",                           "sector": "Financial Services",   "industry": "Public Banking",                    "website": "https://www.sbi.co.in"},
+            "SUNPHARMA":  {"name": "Sun Pharmaceutical Industries Limited",         "sector": "Pharmaceutical",       "industry": "Pharmaceuticals",                   "website": "https://www.sunpharma.com"},
+            "TCS":        {"name": "Tata Consultancy Services Limited",             "sector": "Technology",           "industry": "IT Services & Consulting",          "website": "https://www.tcs.com"},
+            "TATACONSUM": {"name": "Tata Consumer Products Limited",                "sector": "Consumer Staples",     "industry": "Food Products",                     "website": "https://www.tataconsumer.com"},
+            "TATAMOTORS": {"name": "Tata Motors Limited",                           "sector": "Automobile",           "industry": "Commercial Vehicles",               "website": "https://www.tatamotors.com"},
+            "TATASTEEL":  {"name": "Tata Steel Limited",                            "sector": "Metals & Mining",      "industry": "Steel",                             "website": "https://www.tatasteel.com"},
+            "TECHM":      {"name": "Tech Mahindra Limited",                         "sector": "Technology",           "industry": "IT Services & Consulting",          "website": "https://www.techmahindra.com"},
+            "TITAN":      {"name": "Titan Company Limited",                         "sector": "Consumer Discretionary", "industry": "Specialty Retail",                "website": "https://www.titancompany.in"},
+            "TRENT":      {"name": "Trent Limited",                                 "sector": "Consumer Discretionary", "industry": "Specialty Retail",                "website": "https://www.trентlimited.com"},
+            "ULTRACEMCO": {"name": "UltraTech Cement Limited",                      "sector": "Cement",               "industry": "Construction Materials",            "website": "https://www.ultratechcement.com"},
+            "WIPRO":      {"name": "Wipro Limited",                                 "sector": "Technology",           "industry": "IT Services & Consulting",          "website": "https://www.wipro.com"},
+
+            # ── Index / Macro / Global indicators ────────────────────────────
+            "^NSEI":    {"name": "Nifty 50 Index",                  "sector": "Index",        "industry": "Index",           "website": None},
+            "^NSEBANK": {"name": "Nifty Bank Index",                "sector": "Index",        "industry": "Index",           "website": None},
+            "^GSPC":    {"name": "S&P 500 Index",                   "sector": "Global Index", "industry": "Global Index",    "website": None},
+            "^IXIC":    {"name": "Nasdaq Composite Index",          "sector": "Global Index", "industry": "Global Index",    "website": None},
+            "^DJI":     {"name": "Dow Jones Industrial Average",    "sector": "Global Index", "industry": "Global Index",    "website": None},
+            "^VIX":     {"name": "CBOE Volatility Index",           "sector": "Global Index", "industry": "Global Index",    "website": None},
+            "USDINR=X": {"name": "USD/INR Exchange Rate",           "sector": "Currency",     "industry": "Currency",        "website": None},
+            "CL=F":     {"name": "Crude Oil Futures",               "sector": "Commodity",    "industry": "Commodity",       "website": None},
+            "GC=F":     {"name": "Gold Futures",                    "sector": "Commodity",    "industry": "Commodity",       "website": None},
+            "^TNX":     {"name": "US 10-Year Treasury Yield",       "sector": "Macro",        "industry": "Interest Rate",   "website": None},
         }
 
     def fetch_and_save_quote(self, symbol: str) -> MarketQuote:
@@ -160,7 +207,7 @@ class MarketService:
         if not raw_symbol or not isinstance(raw_symbol, str):
             raise ValueError("Invalid symbol in historical metadata.")
         clean_symbol = raw_symbol.split('.')[0].strip()
-        if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-\^=]+$", clean_symbol):
+        if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-\^=&]+$", clean_symbol):
             raise ValueError(f"Invalid symbol characters: '{clean_symbol}'")
             
         # Determine exchange, instrument type and currency

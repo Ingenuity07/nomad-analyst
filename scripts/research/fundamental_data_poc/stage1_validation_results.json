@@ -1,0 +1,56 @@
+[
+  {
+    "symbol": "RELIANCE",
+    "taxonomy": "INDAS",
+    "revenue": "243865.00",
+    "ebitda": "43789.00",
+    "pat": "21930.00",
+    "eps": "13.70",
+    "filing_date": "2025-01-16"
+  },
+  {
+    "symbol": "TCS",
+    "taxonomy": "INDAS",
+    "revenue": "63973.00",
+    "ebitda": "17034.00",
+    "pat": "12444.00",
+    "eps": "34.21",
+    "filing_date": "2025-01-09"
+  },
+  {
+    "symbol": "HDFCBANK",
+    "taxonomy": "BANKING",
+    "revenue": "112193.94",
+    "ebitda": "27930.16",
+    "pat": "17656.61",
+    "eps": "23.11",
+    "filing_date": "2025-01-23"
+  },
+  {
+    "symbol": "BAJFINANCE",
+    "taxonomy": "NBFC_INDAS",
+    "revenue": "18035.11",
+    "ebitda": "12343.95",
+    "pat": "4308.19",
+    "eps": "68.63",
+    "filing_date": "2025-01-29"
+  },
+  {
+    "symbol": "COALINDIA",
+    "taxonomy": "INDAS",
+    "revenue": "35779.78",
+    "ebitda": "12317.24",
+    "pat": "8491.22",
+    "eps": "13.80",
+    "filing_date": "2025-01-27"
+  },
+  {
+    "symbol": "TMPV",
+    "taxonomy": "INDAS",
+    "revenue": "113575.00",
+    "ebitda": "13081.00",
+    "pat": "5578.00",
+    "eps": "14.81",
+    "filing_date": "2025-01-29"
+  }
+]

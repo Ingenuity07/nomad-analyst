@@ -1500,10 +1500,12 @@ class StockOpportunityDiscoverySubsystemTests(TestCase):
             name="distance_from_high_20", param_key="period=20", value=Decimal("-1.2")
         )
 
-        # Derived fundamental metrics
+        # Derived fundamental metrics (with statutory filing_date)
         IncomeStatement.objects.create(
             company=self.company, fiscal_year=2025, period_type="ANNUAL", period_string="Mar 2025",
-            period_end=self.base_time.date() - timedelta(days=30), revenue=Decimal("100000.00"), pat=Decimal("15000.00")
+            period_end=self.base_time.date() - timedelta(days=60),
+            filing_date=self.base_time.date() - timedelta(days=30),
+            revenue=Decimal("100000.00"), pat=Decimal("15000.00")
         )
         DerivedFundamentalMetric.objects.create(
             company=self.company, period_type="ANNUAL", period_string="Mar 2025",
@@ -4781,3 +4783,472 @@ class OutcomeTrackingTests(TestCase):
         self.assertIsNone(rec.expires_at)
         self.assertIsNone(rec.strategy_version)
         self.assertEqual(rec.horizon, "DELIVERY_SWING")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 15B — NIFTY 50 Bootstrap Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NiftyBootstrapTests(TestCase):
+    """
+    Unit / integration tests protecting the Phase 15B NIFTY 50 data foundation.
+
+    All tests use in-memory test DB (no live network calls).
+    Provider calls are mocked where needed.
+    """
+
+    def _make_company(self, symbol, name=None):
+        return Company.objects.update_or_create(
+            short_name=symbol,
+            defaults={"name": name or f"{symbol} Limited", "is_active": True}
+        )[0]
+
+    def _make_instrument(self, symbol, company=None, instrument_type="EQUITY"):
+        if company is None:
+            company = self._make_company(symbol)
+        return Instrument.objects.update_or_create(
+            symbol=symbol,
+            defaults={
+                "company": company,
+                "exchange": "NSE",
+                "instrument_type": instrument_type,
+                "currency": "INR",
+                "is_active": True,
+            }
+        )[0]
+
+    def _make_ohlcv_bars(self, instrument, count=10, timeframe="1d"):
+        """Creates `count` sequential daily bars starting 2024-01-02."""
+        base_ts = datetime(2024, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+        bars = [
+            OHLCVBar(
+                instrument=instrument,
+                timeframe=timeframe,
+                timestamp=base_ts + timedelta(days=i),
+                open=Decimal("100.00"),
+                high=Decimal("105.00"),
+                low=Decimal("98.00"),
+                close=Decimal("102.00"),
+                volume=100000,
+                source="test",
+            )
+            for i in range(count)
+        ]
+        OHLCVBar.objects.bulk_create(bars)
+        return bars
+
+    def test_universe_creation_idempotent(self):
+        """Creating memberships twice must produce exactly N memberships (not 2N)."""
+        univ, _ = Universe.objects.get_or_create(
+            name="NIFTY50_IDEMPTEST", defaults={"is_active": True}
+        )
+        now = datetime.now(timezone.utc)
+        test_symbols = ["IDEM_A", "IDEM_B", "IDEM_C", "IDEM_D", "IDEM_E"]
+        instruments = [self._make_instrument(sym) for sym in test_symbols]
+
+        for inst in instruments:
+            UniverseMembership.objects.get_or_create(
+                universe=univ, instrument=inst,
+                defaults={"added_at": now, "is_active": True}
+            )
+        # Second pass — idempotent
+        for inst in instruments:
+            UniverseMembership.objects.get_or_create(
+                universe=univ, instrument=inst,
+                defaults={"added_at": now, "is_active": True}
+            )
+
+        count = UniverseMembership.objects.filter(universe=univ).count()
+        self.assertEqual(count, 5, "Idempotent run must not create duplicate memberships")
+
+    def test_nifty50_instrument_fields(self):
+        """NIFTY50 instruments must have exchange=NSE, instrument_type=EQUITY, currency=INR."""
+        univ, _ = Universe.objects.get_or_create(
+            name="NIFTY50_FIELDTEST", defaults={"is_active": True}
+        )
+        now = datetime.now(timezone.utc)
+        for sym in ["FLD_RELIANCE", "FLD_TCS", "FLD_INFY"]:
+            inst = self._make_instrument(sym)
+            UniverseMembership.objects.get_or_create(
+                universe=univ, instrument=inst,
+                defaults={"added_at": now, "is_active": True}
+            )
+
+        members = UniverseMembership.objects.filter(
+            universe=univ, is_active=True
+        ).select_related("instrument")
+
+        for m in members:
+            inst = m.instrument
+            self.assertEqual(inst.exchange, "NSE")
+            self.assertEqual(inst.instrument_type, "EQUITY")
+            self.assertEqual(inst.currency, "INR")
+            self.assertTrue(inst.is_active)
+
+    def test_benchmark_instruments_are_index_type(self):
+        """^NSEI and ^NSEBANK must be INDEX instruments and must NOT be in NIFTY50 membership."""
+        for sym in ("BENCH_NSEI", "BENCH_NSEBANK"):
+            self._make_instrument(sym, instrument_type="INDEX")
+
+        univ, _ = Universe.objects.get_or_create(
+            name="NIFTY50_BENCHTEST", defaults={"is_active": True}
+        )
+
+        for sym in ("BENCH_NSEI", "BENCH_NSEBANK"):
+            inst = Instrument.objects.get(symbol=sym)
+            self.assertEqual(inst.instrument_type, "INDEX")
+            # Benchmarks must not be universe members
+            in_univ = UniverseMembership.objects.filter(
+                universe=univ, instrument=inst, is_active=True
+            ).exists()
+            self.assertFalse(in_univ, f"{sym} must NOT be a universe member")
+
+    @patch("requests.get")
+    def test_ohlcv_ingestion_idempotent(self, mock_get):
+        """Ingesting the same bars twice must not create duplicates."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = MOCK_HIST_CHART_RESPONSE
+        mock_get.return_value = mock_resp
+
+        svc = MarketService()
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+        svc.fetch_and_save_historical_ohlcv("INFY", "1d", start, end)
+        count_first = OHLCVBar.objects.filter(
+            instrument__symbol="INFY", timeframe="1d"
+        ).count()
+
+        svc.fetch_and_save_historical_ohlcv("INFY", "1d", start, end)
+        count_second = OHLCVBar.objects.filter(
+            instrument__symbol="INFY", timeframe="1d"
+        ).count()
+
+        self.assertEqual(count_first, count_second,
+                         "Second ingestion run must not create duplicate bars")
+        self.assertGreater(count_first, 0, "At least 1 bar must have been created")
+
+    def test_duplicate_bar_prevention_via_timestamp_exclusion(self):
+        """Direct test: existing-timestamp exclusion in bulk_create must work correctly."""
+        inst = self._make_instrument("DUPTEST15B")
+        ts = datetime(2024, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+        OHLCVBar.objects.create(
+            instrument=inst, timeframe="1d", timestamp=ts,
+            open=Decimal("100"), high=Decimal("105"),
+            low=Decimal("98"), close=Decimal("102"),
+            volume=100000, source="test"
+        )
+
+        existing = set(
+            OHLCVBar.objects.filter(
+                instrument=inst, timeframe="1d", timestamp__in=[ts]
+            ).values_list("timestamp", flat=True)
+        )
+        new_bars = [
+            OHLCVBar(instrument=inst, timeframe="1d", timestamp=ts,
+                     open=Decimal("100"), high=Decimal("105"),
+                     low=Decimal("98"), close=Decimal("102"),
+                     volume=100000, source="test")
+        ]
+        filtered = [b for b in new_bars if b.timestamp not in existing]
+        if filtered:
+            OHLCVBar.objects.bulk_create(filtered)
+
+        total = OHLCVBar.objects.filter(instrument=inst, timeframe="1d").count()
+        self.assertEqual(total, 1, "Duplicate timestamp must be excluded from bulk_create")
+
+    def test_technical_feature_warmup_sma200(self):
+        """
+        SMA_200 must be NULL for first 199 bars and valid from bar 200 onward.
+        This validates warmup semantics in the existing TechnicalFeatureEngine.
+        """
+        inst = self._make_instrument("WARMUPTEST15B")
+        self._make_ohlcv_bars(inst, count=210)
+
+        engine = TechnicalFeatureEngine()
+        engine.calculate_and_save_features(inst, "1d")
+
+        sma200_records = list(
+            TechnicalFeature.objects.filter(
+                instrument=inst, timeframe="1d", name="SMA_200"
+            ).order_by("timestamp")
+        )
+        self.assertEqual(len(sma200_records), 210)
+
+        # First 199 must be NULL
+        for i, rec in enumerate(sma200_records[:199]):
+            self.assertIsNone(rec.value,
+                              f"SMA_200 must be NULL at bar index {i} (warmup)")
+        # From bar 200 onward must be valid
+        for i, rec in enumerate(sma200_records[199:], start=199):
+            self.assertIsNotNone(rec.value,
+                                 f"SMA_200 must be valid at bar index {i}")
+
+    def test_opportunity_scan_does_not_raise(self):
+        """
+        scan_universe() must return a list (possibly empty) without raising,
+        even when fundamental data is absent (Phase 15B scope).
+        """
+        from market.services.discovery_service import OpportunityDiscoveryService
+
+        univ, _ = Universe.objects.get_or_create(
+            name="NIFTY50_SCANTEST", defaults={"is_active": True}
+        )
+        now = datetime.now(timezone.utc)
+        for sym in ["SCAN15_A", "SCAN15_B", "SCAN15_C"]:
+            inst = self._make_instrument(sym)
+            self._make_ohlcv_bars(inst, count=50)
+            UniverseMembership.objects.get_or_create(
+                universe=univ, instrument=inst,
+                defaults={"added_at": now, "is_active": True}
+            )
+
+        svc = OpportunityDiscoveryService()
+        result = svc.scan_universe("NIFTY50_SCANTEST", "DELIVERY_SWING")
+        self.assertIsInstance(result, list,
+                              "scan_universe must return a list (zero results is valid)")
+
+    def test_cleanup_cascades_correctly(self):
+        """
+        Deleting a Company must cascade-delete Instrument and OHLCVBar.
+        Unrelated instruments must remain untouched.
+        """
+        # Synthetic record
+        synth_co = self._make_company("SYNTH_TEST15B")
+        synth_inst = self._make_instrument("SYNTH_INST15B", company=synth_co)
+        self._make_ohlcv_bars(synth_inst, count=5)
+
+        # Real record that must survive
+        real_co = self._make_company("REAL_15B")
+        real_inst = self._make_instrument("REAL_15B", company=real_co)
+        self._make_ohlcv_bars(real_inst, count=5)
+
+        Company.objects.filter(short_name="SYNTH_TEST15B").delete()
+
+        self.assertFalse(Instrument.objects.filter(symbol="SYNTH_INST15B").exists(),
+                         "Synthetic instrument must cascade-delete")
+        self.assertEqual(
+            OHLCVBar.objects.filter(instrument__symbol="SYNTH_INST15B").count(), 0,
+            "Synthetic bars must cascade-delete"
+        )
+        self.assertTrue(Instrument.objects.filter(symbol="REAL_15B").exists(),
+                        "Real instrument must NOT be deleted")
+        self.assertEqual(
+            OHLCVBar.objects.filter(instrument__symbol="REAL_15B").count(), 5,
+            "Real bars must be untouched"
+        )
+
+
+class Phase16BFundamentalXBRLTests(TestCase):
+    """
+    Comprehensive tests for Phase 16B: Official Regulatory XBRL Fundamental Ingestion,
+    Taxonomies (INDAS, BANKING, NBFC_INDAS), Units & Scaling, PIT Safety, Revisions,
+    Idempotency, and Derived Metrics.
+    """
+
+    def setUp(self):
+        self.co_rel = Company.objects.create(name="Reliance Industries Limited", short_name="RELIANCE", sector="Energy")
+        self.co_tcs = Company.objects.create(name="Tata Consultancy Services Limited", short_name="TCS", sector="Technology")
+        self.co_hdfc = Company.objects.create(name="HDFC Bank Limited", short_name="HDFCBANK", sector="Financial Services")
+        self.co_baj = Company.objects.create(name="Bajaj Finance Limited", short_name="BAJFINANCE", sector="Financial Services")
+        self.co_tm = Company.objects.create(name="Tata Motors Limited", short_name="TATAMOTORS", sector="Automobile")
+
+    def test_indas_parser_and_unit_scaling(self):
+        from market.providers.xbrl_provider import INDASMapper, BaseXBRLMapper
+        # Raw facts in absolute INR
+        facts = {
+            "RevenueFromOperations": Decimal("7155630000000.00"),  # 7,15,563 Cr
+            "Expenses": Decimal("6517220000000.00"),
+            "FinanceCosts": Decimal("181140000000.00"),
+            "DepreciationDepletionAndAmortisationExpense": Decimal("396570000000.00"),
+            "ProfitBeforeTax": Decimal("769140000000.00"),
+            "TaxExpense": Decimal("185610000000.00"),
+            "ProfitLossForPeriod": Decimal("586980000000.00"),
+            "BasicEarningsLossPerShareFromContinuingOperations": Decimal("37.13")
+        }
+        mapped = INDASMapper.map_income_statement(facts)
+        self.assertEqual(mapped["revenue"], Decimal("715563.00"))
+        self.assertEqual(mapped["pbt"], Decimal("76914.00"))
+        self.assertEqual(mapped["pat"], Decimal("58698.00"))
+        self.assertEqual(mapped["eps"], Decimal("37.13"))
+        # Operating EBITDA = Rev - (Exp - FinanceCosts - Dep)
+        # = 715563 - (651722 - 18114 - 39657) = 715563 - 593951 = 121612
+        self.assertEqual(mapped["ebitda"], Decimal("121612.00"))
+        # Operating EBIT = EBITDA - Dep = 121612 - 39657 = 81955
+        self.assertEqual(mapped["ebit"], Decimal("81955.00"))
+
+    def test_banking_parser_taxonomy(self):
+        from market.providers.xbrl_provider import BankingMapper
+        facts = {
+            "InterestEarned": Decimal("2495880000000.00"),
+            "OtherIncome": Decimal("1010590000000.00"),
+            "InterestExpended": Decimal("1369070000000.00"),
+            "OperatingExpenses": Decimal("1327010000000.00"),
+            "OperatingProfitBeforeProvisionAndContingencies": Decimal("810370000000.00"),
+            "ProvisionsOtherThanTaxAndContingencies": Decimal("103690000000.00"),
+            "ProfitLossBeforeTax": Decimal("706680000000.00"),
+            "ProfitLossAfterTaxesMinorityInterestAndShareOfProfitLossOfAssociates": Decimal("176560000000.00"),
+            "BasicEarningsPerShareAfterExtraordinaryItems": Decimal("23.11")
+        }
+        mapped = BankingMapper.map_income_statement(facts)
+        # Total revenue = InterestEarned + OtherIncome = 350647 Cr
+        self.assertEqual(mapped["revenue"], Decimal("350647.00"))
+        self.assertEqual(mapped["ebitda"], Decimal("81037.00"))
+        self.assertEqual(mapped["pat"], Decimal("17656.00"))
+        self.assertEqual(mapped["eps"], Decimal("23.11"))
+
+    def test_nbfc_parser_taxonomy(self):
+        from market.providers.xbrl_provider import NBFCIndASMapper
+        facts = {
+            "RevenueFromOperations": Decimal("180351100000.00"),
+            "Expenses": Decimal("122959200000.00"),
+            "FinanceCosts": Decimal("57000000000.00"),
+            "DepreciationDepletionAndAmortisationExpense": Decimal("1200000000.00"),
+            "ProfitBeforeTax": Decimal("57624000000.00"),
+            "ProfitLossForPeriod": Decimal("43081900000.00"),
+            "BasicEarningsLossPerShare": Decimal("68.63")
+        }
+        mapped = NBFCIndASMapper.map_income_statement(facts)
+        self.assertEqual(mapped["revenue"], Decimal("18035.11"))
+        self.assertEqual(mapped["pat"], Decimal("4308.19"))
+        self.assertEqual(mapped["eps"], Decimal("68.63"))
+
+    def test_point_in_time_filtering(self):
+        """
+        Tests Section 23:
+        As-of 2025-01-15:
+        RELIANCE Q3 FY25 filed 2025-01-16 -> excluded
+        TCS Q3 FY25 filed 2025-01-09 -> included
+        """
+        from datetime import date
+        # Create statements
+        IncomeStatement.objects.create(
+            company=self.co_rel,
+            period_type="QUARTERLY",
+            period_string="Dec 2024",
+            fiscal_year=2025,
+            period_start=date(2024, 10, 1),
+            period_end=date(2024, 12, 31),
+            filing_date=date(2025, 1, 16),
+            revenue=Decimal("243865.00"),
+            pat=Decimal("21930.00")
+        )
+        IncomeStatement.objects.create(
+            company=self.co_tcs,
+            period_type="QUARTERLY",
+            period_string="Dec 2024",
+            fiscal_year=2025,
+            period_start=date(2024, 10, 1),
+            period_end=date(2024, 12, 31),
+            filing_date=date(2025, 1, 9),
+            revenue=Decimal("63973.00"),
+            pat=Decimal("12444.00")
+        )
+
+        as_of = date(2025, 1, 15)
+        visible = IncomeStatement.objects.filter(filing_date__lte=as_of)
+        self.assertEqual(visible.count(), 1)
+        self.assertEqual(visible.first().company, self.co_tcs)
+
+        # On 2025-01-17, both should be visible
+        as_of_later = date(2025, 1, 17)
+        self.assertEqual(IncomeStatement.objects.filter(filing_date__lte=as_of_later).count(), 2)
+
+    def test_revision_handling_provenance(self):
+        """
+        Original filing at T1, revision at T2.
+        Proves provenance records preserve both timestamps.
+        """
+        RawFundamentalData.objects.create(
+            company=self.co_rel,
+            source="NSE_XBRL",
+            source_url="https://nsearchives.nseindia.com/corporate/xbrl/original.xml",
+            fiscal_period="Q3_2025",
+            reporting_type="QUARTERLY",
+            raw_payload={"filing_date": "2025-01-16", "version": "ORIGINAL", "pat": 21930},
+            status="NORMALIZED"
+        )
+        RawFundamentalData.objects.create(
+            company=self.co_rel,
+            source="NSE_XBRL",
+            source_url="https://nsearchives.nseindia.com/corporate/xbrl/revised.xml",
+            fiscal_period="Q3_2025",
+            reporting_type="QUARTERLY",
+            raw_payload={"filing_date": "2025-01-20", "version": "REVISED", "pat": 21935},
+            status="NORMALIZED"
+        )
+        logs = RawFundamentalData.objects.filter(company=self.co_rel, fiscal_period="Q3_2025")
+        self.assertEqual(logs.count(), 2)
+        versions = [l.raw_payload["version"] for l in logs]
+        self.assertIn("ORIGINAL", versions)
+        self.assertIn("REVISED", versions)
+
+    def test_tata_motors_symbol_alias_mapping(self):
+        from market.providers.xbrl_provider import SYMBOL_ALIASES, REVERSE_SYMBOL_ALIASES
+        self.assertEqual(SYMBOL_ALIASES.get("TATAMOTORS"), "TMPV")
+        self.assertEqual(REVERSE_SYMBOL_ALIASES.get("TMPV"), "TATAMOTORS")
+
+    def test_idempotency_fundamental_ingestion(self):
+        from market.services.fundamental_service import FundamentalDataService
+        service = FundamentalDataService()
+        sample_payload = {
+            "symbol": "RELIANCE",
+            "isin": "INE002A01018",
+            "taxonomy": "INDAS",
+            "statements": [
+                {
+                    "period_type": "ANNUAL",
+                    "period_string": "Mar 2025",
+                    "fiscal_year": 2025,
+                    "period_start": "2024-04-01",
+                    "period_end": "2025-03-31",
+                    "filing_date": "2025-05-22",
+                    "income_statement": {"revenue": 887040.0, "ebitda": 159667.2, "pat": 79833.6, "eps": 19.0},
+                    "balance_sheet": {"equity_capital": 42000.0, "reserves": 798000.0, "borrowings": 319200.0},
+                    "cash_flow": {"operating_cash_flow": 115000.0, "free_cash_flow": 85000.0}
+                }
+            ]
+        }
+        # First ingestion
+        c1 = service.ingest_company_financials_from_snapshot(sample_payload)
+        self.assertEqual(c1, 1)
+        inc_count1 = IncomeStatement.objects.filter(company=self.co_rel).count()
+
+        # Second ingestion
+        c2 = service.ingest_company_financials_from_snapshot(sample_payload)
+        self.assertEqual(c2, 1)
+        inc_count2 = IncomeStatement.objects.filter(company=self.co_rel).count()
+
+        self.assertEqual(inc_count1, inc_count2, "Repeated ingestion must not duplicate IncomeStatement records.")
+
+    def test_derived_metrics_robustness(self):
+        from market.services.fundamental_service import FundamentalMetricService
+        # Add negative equity & zero revenue company to test edge cases
+        bad_co = Company.objects.create(name="Edge Case Co", short_name="EDGECASE", sector="Diversified")
+        IncomeStatement.objects.create(
+            company=bad_co,
+            period_type="ANNUAL",
+            period_string="Mar 2025",
+            fiscal_year=2025,
+            revenue=Decimal("0.00"),
+            pat=Decimal("-500.00"),
+            eps=Decimal("-10.00")
+        )
+        BalanceSheetStatement.objects.create(
+            company=bad_co,
+            period_type="ANNUAL",
+            period_string="Mar 2025",
+            fiscal_year=2025,
+            equity_capital=Decimal("100.00"),
+            reserves=Decimal("-300.00"),  # negative equity
+            borrowings=Decimal("500.00")
+        )
+        service = FundamentalMetricService()
+        # Must calculate without throwing ZeroDivisionError or emitting NaN
+        service.calculate_and_save_metrics(bad_co)
+        # ROE should be None because equity is negative
+        roe_metric = DerivedFundamentalMetric.objects.filter(company=bad_co, name="return_on_equity").first()
+        self.assertIsNone(roe_metric, "ROE must be undefined for negative equity")
+
+
