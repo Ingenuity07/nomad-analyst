@@ -16,13 +16,16 @@ django_asgi_app = get_asgi_application()
 
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.auth import AuthMiddlewareStack
-from chat.routing import websocket_urlpatterns
+from chat.routing import websocket_urlpatterns as chat_ws_patterns
+from market.routing import websocket_urlpatterns as market_ws_patterns
+
+all_ws_patterns = chat_ws_patterns + market_ws_patterns
 
 application = ProtocolTypeRouter({
     "http": django_asgi_app,
     "websocket": AuthMiddlewareStack(
         URLRouter(
-            websocket_urlpatterns
+            all_ws_patterns
         )
     ),
 })

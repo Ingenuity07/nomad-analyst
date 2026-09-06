@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ISTClock } from '@/components/common/ISTClock';
 import { MarketSessionIndicator } from '@/components/common/MarketSessionIndicator';
+import { KiteStatusBadge } from '@/features/kite/components/KiteStatusBadge';
 import { useMarketOverview } from '@/hooks/useMarketOverview';
 import { useStockSearch } from '@/hooks/useStock';
 
@@ -94,8 +95,10 @@ export const TopHeader: React.FC = () => {
         )}
       </div>
 
-      {/* Market Indicators & IST Clock */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)' }}>
+      {/* Market Indicators, Kite Status & IST Clock */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-4)' }}>
+        <KiteStatusBadge />
+        <div style={{ height: '16px', width: '1px', backgroundColor: 'var(--border-subtle)' }} />
         <MarketSessionIndicator sessionInfo={marketData?.market_session} />
         <div style={{ height: '16px', width: '1px', backgroundColor: 'var(--border-subtle)' }} />
         <ISTClock />

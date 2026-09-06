@@ -18,6 +18,11 @@ urlpatterns = [
     # Versioned REST API presentation layer (v1)
     path('api/v1/', include('market.urls')),
 
+    # Zerodha Kite OAuth root callback (matches registered redirect URL)
+    path('kite/callback/', include([
+        path('', __import__('market.views', fromlist=['KiteCallbackView']).KiteCallbackView.as_view(), name='kite-callback-root'),
+    ])),
+
     # Legacy Chat API (now inside chat app)
     path('api/', include('chat.urls')),
     

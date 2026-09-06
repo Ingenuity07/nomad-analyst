@@ -19,7 +19,16 @@ from .views import (
     # Backtests
     BacktestListAPIView, BacktestDetailAPIView, BacktestRunAPIView,
     # Research
-    StockResearchAPIView
+    StockResearchAPIView,
+    # Kite Authentication & Intraday Data Layer (Phase 17B)
+    KiteLoginAPIView, KiteCallbackView, KiteStatusAPIView,
+    KiteDisconnectAPIView, KiteDataHealthAPIView,
+    # Phase 17C — Intraday Market Context & Signal Foundation
+    IntradayMarketContextAPIView, IntradayStocksAPIView, IntradayStockDetailAPIView,
+    IntradaySectorsAPIView, IntradayIndicesAPIView, IntradayDataHealthAPIView,
+    # Phase 17D — Intraday Opportunity Engine
+    IntradayOpportunitiesAPIView, IntradayOpportunityDetailAPIView,
+    IntradayOpportunityHistoryAPIView, IntradayTopOpportunitiesAPIView,
 )
 
 urlpatterns = [
@@ -65,6 +74,32 @@ urlpatterns = [
     path('backtests/run/', BacktestRunAPIView.as_view(), name='api-backtest-run'),
     path('backtests/<str:run_id>/', BacktestDetailAPIView.as_view(), name='api-backtest-detail'),
 
-    # ── AI Research ───────────────────────────────────────────────────────────
+    # ── AI Research & Phase 17E On-Demand Research Engine ─────────────────────
     path('research/', StockResearchAPIView.as_view(), name='api-stock-research'),
+    path('research/examine/', __import__('research.views', fromlist=['ResearchExamineAPIView']).ResearchExamineAPIView.as_view(), name='api-research-examine'),
+    path('research/<uuid:id>/', __import__('research.views', fromlist=['ResearchDetailAPIView']).ResearchDetailAPIView.as_view(), name='api-research-detail'),
+    path('research/company/<str:symbol>/', __import__('research.views', fromlist=['CompanyResearchAPIView']).CompanyResearchAPIView.as_view(), name='api-research-company'),
+    path('research/<uuid:id>/refresh/', __import__('research.views', fromlist=['ResearchRefreshAPIView']).ResearchRefreshAPIView.as_view(), name='api-research-refresh'),
+    path('research/<uuid:id>/delta/', __import__('research.views', fromlist=['ResearchDeltaAPIView']).ResearchDeltaAPIView.as_view(), name='api-research-delta'),
+
+    # ── Kite Connect Authentication & Data Health (Phase 17B) ────────────────
+    path('kite/auth/login/', KiteLoginAPIView.as_view(), name='api-kite-login'),
+    path('kite/callback/', KiteCallbackView.as_view(), name='api-kite-callback'),
+    path('kite/status/', KiteStatusAPIView.as_view(), name='api-kite-status'),
+    path('kite/auth/disconnect/', KiteDisconnectAPIView.as_view(), name='api-kite-disconnect'),
+    path('kite/data-health/', KiteDataHealthAPIView.as_view(), name='api-kite-data-health'),
+
+    # ── Phase 17C — Intraday Market Context & Signal Foundation ─────────────
+    path('intraday/market-context/', IntradayMarketContextAPIView.as_view(), name='api-intraday-market-context'),
+    path('intraday/stocks/', IntradayStocksAPIView.as_view(), name='api-intraday-stocks'),
+    path('intraday/stocks/<str:symbol>/', IntradayStockDetailAPIView.as_view(), name='api-intraday-stock-detail'),
+    path('intraday/sectors/', IntradaySectorsAPIView.as_view(), name='api-intraday-sectors'),
+    path('intraday/indices/', IntradayIndicesAPIView.as_view(), name='api-intraday-indices'),
+    path('intraday/data-health/', IntradayDataHealthAPIView.as_view(), name='api-intraday-data-health'),
+
+    # ── Phase 17D — Intraday Opportunity Engine ─────────────────────────────
+    path('intraday/opportunities/', IntradayOpportunitiesAPIView.as_view(), name='api-intraday-opportunities'),
+    path('intraday/opportunities/top/', IntradayTopOpportunitiesAPIView.as_view(), name='api-intraday-opportunities-top'),
+    path('intraday/opportunities/<str:symbol>/', IntradayOpportunityDetailAPIView.as_view(), name='api-intraday-opportunity-detail'),
+    path('intraday/opportunities/<str:symbol>/history/', IntradayOpportunityHistoryAPIView.as_view(), name='api-intraday-opportunity-history'),
 ]

@@ -45,4 +45,9 @@ export const ENDPOINTS = {
 
   // Research
   RESEARCH: '/api/v1/research/',
+  RESEARCH_EXAMINE: '/api/v1/research/examine/',
+  RESEARCH_DETAIL: (id: string) => `/api/v1/research/${id}/`,
+  RESEARCH_COMPANY: (symbol: string, mode: string = 'INTRADAY') => `/api/v1/research/company/${encodeURIComponent(symbol)}/?mode=${encodeURIComponent(mode)}`,
+  RESEARCH_REFRESH: (id: string) => `/api/v1/research/${id}/refresh/`,
+  RESEARCH_DELTA: (id: string) => `/api/v1/research/${id}/delta/`,
 };

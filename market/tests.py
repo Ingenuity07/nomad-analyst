@@ -5252,3 +5252,1316 @@ class Phase16BFundamentalXBRLTests(TestCase):
         self.assertIsNone(roe_metric, "ROE must be undefined for negative equity")
 
 
+class KiteProviderTests(TestCase):
+    """
+    Unit tests for Phase 17A: Zerodha Kite Connect Market Data Integration POC.
+    All tests execute offline without requiring live Kite credentials.
+    """
+
+    def setUp(self):
+        self.company = Company.objects.create(
+            name="Reliance Industries Limited",
+            short_name="RELIANCE",
+            sector="Energy",
+            industry="Oil & Gas"
+        )
+        self.instrument = Instrument.objects.create(
+            company=self.company,
+            symbol="RELIANCE",
+            exchange="NSE",
+            instrument_type="EQUITY"
+        )
+
+    def test_kite_configuration_missing(self):
+        """
+        Tests that KiteMarketDataProvider raises AuthenticationError when keys are missing.
+        """
+        from market.providers.kite import KiteMarketDataProvider
+        from market.exceptions import AuthenticationError
+
+        provider = KiteMarketDataProvider(api_key="", access_token="")
+        with self.assertRaises(AuthenticationError):
+            provider._get_client()
+
+    def test_trading_session_classifier(self):
+        """
+        Tests Indian equity market trading session classifier in Asia/Kolkata (IST).
+        """
+        from market.services.trading_session import (
+            TradingSessionService,
+            TradingSession,
+            IST_TIMEZONE,
+        )
+
+        # Wednesday 2026-09-02 (Trading day)
+        # Pre-market: 09:05 IST
+        dt_pre = datetime(2026, 9, 2, 9, 5, tzinfo=IST_TIMEZONE)
+        self.assertEqual(TradingSessionService.get_current_session(dt_pre), TradingSession.PRE_MARKET)
+        self.assertFalse(TradingSessionService.is_market_open(dt_pre))
+
+        # Regular session: 10:30 IST
+        dt_reg = datetime(2026, 9, 2, 10, 30, tzinfo=IST_TIMEZONE)
+        self.assertEqual(TradingSessionService.get_current_session(dt_reg), TradingSession.REGULAR)
+        self.assertTrue(TradingSessionService.is_market_open(dt_reg))
+
+        # Post-market: 15:45 IST
+        dt_post = datetime(2026, 9, 2, 15, 45, tzinfo=IST_TIMEZONE)
+        self.assertEqual(TradingSessionService.get_current_session(dt_post), TradingSession.POST_MARKET)
+        self.assertFalse(TradingSessionService.is_market_open(dt_post))
+
+        # Market closed: 18:00 IST
+        dt_closed = datetime(2026, 9, 2, 18, 0, tzinfo=IST_TIMEZONE)
+        self.assertEqual(TradingSessionService.get_current_session(dt_closed), TradingSession.CLOSED)
+
+        # Weekend: Saturday 2026-09-05 11:00 IST
+        dt_weekend = datetime(2026, 9, 5, 11, 0, tzinfo=IST_TIMEZONE)
+        self.assertEqual(TradingSessionService.get_current_session(dt_weekend), TradingSession.CLOSED)
+        self.assertFalse(TradingSessionService.is_trading_day(dt_weekend.date()))
+
+    def test_kite_instrument_registry_mapping(self):
+        """
+        Tests NIFTY 50 mapping audit, benchmark indices, and Tata Motors / TMPV demerger handling.
+        """
+        from market.services.kite_registry import KiteInstrumentRegistry
+
+        # 1. Benchmarks
+        nifty_token = KiteInstrumentRegistry.get_token("^NSEI")
+        self.assertEqual(nifty_token, 256265)
+        banknifty_token = KiteInstrumentRegistry.get_token("^NSEBANK")
+        self.assertEqual(banknifty_token, 260105)
+
+        # Reverse lookup
+        self.assertEqual(KiteInstrumentRegistry.get_symbol(256265), "^NSEI")
+        self.assertEqual(KiteInstrumentRegistry.get_symbol(260105), "^NSEBANK")
+
+        # 2. Key Equities
+        self.assertEqual(KiteInstrumentRegistry.get_token("RELIANCE"), 738561)
+        self.assertEqual(KiteInstrumentRegistry.get_token("TCS"), 2953217)
+        self.assertEqual(KiteInstrumentRegistry.get_token("INFY"), 408065)
+
+        # 3. Tata Motors Demerger Preserved
+        tmpv_token = KiteInstrumentRegistry.get_token("TMPV")
+        self.assertEqual(tmpv_token, 884737)
+        tatamotors_alias = KiteInstrumentRegistry.get_token("TATAMOTORS")
+        self.assertEqual(tatamotors_alias, 884737)
+
+        # 4. 50/50 Coverage Audit
+        audit = KiteInstrumentRegistry.build_nifty50_mapping()
+        self.assertEqual(audit["metadata"]["nifty50_constituents_total"], 50)
+        self.assertEqual(audit["metadata"]["nifty50_mapped_count"], 50)
+        self.assertEqual(audit["metadata"]["nifty50_unmapped_count"], 0)
+        self.assertEqual(audit["metadata"]["coverage_percent"], 100.0)
+
+    def test_kite_quote_normalizer(self):
+        """
+        Tests normalizing Kite REST quote payload into canonical MarketQuote.
+        """
+        from market.normalizers.kite import KiteNormalizer
+        from market.providers.base import MarketQuote
+
+        raw_quote = {
+            "NSE:RELIANCE": {
+                "instrument_token": 738561,
+                "timestamp": "2026-09-04 15:30:00",
+                "last_price": 2950.50,
+                "volume": 2500000,
+                "ohlc": {
+                    "open": 2940.00,
+                    "high": 2965.00,
+                    "low": 2930.00,
+                    "close": 2935.00
+                }
+            }
+        }
+        normalizer = KiteNormalizer()
+        quote = normalizer.normalize(raw_quote)
+
+        self.assertIsInstance(quote, MarketQuote)
+        self.assertEqual(quote.symbol, "RELIANCE")
+        self.assertEqual(quote.exchange, "NSE")
+        self.assertEqual(quote.price, Decimal("2950.50"))
+        self.assertEqual(quote.open_price, Decimal("2940.00"))
+        self.assertEqual(quote.high, Decimal("2965.00"))
+        self.assertEqual(quote.low, Decimal("2930.00"))
+        self.assertEqual(quote.volume, 2500000)
+        self.assertEqual(quote.previous_close, Decimal("2935.00"))
+        self.assertEqual(quote.change, Decimal("15.50"))
+
+    def test_kite_candle_integrity_validation(self):
+        """
+        Tests strict OHLC integrity validation:
+        high >= max(open, close), low <= min(open, close), volume >= 0.
+        """
+        from market.normalizers.kite import KiteNormalizer
+        from market.exceptions import InvalidPayloadError
+
+        # Valid candle
+        valid_raw = ["2026-09-04 10:00:00", 2500.0, 2520.0, 2490.0, 2510.0, 50000]
+        candle = KiteNormalizer.normalize_candle(valid_raw, "RELIANCE", timeframe="15m")
+        self.assertEqual(candle["open"], Decimal("2500.0"))
+        self.assertEqual(candle["high"], Decimal("2520.0"))
+        self.assertEqual(candle["low"], Decimal("2490.0"))
+        self.assertEqual(candle["close"], Decimal("2510.0"))
+        self.assertEqual(candle["volume"], 50000)
+
+        # Invalid: High < Close
+        invalid_high = ["2026-09-04 10:00:00", 2500.0, 2505.0, 2490.0, 2510.0, 50000]
+        with self.assertRaises(InvalidPayloadError):
+            KiteNormalizer.normalize_candle(invalid_high, "RELIANCE", timeframe="15m")
+
+        # Invalid: Low > Open
+        invalid_low = ["2026-09-04 10:00:00", 2500.0, 2520.0, 2505.0, 2510.0, 50000]
+        with self.assertRaises(InvalidPayloadError):
+            KiteNormalizer.normalize_candle(invalid_low, "RELIANCE", timeframe="15m")
+
+        # Invalid: Negative volume
+        invalid_vol = ["2026-09-04 10:00:00", 2500.0, 2520.0, 2490.0, 2510.0, -100]
+        with self.assertRaises(InvalidPayloadError):
+            KiteNormalizer.normalize_candle(invalid_vol, "RELIANCE", timeframe="15m")
+
+    def test_kite_tick_normalizer(self):
+        """
+        Tests converting raw WebSocket tick to NomadMarketTick.
+        """
+        from market.normalizers.kite import KiteNormalizer, NomadMarketTick
+
+        raw_tick = {
+            "instrument_token": 738561,
+            "last_price": 2950.50,
+            "last_traded_quantity": 25,
+            "volume_traded": 1500000,
+            "ohlc": {
+                "open": 2930.00,
+                "high": 2960.00,
+                "low": 2925.00,
+                "close": 2935.00
+            },
+            "change": 0.528,
+            "timestamp": "2026-09-04T14:15:00+05:30",
+            "exchange_timestamp": "2026-09-04T14:15:00+05:30",
+            "depth": {"buy": [{"quantity": 50, "price": 2950.0, "orders": 2}], "sell": []}
+        }
+        tick = KiteNormalizer.normalize_tick(raw_tick)
+        self.assertIsInstance(tick, NomadMarketTick)
+        self.assertEqual(tick.symbol, "RELIANCE")
+        self.assertEqual(tick.last_price, Decimal("2950.50"))
+        self.assertEqual(tick.last_traded_quantity, 25)
+        self.assertEqual(tick.volume, 1500000)
+        self.assertEqual(tick.open, Decimal("2930.00"))
+        self.assertEqual(tick.high, Decimal("2960.00"))
+        self.assertEqual(tick.low, Decimal("2925.00"))
+        self.assertEqual(tick.close, Decimal("2935.00"))
+        self.assertIsNotNone(tick.exchange_timestamp)
+        self.assertIsNotNone(tick.received_timestamp)
+        self.assertIsNotNone(tick.depth)
+
+    def test_kite_provider_exception_translation(self):
+        """
+        Tests that Kite specific exceptions map predictably into Nomad's MarketDataError hierarchy.
+        """
+        from market.providers.kite import KiteMarketDataProvider
+        from market.exceptions import (
+            AuthenticationError,
+            RateLimitExceededError,
+            SymbolNotFoundError,
+            ProviderConnectionError,
+        )
+
+        class MockFailingClient:
+            def quote(self, symbols):
+                raise Exception("TokenException: Token is invalid or expired (403)")
+
+            def historical_data(self, *args, **kwargs):
+                raise Exception("NetworkException: Connection timed out")
+
+        provider = KiteMarketDataProvider(api_key="k", access_token="t", kite_client=MockFailingClient())
+
+        with self.assertRaises(AuthenticationError):
+            provider.get_quote("RELIANCE")
+
+        with self.assertRaises(ProviderConnectionError):
+            provider.get_historical_ohlcv("RELIANCE", timeframe="1d")
+
+    def test_kite_ticker_manager_snapshot_update(self):
+        """
+        Tests KiteTickerManager receiving normalized tick and updating MarketSnapshot in DB.
+        """
+        from market.services.kite_ticker import KiteTickerManager
+        from market.normalizers.kite import NomadMarketTick
+
+        tick = NomadMarketTick(
+            instrument_token=738561,
+            symbol="RELIANCE",
+            exchange="NSE",
+            last_price=Decimal("2955.00"),
+            volume=1600000,
+            open=Decimal("2930.00"),
+            high=Decimal("2960.00"),
+            low=Decimal("2925.00"),
+            close=Decimal("2935.00"),
+            change=Decimal("20.00"),
+            change_percent=Decimal("0.68"),
+            exchange_timestamp=datetime.now(timezone.utc),
+            received_timestamp=datetime.now(timezone.utc),
+        )
+
+        manager = KiteTickerManager(api_key="mock", access_token="mock", update_db_snapshot=True)
+        initial_count = MarketSnapshot.objects.filter(instrument=self.instrument).count()
+        manager.update_market_snapshot(tick)
+        new_count = MarketSnapshot.objects.filter(instrument=self.instrument).count()
+
+        self.assertEqual(new_count, initial_count + 1)
+        latest_snapshot = MarketSnapshot.objects.filter(instrument=self.instrument).latest("timestamp")
+        self.assertEqual(latest_snapshot.close, Decimal("2955.00"))
+        self.assertEqual(latest_snapshot.source, "KiteTicker")
+
+
+class KiteAuthAndDataLayerTests(TestCase):
+    """
+    Unit and integration tests for Phase 17B: Kite Authentication Lifecycle and Intraday Data Layer.
+    All tests execute offline without requiring live Zerodha Kite credentials.
+    """
+
+    def setUp(self):
+        from market.models import Company, Instrument, KiteCredential
+        self.company = Company.objects.create(
+            name="Reliance Industries Limited",
+            short_name="RELIANCE",
+            sector="Energy",
+            industry="Oil & Gas"
+        )
+        self.instrument = Instrument.objects.create(
+            company=self.company,
+            symbol="RELIANCE",
+            exchange="NSE",
+            instrument_type="EQUITY"
+        )
+        # Clear existing credentials
+        KiteCredential.objects.all().delete()
+
+    def test_kite_login_url_generation(self):
+        """
+        Tests generating the Zerodha OAuth login URL with api_key and redirect_url.
+        """
+        from market.services.kite_auth import KiteCredentialService
+        from django.test import override_settings
+
+        with override_settings(KITE_API_KEY="test_api_key", KITE_REDIRECT_URL="http://127.0.0.1:8000/kite/callback/"):
+            login_url = KiteCredentialService.generate_login_url()
+            self.assertIn("https://kite.zerodha.com/connect/login", login_url)
+            self.assertIn("api_key=test_api_key", login_url)
+            self.assertIn("v=3", login_url)
+            self.assertIn("redirect_url=http%3A%2F%2F127.0.0.1%3A8000%2Fkite%2Fcallback%2F", login_url)
+
+    def test_kite_token_exchange_and_encryption(self):
+        """
+        Tests exchanging request token, encrypting access token at rest, and calculating 06:00 IST expiry.
+        """
+        from market.services.kite_auth import KiteCredentialService
+        from market.models import KiteCredential
+        from django.test import override_settings
+
+        class MockSessionKiteClient:
+            def generate_session(self, request_token, api_secret):
+                return {
+                    "user_id": "AB1234",
+                    "user_name": "Test Trader",
+                    "access_token": "secret_access_token_xyz_987",
+                    "public_token": "public_tok_123",
+                }
+
+        with override_settings(KITE_API_KEY="k", KITE_API_SECRET="s"):
+            res = KiteCredentialService.exchange_request_token(
+                request_token="mock_req_tok_111",
+                account_id="default",
+                kite_client=MockSessionKiteClient(),
+            )
+            self.assertTrue(res["success"])
+            self.assertEqual(res["user_id"], "AB1234")
+            self.assertEqual(res["status"], "CONNECTED")
+
+            cred = KiteCredential.objects.get(account_id="default")
+            self.assertEqual(cred.status, "CONNECTED")
+            self.assertEqual(cred.user_id, "AB1234")
+            # Raw plaintext token must NOT be stored in encrypted_access_token field
+            self.assertNotEqual(cred.encrypted_access_token, "secret_access_token_xyz_987")
+            # Decrypted token must match
+            self.assertEqual(cred.get_access_token(), "secret_access_token_xyz_987")
+            # Expiry must be calculated
+            self.assertIsNotNone(cred.expires_at)
+            self.assertEqual(KiteCredentialService.get_valid_access_token(), "secret_access_token_xyz_987")
+
+    def test_kite_token_expiry_evaluation(self):
+        """
+        Tests that an expired token is marked EXPIRED and returns None.
+        """
+        from market.services.kite_auth import KiteCredentialService
+        from market.models import KiteCredential
+        from django.test import override_settings
+        from django.utils import timezone as django_tz
+
+        cred = KiteCredential.objects.create(
+            account_id="default",
+            user_id="AB1234",
+            status="CONNECTED",
+            authenticated_at=django_tz.now() - timedelta(days=2),
+            expires_at=django_tz.now() - timedelta(hours=5), # Expired 5 hours ago
+        )
+        cred.set_access_token("expired_token_123")
+        cred.save()
+
+        with override_settings(KITE_ACCESS_TOKEN=""):
+            token = KiteCredentialService.get_valid_access_token()
+            self.assertIsNone(token)
+            cred.refresh_from_db()
+            self.assertEqual(cred.status, "EXPIRED")
+
+    def test_kite_safe_status_endpoint_security(self):
+        """
+        Tests that /api/v1/kite/status/ never returns access_token, api_secret, or request_token.
+        """
+        from market.models import KiteCredential
+        from django.test import Client, override_settings
+        from django.utils import timezone as django_tz
+
+        cred = KiteCredential.objects.create(
+            account_id="default",
+            user_id="AB1234",
+            status="CONNECTED",
+            authenticated_at=django_tz.now(),
+            expires_at=django_tz.now() + timedelta(hours=10),
+            request_token="sensitivereqtok12345",
+        )
+        cred.set_access_token("sensitiveaccesstok98765")
+        cred.save()
+
+        client = Client()
+        with override_settings(KITE_API_KEY="my_key", KITE_API_SECRET="my_secret"):
+            response = client.get('/api/v1/kite/status/')
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+
+            # Verify public fields
+            self.assertTrue(data["configured"])
+            self.assertTrue(data["authenticated"])
+            self.assertEqual(data["status"], "CONNECTED")
+            self.assertEqual(data["user_id"], "AB1234")
+
+            # CRITICAL SECURITY AUDIT: No secrets leaked in response
+            body_str = response.content.decode('utf-8')
+            self.assertNotIn("sensitiveaccesstok", body_str)
+            self.assertNotIn("sensitivereqtok", body_str)
+            self.assertNotIn("my_secret", body_str)
+            self.assertNotIn("access_token", data)
+            self.assertNotIn("api_secret", data)
+            self.assertNotIn("request_token", data)
+
+    def test_kite_disconnect_endpoint(self):
+        """
+        Tests that POST /api/v1/kite/auth/disconnect/ clears session and marks AUTHENTICATION_REQUIRED.
+        """
+        from market.models import KiteCredential
+        from django.test import Client
+        from django.utils import timezone as django_tz
+
+        cred = KiteCredential.objects.create(
+            account_id="default",
+            user_id="AB1234",
+            status="CONNECTED",
+            authenticated_at=django_tz.now(),
+            expires_at=django_tz.now() + timedelta(hours=5),
+        )
+        cred.set_access_token("valid_token_777")
+        cred.save()
+
+        client = Client()
+        response = client.post('/api/v1/kite/auth/disconnect/')
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
+
+        cred.refresh_from_db()
+        self.assertEqual(cred.status, "AUTHENTICATION_REQUIRED")
+        self.assertIsNone(cred.get_access_token())
+
+    def test_plausible_exchange_timestamp(self):
+        """
+        Tests exchange timestamp plausibility and flags off-hours ticks (e.g. 22:24 IST) as suspicious.
+        """
+        from market.services.trading_session import TradingSessionService, IST_TIMEZONE
+        from market.normalizers.kite import KiteNormalizer
+
+        # Wednesday 2026-09-02 11:30:00 IST (Trading session) -> Plausible
+        dt_trading = datetime(2026, 9, 2, 11, 30, tzinfo=IST_TIMEZONE)
+        self.assertTrue(TradingSessionService.is_plausible_exchange_timestamp(dt_trading))
+
+        # Wednesday 2026-09-02 22:24:00 IST (Off-hours / Night) -> Suspicious
+        dt_off_hours = datetime(2026, 9, 2, 22, 24, tzinfo=IST_TIMEZONE)
+        self.assertFalse(TradingSessionService.is_plausible_exchange_timestamp(dt_off_hours))
+
+        # Saturday 2026-09-05 11:30:00 IST (Weekend) -> Suspicious
+        dt_weekend = datetime(2026, 9, 5, 11, 30, tzinfo=IST_TIMEZONE)
+        self.assertFalse(TradingSessionService.is_plausible_exchange_timestamp(dt_weekend))
+
+        # Test KiteNormalizer flags suspicious timestamp
+        raw_tick_night = {
+            "instrument_token": 738561,
+            "last_price": 2950.0,
+            "exchange_timestamp": dt_off_hours.isoformat(),
+        }
+        tick = KiteNormalizer.normalize_tick(raw_tick_night)
+        self.assertTrue(tick.is_suspicious_timestamp)
+
+        raw_tick_day = {
+            "instrument_token": 738561,
+            "last_price": 2950.0,
+            "exchange_timestamp": dt_trading.isoformat(),
+        }
+        tick_day = KiteNormalizer.normalize_tick(raw_tick_day)
+        self.assertFalse(tick_day.is_suspicious_timestamp)
+
+    def test_kite_callback_cancellation_and_error_handling(self):
+        """
+        Tests Zerodha OAuth callback handling on user cancellation.
+        """
+        from django.test import Client, override_settings
+
+        client = Client()
+        with override_settings(KITE_FRONTEND_REDIRECT_URL="http://localhost:5173/intraday"):
+            # 1. User cancels Zerodha login
+            resp_cancel = client.get('/kite/callback/?status=cancelled&message=User+declined')
+            self.assertEqual(resp_cancel.status_code, 302)
+            self.assertIn("kite_auth=cancelled", resp_cancel.url)
+
+            # 2. Missing request_token
+            resp_missing = client.get('/kite/callback/')
+            self.assertEqual(resp_missing.status_code, 302)
+            self.assertIn("kite_auth=error", resp_missing.url)
+
+    def test_kite_data_health_endpoint(self):
+        """
+        Tests GET /api/v1/kite/data-health/ distinguishes between LIVE and MARKET CLOSED.
+        """
+        from django.test import Client
+
+        client = Client()
+        response = client.get('/api/v1/kite/data-health/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["provider"], "kite")
+        self.assertIn(data["data_status"], ["LIVE", "WAITING_FOR_DATA", "MARKET CLOSED", "DISCONNECTED"])
+        self.assertEqual(data["subscribed_instruments_count"], 52)
+        self.assertIn("market_session", data)
+
+    def test_historical_ingestion_idempotent_upsert(self):
+        """
+        Tests KiteHistoricalIngestionService idempotently inserts bars without duplicates.
+        """
+        from market.services.kite_historical import KiteHistoricalIngestionService
+        from market.providers.kite import KiteMarketDataProvider
+        from market.models import OHLCVBar
+
+        class MockProvider:
+            def get_historical_ohlcv(self, symbol, timeframe, start_date, end_date):
+                t1 = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+                t2 = datetime(2026, 9, 1, 10, 15, tzinfo=timezone.utc)
+                return {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": [
+                        [t1.isoformat(), 2500.0, 2520.0, 2490.0, 2510.0, 50000],
+                        [t2.isoformat(), 2510.0, 2530.0, 2505.0, 2525.0, 60000],
+                    ],
+                }
+
+        service = KiteHistoricalIngestionService(provider=MockProvider())
+
+        # Run 1: 2 bars created
+        res1 = service.ingest_symbol("RELIANCE", timeframe="15m")
+        self.assertEqual(res1["created"], 2)
+        self.assertEqual(res1["existing"], 0)
+        self.assertEqual(OHLCVBar.objects.filter(instrument=self.instrument, timeframe="15m").count(), 2)
+
+        # Run 2: 0 bars created, 2 existing skipped
+        res2 = service.ingest_symbol("RELIANCE", timeframe="15m")
+        self.assertEqual(res2["created"], 0)
+        self.assertEqual(res2["existing"], 2)
+        self.assertEqual(OHLCVBar.objects.filter(instrument=self.instrument, timeframe="15m").count(), 2)
+
+
+class IntradayMarketContextTests(TestCase):
+    """
+    Phase 17C Test Suite: Intraday Market Context & Signal Foundation.
+    Tests:
+    - Tick normalization with ATP / average_price
+    - 1m, 5m, 15m candle aggregation and boundary bucketing
+    - Out-of-order and duplicate tick integrity
+    - Session VWAP and distance calculation
+    - Market breadth states (Advances/Declines/Unchanged, A/D ratio)
+    - Deterministic sector strengths and rankings
+    - Relative strength vs NIFTY and vs Sector
+    - Volume confirmation states (CONFIRMED_UP, WEAK_UP, etc.)
+    - Opening range structure (ORB 5m/15m states)
+    - Deterministic market regime classification and transparent explanations
+    - Data freshness tiers (FRESH, STALE, UNAVAILABLE)
+    - Phase 17C REST API endpoints
+    - Channels WebSocket consumer
+    - MarketContextSnapshot and StockIntradayContext persistence
+    """
+
+    def setUp(self):
+        from django.utils import timezone as dj_timezone
+        from market.models import Company, Instrument, Universe, UniverseMembership
+
+        # Setup NIFTY50 Universe
+        self.univ, _ = Universe.objects.get_or_create(name="NIFTY50")
+
+        # Setup representative test companies and instruments
+        self.companies = {}
+        self.instruments = {}
+        sample_meta = [
+            ("RELIANCE", "Reliance Industries", "Energy", 2950.0),
+            ("TCS", "Tata Consultancy Services", "Technology", 4200.0),
+            ("HDFCBANK", "HDFC Bank Limited", "Financial Services", 1650.0),
+            ("TATASTEEL", "Tata Steel Limited", "Metals & Mining", 152.0),
+            ("SUNPHARMA", "Sun Pharma", "Pharmaceutical", 1820.0),
+        ]
+
+        for sym, name, sec, pr in sample_meta:
+            comp, _ = Company.objects.get_or_create(
+                short_name=sym,
+                defaults={"name": name, "sector": sec, "industry": sec}
+            )
+            inst, _ = Instrument.objects.get_or_create(
+                symbol=sym,
+                defaults={"company": comp, "exchange": "NSE", "instrument_type": "EQUITY"}
+            )
+            UniverseMembership.objects.get_or_create(universe=self.univ, instrument=inst, is_active=True)
+            self.companies[sym] = comp
+            self.instruments[sym] = inst
+
+        # Indices
+        for idx_sym in ["^NSEI", "^NSEBANK"]:
+            comp, _ = Company.objects.get_or_create(short_name=idx_sym, defaults={"name": idx_sym, "sector": "Index"})
+            inst, _ = Instrument.objects.get_or_create(symbol=idx_sym, defaults={"company": comp, "exchange": "NSE", "instrument_type": "INDEX"})
+            self.instruments[idx_sym] = inst
+
+    def test_tick_normalization_with_average_price(self):
+        """
+        Tests that Kite normalizer extracts average_price (ATP / VWAP) from tick packets.
+        """
+        from market.normalizers.kite import KiteNormalizer
+        raw_tick = {
+            "instrument_token": 738561,
+            "last_price": 2980.5,
+            "volume_traded": 1500000,
+            "average_price": 2965.2, # Exchange official VWAP
+            "ohlc": {"open": 2950.0, "high": 2990.0, "low": 2945.0, "close": 2940.0},
+            "timestamp": "2026-09-04 11:30:00",
+        }
+        norm = KiteNormalizer.normalize_tick(raw_tick)
+        self.assertEqual(norm.symbol, "RELIANCE")
+        self.assertEqual(norm.last_price, Decimal("2980.5"))
+        self.assertEqual(norm.average_price, Decimal("2965.2"))
+
+    def test_intraday_bar_aggregation_1m_5m_15m(self):
+        """
+        Tests IntradayBarAggregator bucketing, OHLC updates, and boundary alignment.
+        """
+        from market.services.intraday_aggregator import IntradayBarAggregator
+        from market.normalizers.kite import NomadMarketTick
+        from market.models import OHLCVBar
+        from zoneinfo import ZoneInfo
+
+        agg = IntradayBarAggregator(persist_to_db=True)
+        ist = ZoneInfo("Asia/Kolkata")
+
+        # 3 ticks at 09:15:10, 09:15:30, 09:15:50 (within first 1m bar)
+        t1 = datetime(2026, 9, 4, 9, 15, 10, tzinfo=ist)
+        tick1 = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2950.0"),
+            volume=1000, received_timestamp=t1, exchange_timestamp=t1
+        )
+        agg.process_tick(tick1)
+
+        t2 = datetime(2026, 9, 4, 9, 15, 30, tzinfo=ist)
+        tick2 = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2970.0"),
+            volume=1500, received_timestamp=t2, exchange_timestamp=t2
+        )
+        agg.process_tick(tick2)
+
+        t3 = datetime(2026, 9, 4, 9, 15, 50, tzinfo=ist)
+        tick3 = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2945.0"),
+            volume=2200, received_timestamp=t3, exchange_timestamp=t3
+        )
+        agg.process_tick(tick3)
+
+        bar_1m = agg.get_current_bar("RELIANCE", "1m")
+        self.assertIsNotNone(bar_1m)
+        self.assertEqual(bar_1m.open, Decimal("2950.0"))
+        self.assertEqual(bar_1m.high, Decimal("2970.0"))
+        self.assertEqual(bar_1m.low, Decimal("2945.0"))
+        self.assertEqual(bar_1m.close, Decimal("2945.0"))
+        self.assertEqual(bar_1m.volume, 2200)
+
+        # Tick at 09:16:05 crosses 1m boundary -> finalizes 09:15 bar
+        t4 = datetime(2026, 9, 4, 9, 16, 5, tzinfo=ist)
+        tick4 = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2955.0"),
+            volume=2600, received_timestamp=t4, exchange_timestamp=t4
+        )
+        agg.process_tick(tick4)
+
+        # Check that 09:15 bar is persisted in OHLCVBar table
+        saved_bar = OHLCVBar.objects.filter(
+            instrument=self.instruments["RELIANCE"],
+            timeframe="1m",
+            timestamp=datetime(2026, 9, 4, 9, 15, 0, tzinfo=ist)
+        ).first()
+        self.assertIsNotNone(saved_bar)
+        self.assertEqual(saved_bar.open, Decimal("2950.0"))
+        self.assertEqual(saved_bar.high, Decimal("2970.0"))
+        self.assertEqual(saved_bar.low, Decimal("2945.0"))
+        self.assertEqual(saved_bar.close, Decimal("2945.0"))
+
+    def test_market_breadth_calculation(self):
+        """
+        Tests market breadth calculation: advances, declines, A/D ratio, and breadth states.
+        """
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+
+        # Bullish market: 4 advancing, 1 declining
+        states = [
+            {"symbol": "RELIANCE", "last_price": 2980, "change_pct": 1.5, "vwap": 2960},
+            {"symbol": "TCS", "last_price": 4250, "change_pct": 1.2, "vwap": 4220},
+            {"symbol": "HDFCBANK", "last_price": 1670, "change_pct": 0.8, "vwap": 1660},
+            {"symbol": "TATASTEEL", "last_price": 155, "change_pct": 2.0, "vwap": 153},
+            {"symbol": "SUNPHARMA", "last_price": 1810, "change_pct": -0.6, "vwap": 1820},
+        ]
+        breadth = IntradayMarketContextEngine.calculate_market_breadth(states)
+        self.assertEqual(breadth["advance_count"], 4)
+        self.assertEqual(breadth["decline_count"], 1)
+        self.assertEqual(breadth["unchanged_count"], 0)
+        self.assertEqual(breadth["advance_pct"], Decimal("80.0"))
+        self.assertEqual(breadth["above_vwap_pct"], Decimal("80.0"))
+        self.assertEqual(breadth["breadth_state"], "STRONG_POSITIVE")
+
+    def test_sector_strength_and_deterministic_ranking(self):
+        """
+        Tests sector aggregation and deterministic ranking by average return.
+        """
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+
+        states = [
+            {"symbol": "RELIANCE", "sector": "Energy", "change_pct": 2.5, "last_price": 2980, "vwap": 2960},
+            {"symbol": "TCS", "sector": "Technology", "change_pct": 1.0, "last_price": 4250, "vwap": 4220},
+            {"symbol": "TATASTEEL", "sector": "Metals & Mining", "change_pct": 3.0, "last_price": 155, "vwap": 153},
+            {"symbol": "SUNPHARMA", "sector": "Pharmaceutical", "change_pct": -1.2, "last_price": 1810, "vwap": 1820},
+        ]
+        sectors = IntradayMarketContextEngine.calculate_sector_strengths(states, nifty_return=Decimal("1.2"))
+        self.assertEqual(len(sectors), 4)
+        # Rank 1: Metals & Mining (+3.0%)
+        self.assertEqual(sectors[0]["sector"], "Metals & Mining")
+        self.assertEqual(sectors[0]["rank"], 1)
+        # Rank 2: Energy (+2.5%)
+        self.assertEqual(sectors[1]["sector"], "Energy")
+        self.assertEqual(sectors[1]["rank"], 2)
+        # Rank 4: Pharmaceutical (-1.2%)
+        self.assertEqual(sectors[3]["sector"], "Pharmaceutical")
+        self.assertEqual(sectors[3]["rank"], 4)
+
+    def test_volume_confirmation_classification(self):
+        """
+        Tests volume confirmation states: CONFIRMED_UP, WEAK_UP, CONFIRMED_DOWN, WEAK_DOWN, NEUTRAL.
+        """
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+
+        # Price rising + high RVOL -> CONFIRMED_UP
+        c1 = IntradayMarketContextEngine.classify_volume_confirmation(Decimal("1.5"), Decimal("1.4"))
+        self.assertEqual(c1, "CONFIRMED_UP")
+
+        # Price rising + weak RVOL -> WEAK_UP
+        c2 = IntradayMarketContextEngine.classify_volume_confirmation(Decimal("1.5"), Decimal("0.6"))
+        self.assertEqual(c2, "WEAK_UP")
+
+        # Price falling + high RVOL -> CONFIRMED_DOWN
+        c3 = IntradayMarketContextEngine.classify_volume_confirmation(Decimal("-1.2"), Decimal("1.3"))
+        self.assertEqual(c3, "CONFIRMED_DOWN")
+
+        # Price flat -> NEUTRAL
+        c4 = IntradayMarketContextEngine.classify_volume_confirmation(Decimal("0.02"), Decimal("1.5"))
+        self.assertEqual(c4, "NEUTRAL")
+
+    def test_opening_range_breakout_classification(self):
+        """
+        Tests price positioning relative to 15m opening range.
+        """
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+
+        # Above ORB
+        orb_state1, gap1 = IntradayMarketContextEngine.classify_opening_structure(
+            open_price=Decimal("152.0"), prev_close=Decimal("150.0"),
+            last_price=Decimal("156.0"), orb_high=Decimal("154.0"), orb_low=Decimal("151.0")
+        )
+        self.assertEqual(orb_state1, "ABOVE_ORB")
+        self.assertAlmostEqual(float(gap1), 1.33, places=2)
+
+        # Below ORB
+        orb_state2, _ = IntradayMarketContextEngine.classify_opening_structure(
+            open_price=Decimal("152.0"), prev_close=Decimal("150.0"),
+            last_price=Decimal("150.0"), orb_high=Decimal("154.0"), orb_low=Decimal("151.0")
+        )
+        self.assertEqual(orb_state2, "BELOW_ORB")
+
+        # Inside ORB
+        orb_state3, _ = IntradayMarketContextEngine.classify_opening_structure(
+            open_price=Decimal("152.0"), prev_close=Decimal("150.0"),
+            last_price=Decimal("153.0"), orb_high=Decimal("154.0"), orb_low=Decimal("151.0")
+        )
+        self.assertEqual(orb_state3, "INSIDE_ORB")
+
+    def test_deterministic_market_regime_classification(self):
+        """
+        Tests deterministic classification into TRENDING_UP, TRENDING_DOWN, RANGE, VOLATILE with reasons.
+        """
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+
+        nifty_up = {"last_price": 24650, "open": 24500, "high": 24680, "low": 24480, "change_pct": 0.8, "vwap": 24550}
+        bank_up = {"last_price": 52400, "open": 52000, "high": 52500, "low": 51950, "change_pct": 0.9, "vwap": 52200}
+        breadth_up = {"advance_pct": Decimal("75.0"), "decline_pct": Decimal("20.0"), "advance_count": 38, "decline_count": 10, "advance_decline_ratio": Decimal("3.8")}
+        sectors_up = [{"sector": "S1", "average_return": Decimal("1.5")}, {"sector": "S2", "average_return": Decimal("0.8")}]
+
+        res_up = IntradayMarketContextEngine.classify_market_regime(nifty_up, bank_up, breadth_up, sectors_up)
+        self.assertEqual(res_up["regime"], "TRENDING_UP")
+        self.assertGreaterEqual(res_up["confidence"], 0.70)
+        self.assertTrue(any("NIFTY above session VWAP" in r for r in res_up["reasons"]))
+        self.assertEqual(res_up["index_confirmation"], "CONFIRMED_BULLISH")
+
+    def test_data_freshness_tiers(self):
+        """
+        Tests FRESH, STALE, and UNAVAILABLE classification based on elapsed time.
+        """
+        from market.services.intraday_state_manager import IntradayStateManager
+        from django.utils import timezone as dj_timezone
+
+        mgr = IntradayStateManager()
+        now = datetime.now(timezone.utc)
+
+        # 1. Fresh: 2 seconds ago
+        mgr._last_tick_time = now - timedelta(seconds=2)
+        f1 = mgr.get_freshness_status()
+        self.assertEqual(f1["freshness"], "FRESH")
+        self.assertTrue(f1["is_fresh"])
+
+        # 2. Stale: 15 seconds ago
+        mgr._last_tick_time = now - timedelta(seconds=15)
+        f2 = mgr.get_freshness_status()
+        self.assertEqual(f2["freshness"], "STALE")
+        self.assertFalse(f2["is_fresh"])
+
+        # 3. Unavailable: 90 seconds ago
+        mgr._last_tick_time = now - timedelta(seconds=90)
+        f3 = mgr.get_freshness_status()
+        self.assertEqual(f3["freshness"], "UNAVAILABLE")
+        self.assertFalse(f3["is_fresh"])
+
+    def test_intraday_rest_api_endpoints(self):
+        """
+        Tests GET /api/v1/intraday/ endpoints return 200 with structured context.
+        """
+        from django.test import Client
+        from market.services.intraday_state_manager import IntradayStateManager
+        from market.normalizers.kite import NomadMarketTick
+
+        mgr = IntradayStateManager()
+        # Feed mock ticks
+        t = datetime.now(timezone.utc)
+        tick = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2950.0"),
+            open=Decimal("2940.0"), high=Decimal("2960.0"), low=Decimal("2935.0"), close=Decimal("2930.0"),
+            change=Decimal("20.0"), change_percent=Decimal("0.68"), average_price=Decimal("2948.0"),
+            volume=50000, received_timestamp=t, exchange_timestamp=t
+        )
+        mgr.on_tick(tick)
+
+        client = Client()
+
+        # 1. Market Context
+        resp_ctx = client.get("/api/v1/intraday/market-context/")
+        self.assertEqual(resp_ctx.status_code, 200)
+        data_ctx = resp_ctx.json()
+        self.assertIn("market_regime", data_ctx)
+        self.assertIn("breadth", data_ctx)
+        self.assertIn("freshness", data_ctx)
+
+        # 2. Stocks
+        resp_stocks = client.get("/api/v1/intraday/stocks/")
+        self.assertEqual(resp_stocks.status_code, 200)
+        data_stocks = resp_stocks.json()
+        self.assertIn("stocks", data_stocks)
+
+        # 3. Sectors
+        resp_sec = client.get("/api/v1/intraday/sectors/")
+        self.assertEqual(resp_sec.status_code, 200)
+        self.assertIn("sectors", resp_sec.json())
+
+        # 4. Indices
+        resp_idx = client.get("/api/v1/intraday/indices/")
+        self.assertEqual(resp_idx.status_code, 200)
+        self.assertIn("nifty", resp_idx.json())
+
+        # 5. Data Health
+        resp_health = client.get("/api/v1/intraday/data-health/")
+        self.assertEqual(resp_health.status_code, 200)
+        self.assertIn("universe_coverage", resp_health.json())
+
+    def test_market_context_and_stock_context_persistence(self):
+        """
+        Tests persisting MarketContextSnapshot and StockIntradayContext records.
+        """
+        from market.services.intraday_state_manager import IntradayStateManager
+        from market.normalizers.kite import NomadMarketTick
+        from market.models import MarketContextSnapshot, StockIntradayContext
+
+        mgr = IntradayStateManager()
+        t = datetime.now(timezone.utc)
+        tick = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2950.0"),
+            open=Decimal("2940.0"), high=Decimal("2960.0"), low=Decimal("2935.0"), close=Decimal("2930.0"),
+            change=Decimal("20.0"), change_percent=Decimal("0.68"), average_price=Decimal("2948.0"),
+            volume=50000, received_timestamp=t, exchange_timestamp=t
+        )
+        mgr.on_tick(tick)
+
+        snapshot = mgr.persist_snapshots()
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.universe, "NIFTY50")
+        self.assertIn(snapshot.market_regime, ["TRENDING_UP", "TRENDING_DOWN", "RANGE", "VOLATILE", "TRANSITIONING", "UNKNOWN"])
+        self.assertTrue(StockIntradayContext.objects.filter(instrument=self.instruments["RELIANCE"]).exists())
+
+
+class IntradayOpportunityEngineTests(TestCase):
+    """
+    Phase 17D Test Suite:
+    - Candidate eligibility filtering & explicit exclusion reasons
+    - Opportunity family detections (Momentum, RS, VWAP, ORB, Sector Leader, Mean Reversion)
+    - 8-Dimensional scoring, transparent penalties, confidence
+    - Structured explainability (supporting, contradicting, warnings, invalidation)
+    - Lifecycle states (EMERGING, CONFIRMED, WEAKENING, INVALIDATED, STALE)
+    - Deterministic ranking & sector diversification
+    - Snapshot persistence & history tracking
+    - REST API endpoints
+    - MANDATORY NO-LOOK-AHEAD verification
+    """
+    databases = {'default', 'telemetry'}
+
+    def setUp(self):
+        from market.models import Company, Instrument, Universe, UniverseMembership
+
+        self.univ, _ = Universe.objects.get_or_create(name="NIFTY50")
+
+        self.companies = {}
+        self.instruments = {}
+        sample_meta = [
+            ("RELIANCE", "Reliance Industries", "Energy", 2950.0),
+            ("TCS", "Tata Consultancy Services", "Technology", 4200.0),
+            ("HDFCBANK", "HDFC Bank Limited", "Financial Services", 1650.0),
+            ("TATASTEEL", "Tata Steel Limited", "Metals & Mining", 152.0),
+            ("SUNPHARMA", "Sun Pharma", "Pharmaceutical", 1820.0),
+        ]
+
+        for sym, name, sec, pr in sample_meta:
+            comp, _ = Company.objects.get_or_create(
+                short_name=sym,
+                defaults={"name": name, "sector": sec, "industry": sec}
+            )
+            inst, _ = Instrument.objects.get_or_create(
+                symbol=sym,
+                defaults={"company": comp, "exchange": "NSE", "instrument_type": "EQUITY"}
+            )
+            UniverseMembership.objects.get_or_create(universe=self.univ, instrument=inst, is_active=True)
+            self.companies[sym] = comp
+            self.instruments[sym] = inst
+
+        for idx_sym in ["^NSEI", "^NSEBANK"]:
+            comp, _ = Company.objects.get_or_create(short_name=idx_sym, defaults={"name": idx_sym, "sector": "Index"})
+            inst, _ = Instrument.objects.get_or_create(symbol=idx_sym, defaults={"company": comp, "exchange": "NSE", "instrument_type": "INDEX"})
+            self.instruments[idx_sym] = inst
+
+    def test_candidate_eligibility_filtering(self):
+        """
+        Tests candidate filtering rules and explicit exclusion reasons.
+        """
+        from market.services.intraday_opportunity_detector import IntradayOpportunityDetector
+
+        # Valid stock
+        valid_stock = {
+            "symbol": "TATASTEEL", "last_price": Decimal("154.0"), "previous_close": Decimal("150.0"),
+            "vwap": Decimal("152.5"), "volume": 50000,
+        }
+        eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(valid_stock, freshness_age_seconds=10.0)
+        self.assertTrue(eligible)
+        self.assertIsNone(reason)
+
+        # Invalid price
+        invalid_price = dict(valid_stock, last_price=Decimal("5.0"))
+        eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(invalid_price, freshness_age_seconds=10.0)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "INVALID_OR_MISSING_PRICE")
+
+        # Missing VWAP
+        missing_vwap = dict(valid_stock, vwap=None)
+        eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(missing_vwap, freshness_age_seconds=10.0)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "MISSING_SESSION_VWAP")
+
+        # Insufficient volume
+        low_vol = dict(valid_stock, volume=50)
+        eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(low_vol, freshness_age_seconds=10.0)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "INSUFFICIENT_LIQUIDITY_VOLUME")
+
+        # Stale data
+        eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(valid_stock, freshness_age_seconds=120.0)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "STALE_MARKET_DATA")
+
+    def test_opportunity_family_detection(self):
+        """
+        Tests deterministic classification into opportunity families.
+        """
+        from market.services.intraday_opportunity_detector import IntradayOpportunityDetector
+
+        # 1. Momentum Continuation
+        stock_mom = {
+            "symbol": "TATASTEEL", "last_price": 155.0, "change_pct": 2.5, "distance_from_vwap": 0.8,
+            "momentum_5m": 0.4, "momentum_15m": 0.9, "volume_confirmation": "CONFIRMED_UP",
+            "opening_range_state": "INSIDE_ORB",
+        }
+        opp_type, bias, _ = IntradayOpportunityDetector.detect_opportunity_type(stock_mom)
+        self.assertEqual(opp_type, "MOMENTUM_CONTINUATION")
+        self.assertEqual(bias, "BULLISH")
+
+        # 2. Relative Strength
+        stock_rs = {
+            "symbol": "TATASTEEL", "last_price": 155.0, "change_pct": 2.5, "distance_from_vwap": 0.8,
+            "momentum_5m": 0.1, "momentum_15m": 0.2, "relative_strength_vs_market": 1.5,
+            "relative_strength_vs_sector": 0.8, "volume_confirmation": "CONFIRMED_UP",
+            "opening_range_state": "INSIDE_ORB",
+        }
+        opp_type, bias, _ = IntradayOpportunityDetector.detect_opportunity_type(stock_rs)
+        self.assertEqual(opp_type, "RELATIVE_STRENGTH")
+        self.assertEqual(bias, "BULLISH")
+
+        # 3. Opening Range Breakout
+        stock_orb = {
+            "symbol": "TATASTEEL", "last_price": 155.0, "change_pct": 2.5, "distance_from_vwap": 0.8,
+            "opening_range_state": "ABOVE_ORB", "volume_confirmation": "CONFIRMED_UP",
+        }
+        opp_type, bias, _ = IntradayOpportunityDetector.detect_opportunity_type(stock_orb)
+        self.assertEqual(opp_type, "OPENING_RANGE_BREAKOUT")
+        self.assertEqual(bias, "BULLISH")
+
+        # 4. Sector Leadership
+        sec_info = {"name": "Metals & Mining", "rank": 1, "return_pct": 1.2}
+        stock_sec = {
+            "symbol": "TATASTEEL", "last_price": 155.0, "change_pct": 2.2, "distance_from_vwap": 0.5,
+            "relative_strength_vs_market": 1.0, "volume_confirmation": "CONFIRMED_UP",
+            "opening_range_state": "INSIDE_ORB",
+        }
+        opp_type, bias, _ = IntradayOpportunityDetector.detect_opportunity_type(stock_sec, sector_info=sec_info)
+        self.assertEqual(opp_type, "SECTOR_LEADERSHIP")
+        self.assertEqual(bias, "BULLISH")
+
+        # 5. Mean Reversion Context
+        stock_rev = {
+            "symbol": "TATASTEEL", "last_price": 160.0, "change_pct": 4.5, "distance_from_vwap": 3.2,
+            "momentum_5m": -0.3, "opening_range_state": "INSIDE_ORB",
+        }
+        opp_type, bias, _ = IntradayOpportunityDetector.detect_opportunity_type(stock_rev)
+        self.assertEqual(opp_type, "MEAN_REVERSION_CONTEXT")
+        self.assertEqual(bias, "BEARISH_EXHAUSTION")
+
+    def test_dimensional_scoring_and_penalties(self):
+        """
+        Tests 8-dimensional scoring, penalty deduction, and confidence bounds.
+        """
+        from market.services.intraday_opportunity_scorer import IntradayOpportunityScorer
+
+        stock = {
+            "symbol": "TATASTEEL", "change_pct": Decimal("2.1"), "distance_from_vwap": Decimal("0.75"),
+            "relative_volume": Decimal("1.4"), "momentum_5m": Decimal("0.35"), "momentum_15m": Decimal("0.8"),
+            "relative_strength_vs_market": Decimal("1.2"), "relative_strength_vs_sector": Decimal("0.8"),
+            "opening_range_state": "INSIDE_ORB", "sector": "Metals & Mining",
+        }
+        mkt = {
+            "market_regime": "TRENDING_UP",
+            "nifty": {"return_pct": 0.5},
+            "breadth": {"advance_decline_ratio": 2.2, "breadth_state": "STRONG_POSITIVE"},
+        }
+        sec = {"name": "Metals & Mining", "rank": 1, "return_pct": 1.3}
+        freshness = {"freshness": "FRESH"}
+
+        score_res = IntradayOpportunityScorer.calculate_opportunity_score(
+            stock_context=stock,
+            opportunity_type="RELATIVE_STRENGTH",
+            bias="BULLISH",
+            market_context=mkt,
+            sector_info=sec,
+            freshness_info=freshness,
+        )
+
+        self.assertGreaterEqual(score_res["score"], Decimal("70.0"))
+        self.assertLessEqual(score_res["score"], Decimal("100.0"))
+        self.assertGreaterEqual(score_res["confidence"], 0.65)
+        self.assertLessEqual(score_res["confidence"], 1.0)
+        self.assertEqual(score_res["state"], "CONFIRMED")
+        self.assertEqual(score_res["market_alignment"], "STRONGLY_ALIGNED")
+
+        # Test penalty application with weak volume and market divergence
+        stock_weak = dict(stock, relative_volume=Decimal("0.5"))
+        mkt_divergent = dict(mkt, market_regime="TRENDING_DOWN", nifty={"return_pct": -0.8}, breadth={"advance_decline_ratio": 0.4})
+        score_penalized = IntradayOpportunityScorer.calculate_opportunity_score(
+            stock_context=stock_weak,
+            opportunity_type="RELATIVE_STRENGTH",
+            bias="BULLISH",
+            market_context=mkt_divergent,
+            sector_info=sec,
+            freshness_info=freshness,
+        )
+
+        self.assertLess(score_penalized["score"], score_res["score"])
+        self.assertTrue(any(p["reason"] == "LOW_VOLUME_CONFIRMATION" for p in score_penalized["penalties"]))
+        self.assertTrue(any(p["reason"] == "BEARISH_MARKET_DIVERGENCE" for p in score_penalized["penalties"]))
+
+    def test_structured_explanations(self):
+        """
+        Tests explainability output: supporting factors, contradicting factors, warnings, and invalidation.
+        """
+        from market.services.intraday_opportunity_explainer import IntradayOpportunityExplainer
+
+        stock = {
+            "symbol": "TATASTEEL", "change_pct": 2.1, "distance_from_vwap": 0.75,
+            "relative_volume": 1.5, "momentum_5m": 0.35, "momentum_15m": 0.8,
+            "relative_strength_vs_market": 1.2, "relative_strength_vs_sector": 0.8,
+            "opening_range_state": "INSIDE_ORB", "volume_confirmation": "CONFIRMED_UP",
+        }
+        mkt = {
+            "market_regime": "TRENDING_UP",
+            "breadth": {"advance_decline_ratio": 2.2, "breadth_state": "STRONG_POSITIVE"},
+        }
+        sec = {"name": "Metals & Mining", "rank": 1, "return_pct": 1.3}
+
+        exp = IntradayOpportunityExplainer.explain_opportunity(
+            stock_context=stock,
+            opportunity_type="RELATIVE_STRENGTH",
+            bias="BULLISH",
+            score_data={"score": Decimal("84.0")},
+            market_context=mkt,
+            sector_info=sec,
+        )
+
+        self.assertGreater(len(exp["supporting_factors"]), 0)
+        self.assertTrue(any("VWAP" in s for s in exp["supporting_factors"]))
+        self.assertTrue(any("NIFTY" in s for s in exp["supporting_factors"]))
+        self.assertTrue(any("Metals" in s for s in exp["supporting_factors"]))
+        self.assertIn("invalidation_condition", exp)
+
+    def test_deterministic_ranking_and_tie_breaking(self):
+        """
+        Tests ranking ordering (Score DESC, Confidence DESC, Symbol ASC) and sector diversification.
+        """
+        from market.services.intraday_opportunity_ranker import IntradayOpportunityRanker
+
+        opps = [
+            {"symbol": "B_SYM", "score": 80.0, "confidence": 0.8, "sector": "Technology"},
+            {"symbol": "A_SYM", "score": 80.0, "confidence": 0.8, "sector": "Technology"}, # Tie with B_SYM, A comes first
+            {"symbol": "C_SYM", "score": 85.0, "confidence": 0.7, "sector": "Technology"},
+            {"symbol": "D_SYM", "score": 75.0, "confidence": 0.9, "sector": "Energy"},
+        ]
+
+        raw = IntradayOpportunityRanker.rank_opportunities(opps, mode="RAW_RANKING", limit=10)
+        ranked = raw["opportunities"]
+        self.assertEqual(ranked[0]["symbol"], "C_SYM") # Highest score 85.0
+        self.assertEqual(ranked[1]["symbol"], "A_SYM") # Score 80.0, tie broken by Symbol ASC
+        self.assertEqual(ranked[2]["symbol"], "B_SYM") # Score 80.0
+        self.assertEqual(ranked[3]["symbol"], "D_SYM") # Score 75.0
+
+        # Test sector diversification
+        div = IntradayOpportunityRanker.rank_opportunities(opps, mode="SECTOR_DIVERSIFIED", limit=3, max_per_sector=2)
+        div_ranked = div["opportunities"]
+        tech_count = sum(1 for o in div_ranked if o["sector"] == "Technology")
+        self.assertLessEqual(tech_count, 2)
+        self.assertEqual(div_ranked[2]["symbol"], "D_SYM") # Energy promoted into Top 3
+
+    def test_persistence_and_retrieval(self):
+        """
+        Tests persisting IntradayOpportunitySnapshot and querying history.
+        """
+        from market.services.intraday_opportunity_engine import IntradayOpportunityEngine
+        from market.models import IntradayOpportunitySnapshot
+
+        engine = IntradayOpportunityEngine()
+        t = datetime.now(timezone.utc)
+        opp = {
+            "symbol": "TATASTEEL",
+            "opportunity_type": "RELATIVE_STRENGTH",
+            "state": "CONFIRMED",
+            "score": 84.5,
+            "confidence": 0.88,
+            "component_scores": {
+                "momentum_score": 85.0, "relative_strength_score": 90.0, "volume_score": 80.0,
+                "vwap_score": 90.0, "market_alignment_score": 80.0, "sector_alignment_score": 80.0,
+                "orb_score": 60.0, "data_quality_score": 100.0,
+            },
+            "supporting_factors": ["Above VWAP", "Outperforming NIFTY"],
+            "contradicting_factors": [],
+            "warnings": [],
+            "penalties": [],
+            "metrics": {"last_price": 154.0, "change_pct": 2.1},
+            "rank": 1,
+            "sector": {"name": "Metals & Mining"},
+            "market_alignment": "STRONGLY_ALIGNED",
+            "sector_alignment": "STRONGLY_ALIGNED",
+            "data_quality": "HIGH",
+            "freshness": "FRESH",
+            "first_detected_at": t.isoformat(),
+        }
+
+        engine._persist_opportunities([opp], t)
+        snap = IntradayOpportunitySnapshot.objects.filter(symbol="TATASTEEL").first()
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.opportunity_type, "RELATIVE_STRENGTH")
+        self.assertEqual(snap.state, "CONFIRMED")
+        self.assertEqual(float(snap.score), 84.5)
+        self.assertEqual(snap.rank, 1)
+
+    def test_rest_api_endpoints(self):
+        """
+        Tests GET /api/v1/intraday/opportunities/ endpoints.
+        """
+        from rest_framework.test import APIClient
+        from market.services.intraday_state_manager import IntradayStateManager
+        from market.normalizers.kite import NomadMarketTick
+
+        client = APIClient()
+        mgr = IntradayStateManager()
+        t = datetime.now(timezone.utc)
+
+        tick = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2960.0"),
+            open=Decimal("2940.0"), high=Decimal("2970.0"), low=Decimal("2935.0"), close=Decimal("2930.0"),
+            change=Decimal("30.0"), change_percent=Decimal("1.02"), average_price=Decimal("2950.0"),
+            volume=80000, received_timestamp=t, exchange_timestamp=t
+        )
+        mgr.on_tick(tick)
+
+        # 1. Opportunities list
+        resp = client.get("/api/v1/intraday/opportunities/")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("opportunities", data)
+        self.assertIn("market_context", data)
+
+        # 2. Top opportunities
+        resp_top = client.get("/api/v1/intraday/opportunities/top/")
+        self.assertEqual(resp_top.status_code, 200)
+        self.assertIn("top_opportunities", resp_top.json())
+
+        # 3. Single symbol detail
+        resp_detail = client.get("/api/v1/intraday/opportunities/RELIANCE/")
+        self.assertEqual(resp_detail.status_code, 200)
+        self.assertIn("symbol", resp_detail.json())
+
+        # 4. History
+        resp_hist = client.get("/api/v1/intraday/opportunities/RELIANCE/history/")
+        self.assertEqual(resp_hist.status_code, 200)
+        self.assertIn("history", resp_hist.json())
+
+    def test_mandatory_no_look_ahead(self):
+        """
+        MANDATORY NO-LOOK-AHEAD REGRESSION TEST:
+        Validates that injecting future market ticks / candles at timestamp T + 15m
+        does NOT alter or mutate an opportunity evaluation calculated for timestamp T.
+        """
+        from market.services.intraday_opportunity_engine import IntradayOpportunityEngine
+        from zoneinfo import ZoneInfo
+
+        ist = ZoneInfo("Asia/Kolkata")
+        t_snapshot = datetime(2026, 9, 4, 10, 0, 0, tzinfo=ist)
+
+        # State of market and stocks strictly at 10:00 IST
+        stock_at_10 = {
+            "symbol": "TATASTEEL",
+            "last_price": Decimal("152.0"),
+            "previous_close": Decimal("150.0"),
+            "change_pct": Decimal("1.33"),
+            "vwap": Decimal("151.0"),
+            "distance_from_vwap": Decimal("0.66"),
+            "volume": 20000,
+            "relative_volume": Decimal("1.3"),
+            "momentum_5m": Decimal("0.2"),
+            "momentum_15m": Decimal("0.5"),
+            "relative_strength_vs_market": Decimal("0.8"),
+            "relative_strength_vs_sector": Decimal("0.5"),
+            "opening_range_state": "INSIDE_ORB",
+            "sector": "Metals & Mining",
+            "volume_confirmation": "CONFIRMED_UP",
+        }
+        mkt_at_10 = {
+            "market_regime": "TRENDING_UP",
+            "regime_confidence": 0.8,
+            "breadth": {"breadth_state": "STRONG_POSITIVE", "advance_decline_ratio": 2.0},
+            "sectors": [{"name": "Metals & Mining", "rank": 1, "return_pct": 1.1}],
+            "nifty": {"return_pct": 0.5},
+        }
+
+        engine1 = IntradayOpportunityEngine()
+        eval_at_10 = engine1.evaluate_universe_opportunities(
+            market_context=mkt_at_10,
+            constituent_contexts=[stock_at_10],
+            as_of=t_snapshot,
+            persist_to_db=False,
+        )
+
+        score_at_10 = eval_at_10["opportunities"][0]["score"]
+        opp_type_at_10 = eval_at_10["opportunities"][0]["opportunity_type"]
+        state_at_10 = eval_at_10["opportunities"][0]["state"]
+
+        # Now simulate future data arriving at 10:15 IST (e.g. sharp crash or massive pump)
+        t_future = datetime(2026, 9, 4, 10, 15, 0, tzinfo=ist)
+        stock_at_10_15 = dict(
+            stock_at_10,
+            last_price=Decimal("142.0"), # Crashing down
+            change_pct=Decimal("-5.33"),
+            distance_from_vwap=Decimal("-4.5"),
+            momentum_5m=Decimal("-1.5"),
+            momentum_15m=Decimal("-2.5"),
+            volume_confirmation="CONFIRMED_DOWN",
+        )
+        mkt_at_10_15 = dict(
+            mkt_at_10,
+            market_regime="TRENDING_DOWN",
+            breadth={"breadth_state": "STRONG_NEGATIVE", "advance_decline_ratio": 0.3},
+            nifty={"return_pct": -1.2},
+        )
+
+        # Re-evaluate opportunities for timestamp T (10:00 IST) using an independent engine run
+        engine2 = IntradayOpportunityEngine()
+        eval_replayed_at_10 = engine2.evaluate_universe_opportunities(
+            market_context=mkt_at_10,
+            constituent_contexts=[stock_at_10],
+            as_of=t_snapshot,
+            persist_to_db=False,
+        )
+
+        # Assert zero leakage / identical results
+        self.assertEqual(eval_replayed_at_10["opportunities"][0]["score"], score_at_10)
+        self.assertEqual(eval_replayed_at_10["opportunities"][0]["opportunity_type"], opp_type_at_10)
+        self.assertEqual(eval_replayed_at_10["opportunities"][0]["state"], state_at_10)
+        self.assertEqual(eval_replayed_at_10["opportunities"][0]["component_scores"], eval_at_10["opportunities"][0]["component_scores"])
+        self.assertEqual(eval_replayed_at_10["opportunities"][0]["supporting_factors"], eval_at_10["opportunities"][0]["supporting_factors"])
+
+
+

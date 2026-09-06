@@ -1,4 +1,6 @@
 import uuid
+from decimal import Decimal
+from typing import Optional
 from django.db import models
 from django.utils import timezone
 
@@ -381,6 +383,24 @@ class MarketContextSnapshot(models.Model):
     as_of = models.DateTimeField(db_index=True)
     universe = models.CharField(max_length=50, default="NIFTY50")
     calculations_version = models.IntegerField(default=1)
+    
+    # Intraday summary columns for rapid querying
+    market_direction = models.CharField(max_length=20, default='NEUTRAL')
+    market_regime = models.CharField(max_length=30, default='UNKNOWN')
+    nifty_return = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    banknifty_return = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    advance_count = models.IntegerField(default=0)
+    decline_count = models.IntegerField(default=0)
+    unchanged_count = models.IntegerField(default=0)
+    advance_decline_ratio = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    above_vwap_pct = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    below_vwap_pct = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    sector_leader = models.CharField(max_length=50, blank=True, null=True)
+    sector_laggard = models.CharField(max_length=50, blank=True, null=True)
+    market_volatility = models.CharField(max_length=20, default='NORMAL')
+    breadth_state = models.CharField(max_length=30, default='NEUTRAL')
+    index_confirmation = models.CharField(max_length=30, default='NEUTRAL')
+
     index_regimes = models.JSONField(default=dict)
     breadth = models.JSONField(default=dict)
     sector_rankings = models.JSONField(default=list)
@@ -398,6 +418,46 @@ class MarketContextSnapshot(models.Model):
 
     def __str__(self):
         return f"Market Context Snapshot [{self.universe}] @ {self.as_of.isoformat()}"
+
+
+class StockIntradayContext(models.Model):
+    """
+    Intraday stock-level context snapshot capturing technical, relative strength,
+    volume confirmation, opening range, and foundation context features.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    instrument = models.ForeignKey(Instrument, on_delete=models.CASCADE, related_name='intraday_contexts')
+    timestamp = models.DateTimeField(db_index=True)
+    last_price = models.DecimalField(max_digits=12, decimal_places=2)
+    change_pct = models.DecimalField(max_digits=6, decimal_places=2)
+    vwap = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    distance_from_vwap = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    volume = models.BigIntegerField(default=0)
+    relative_volume = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    momentum_5m = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    momentum_15m = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    momentum_30m = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    relative_strength_vs_market = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    relative_strength_vs_sector = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    sector = models.CharField(max_length=100, default='Unknown')
+    sector_return = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    volume_confirmation = models.CharField(max_length=30, default='NEUTRAL')
+    opening_range_state = models.CharField(max_length=30, default='INSIDE_ORB')
+    intraday_high = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    intraday_low = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    component_scores = models.JSONField(default=dict)
+    context_score = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['instrument', 'timestamp']),
+            models.Index(fields=['timestamp']),
+        ]
+        verbose_name_plural = "Stock Intraday Contexts"
+
+    def __str__(self):
+        return f"{self.instrument.symbol} IntradayContext @ {self.timestamp.isoformat()}"
 
 
 class Universe(models.Model):
@@ -862,3 +922,149 @@ class BacktestRun(models.Model):
 
     def __str__(self):
         return f"BacktestRun({self.run_id} status={self.status})"
+
+
+def _get_kite_cipher():
+    import base64
+    import hashlib
+    from cryptography.fernet import Fernet
+    from django.conf import settings
+
+    key_material = getattr(settings, 'SECRET_KEY', 'nomad-analyst-secure-encryption-key').encode('utf-8')
+    key_32 = hashlib.sha256(key_material).digest()
+    return Fernet(base64.urlsafe_b64encode(key_32))
+
+
+class KiteCredential(models.Model):
+    """
+    Secure persistence for Zerodha Kite Connect credentials and authentication lifecycle.
+    Encrypts access token at rest using Fernet with Django SECRET_KEY.
+    """
+    STATUS_CHOICES = (
+        ('NOT_CONFIGURED', 'Not Configured'),
+        ('AUTHENTICATION_REQUIRED', 'Authentication Required'),
+        ('AUTHENTICATING', 'Authenticating'),
+        ('CONNECTED', 'Connected'),
+        ('EXPIRED', 'Expired'),
+        ('ERROR', 'Error'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    account_id = models.CharField(max_length=50, default='default', unique=True)
+    user_id = models.CharField(max_length=50, blank=True, null=True, help_text="Zerodha User ID / Client ID")
+    user_name = models.CharField(max_length=100, blank=True, null=True)
+    encrypted_access_token = models.TextField(blank=True, null=True)
+    public_token = models.CharField(max_length=255, blank=True, null=True)
+    request_token = models.CharField(max_length=255, blank=True, null=True)
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='NOT_CONFIGURED')
+    authenticated_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['account_id']),
+            models.Index(fields=['status']),
+        ]
+
+    def set_access_token(self, token: str):
+        if not token:
+            self.encrypted_access_token = None
+        else:
+            cipher = _get_kite_cipher()
+            self.encrypted_access_token = cipher.encrypt(token.encode('utf-8')).decode('utf-8')
+
+    def get_access_token(self) -> Optional[str]:
+        if not self.encrypted_access_token:
+            return None
+        try:
+            cipher = _get_kite_cipher()
+            return cipher.decrypt(self.encrypted_access_token.encode('utf-8')).decode('utf-8')
+        except Exception:
+            return None
+
+    def __str__(self):
+        return f"KiteCredential({self.account_id} status={self.status} user={self.user_id})"
+
+
+class IntradayOpportunitySnapshot(models.Model):
+    """
+    Point-in-time snapshot of an intraday stock opportunity evaluation.
+    Provides complete dimensional score decomposition, deterministic classifications,
+    and structured explainability factors.
+    """
+    OPPORTUNITY_TYPE_CHOICES = (
+        ('MOMENTUM_CONTINUATION', 'Momentum Continuation'),
+        ('RELATIVE_STRENGTH', 'Relative Strength'),
+        ('VWAP_TREND', 'VWAP Trend'),
+        ('OPENING_RANGE_BREAKOUT', 'Opening Range Breakout'),
+        ('OPENING_RANGE_BREAKDOWN', 'Opening Range Breakdown'),
+        ('SECTOR_LEADERSHIP', 'Sector Leadership'),
+        ('MEAN_REVERSION_CONTEXT', 'Mean Reversion Context'),
+        ('NO_CLEAR_OPPORTUNITY', 'No Clear Opportunity'),
+    )
+
+    STATE_CHOICES = (
+        ('EMERGING', 'Emerging'),
+        ('CONFIRMED', 'Confirmed'),
+        ('WEAKENING', 'Weakening'),
+        ('INVALIDATED', 'Invalidated'),
+        ('STALE', 'Stale'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    instrument = models.ForeignKey(
+        Instrument, on_delete=models.CASCADE, related_name='intraday_opportunities'
+    )
+    symbol = models.CharField(max_length=50, db_index=True)
+    timestamp = models.DateTimeField(db_index=True)
+    opportunity_type = models.CharField(max_length=50, choices=OPPORTUNITY_TYPE_CHOICES)
+    state = models.CharField(max_length=30, choices=STATE_CHOICES, default='EMERGING')
+
+    # Scores
+    score = models.DecimalField(max_digits=6, decimal_places=2, help_text="Composite quality score 0-100")
+    confidence = models.DecimalField(max_digits=4, decimal_places=2, help_text="Evidence completeness 0.0-1.0")
+
+    # Dimensional Component Scores (0-100 each)
+    momentum_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    relative_strength_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    volume_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    vwap_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    market_alignment_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    sector_alignment_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    orb_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+    data_quality_score = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal('0.0'))
+
+    # Structured Explanations
+    supporting_factors = models.JSONField(default=list)
+    contradicting_factors = models.JSONField(default=list)
+    warnings = models.JSONField(default=list)
+    penalties = models.JSONField(default=list)
+    metrics = models.JSONField(default=dict)
+
+    # Metadata & Context
+    rank = models.IntegerField(null=True, blank=True)
+    sector = models.CharField(max_length=100, default='Unknown')
+    market_alignment = models.CharField(max_length=30, default='NEUTRAL')
+    sector_alignment = models.CharField(max_length=30, default='NEUTRAL')
+    data_quality = models.CharField(max_length=20, default='HIGH')
+    freshness = models.CharField(max_length=20, default='FRESH')
+
+    # Lifecycle tracking
+    first_detected_at = models.DateTimeField(null=True, blank=True)
+    last_updated_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['symbol', 'timestamp']),
+            models.Index(fields=['timestamp', 'rank']),
+            models.Index(fields=['opportunity_type', 'state']),
+            models.Index(fields=['state', 'score']),
+        ]
+        verbose_name_plural = "Intraday Opportunity Snapshots"
+
+    def __str__(self):
+        return f"{self.symbol} [{self.opportunity_type}] score={self.score} state={self.state} @ {self.timestamp.isoformat()}"

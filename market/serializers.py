@@ -5,8 +5,9 @@ from typing import Dict, Any
 from .models import (
     Company, Instrument, MarketSnapshot, OHLCVBar, TechnicalFeature,
     IncomeStatement, BalanceSheetStatement, CashFlowStatement, DerivedFundamentalMetric,
-    NewsItem, CorporateDisclosure, MarketContextSnapshot,
-    StockOpportunitySnapshot, StockRecommendation, RecommendationOutcome, BacktestRun
+    NewsItem, CorporateDisclosure, MarketContextSnapshot, StockIntradayContext,
+    StockOpportunitySnapshot, StockRecommendation, RecommendationOutcome, BacktestRun,
+    IntradayOpportunitySnapshot
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,9 +161,28 @@ class MarketContextSnapshotSerializer(serializers.ModelSerializer):
     class Meta:
         model = MarketContextSnapshot
         fields = [
-            'id', 'as_of', 'universe', 'breadth', 'index_regimes',
-            'fii_dii_flow', 'cross_market_cues', 'macro_events',
-            'calculation_version', 'created_at'
+            'id', 'as_of', 'universe', 'calculations_version',
+            'market_direction', 'market_regime', 'nifty_return', 'banknifty_return',
+            'advance_count', 'decline_count', 'unchanged_count', 'advance_decline_ratio',
+            'above_vwap_pct', 'below_vwap_pct', 'sector_leader', 'sector_laggard',
+            'market_volatility', 'breadth_state', 'index_confirmation',
+            'breadth', 'index_regimes', 'sector_rankings', 'created_at'
+        ]
+
+class StockIntradayContextSerializer(serializers.ModelSerializer):
+    symbol = serializers.CharField(source='instrument.symbol', read_only=True)
+    company_name = serializers.CharField(source='instrument.company.name', read_only=True)
+
+    class Meta:
+        model = StockIntradayContext
+        fields = [
+            'id', 'symbol', 'company_name', 'timestamp',
+            'last_price', 'change_pct', 'vwap', 'distance_from_vwap',
+            'volume', 'relative_volume', 'momentum_5m', 'momentum_15m', 'momentum_30m',
+            'relative_strength_vs_market', 'relative_strength_vs_sector',
+            'sector', 'sector_return', 'volume_confirmation', 'opening_range_state',
+            'intraday_high', 'intraday_low', 'component_scores', 'context_score',
+            'created_at'
         ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,3 +278,24 @@ class ResearchQueryRequestSerializer(serializers.Serializer):
     question = serializers.CharField(max_length=1000, required=True)
     depth = serializers.ChoiceField(choices=['quick', 'standard', 'deep', 'QUICK', 'STANDARD', 'DEEP'], default='standard')
     as_of = serializers.CharField(required=False, allow_null=True, default=None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Intraday Opportunity Snapshot Serializer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IntradayOpportunitySnapshotSerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(source='instrument.company.name', read_only=True)
+
+    class Meta:
+        model = IntradayOpportunitySnapshot
+        fields = [
+            'id', 'symbol', 'company_name', 'timestamp', 'opportunity_type', 'state',
+            'score', 'confidence', 'momentum_score', 'relative_strength_score',
+            'volume_score', 'vwap_score', 'market_alignment_score',
+            'sector_alignment_score', 'orb_score', 'data_quality_score',
+            'supporting_factors', 'contradicting_factors', 'warnings',
+            'penalties', 'metrics', 'rank', 'sector', 'market_alignment',
+            'sector_alignment', 'data_quality', 'freshness',
+            'first_detected_at', 'last_updated_at', 'created_at'
+        ]

@@ -277,3 +277,10 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
 }
 
+# Zerodha Kite Connect Configuration (Phase 17A/17B)
+KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
+KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
+KITE_ACCESS_TOKEN = os.environ.get("KITE_ACCESS_TOKEN", "")
+KITE_REDIRECT_URL = os.environ.get("KITE_REDIRECT_URL", "http://127.0.0.1:8000/kite/callback/")
+KITE_FRONTEND_REDIRECT_URL = os.environ.get("KITE_FRONTEND_REDIRECT_URL", "http://localhost:5173/intraday")
+

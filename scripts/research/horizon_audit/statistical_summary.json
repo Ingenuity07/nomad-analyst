@@ -1,0 +1,31 @@
+{
+  "total_companies": 50,
+  "scored_companies": 49,
+  "fundamental_score": {
+    "min": 54.0,
+    "max": 85.0,
+    "mean": 70.16326530612245,
+    "std": 9.903301735085288,
+    "median": 71.5,
+    "p25": 58.5,
+    "p75": 80.5
+  },
+  "long_term_score": {
+    "min": 51.4,
+    "max": 82.8,
+    "mean": 65.30408163265307,
+    "std": 6.64529783683733,
+    "median": 66.15,
+    "p25": 59.65,
+    "p75": 70.65
+  },
+  "correlations": {
+    "fun_vs_lt_score": 0.5919657536514168,
+    "rev_growth_vs_fun_score": -0.48286984801286836,
+    "pat_growth_vs_fun_score": -0.48286956997011315,
+    "roe_vs_fun_score": 0.6759034996568823,
+    "roce_vs_fun_score": 0.8830654137909824,
+    "de_vs_fun_score": -0.7542755322697059,
+    "pe_vs_fun_score": null
+  }
+}

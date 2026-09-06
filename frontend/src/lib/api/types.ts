@@ -536,3 +536,360 @@ export interface ResearchReportResponse {
   evidence: string[];
   generated_at: string;
 }
+
+// ── Kite Connect Authentication & Data Health (Phase 17B) ───────────────────
+
+export interface KiteStatusResponse {
+  configured: boolean;
+  authenticated: boolean;
+  status: 'NOT_CONFIGURED' | 'AUTHENTICATION_REQUIRED' | 'AUTHENTICATING' | 'CONNECTED' | 'EXPIRED' | 'ERROR';
+  user_id: string | null;
+  user_name: string | null;
+  authenticated_at: string | null;
+  expires_at: string | null;
+  last_error: string | null;
+  login_url: string | null;
+  provider: string;
+}
+
+export interface KiteDataHealthResponse {
+  provider: string;
+  authenticated: boolean;
+  connection_status: string;
+  market_session: string;
+  is_market_open: boolean;
+  data_status: 'LIVE' | 'WAITING_FOR_DATA' | 'MARKET CLOSED' | 'DISCONNECTED';
+  subscribed_instruments_count: number;
+  last_tick: {
+    symbol: string;
+    last_price: number;
+    volume: number;
+    exchange_timestamp: string | null;
+    received_timestamp: string;
+    is_suspicious: boolean;
+  } | null;
+  last_snapshot_timestamp: string | null;
+  as_of: string;
+}
+
+// ── Phase 17C — Intraday Market Context & Signal Foundation ─────────────────
+
+export interface IntradayIndexState {
+  symbol: string;
+  name: string;
+  price: number;
+  change: number;
+  change_percent: number;
+  open: number;
+  high: number;
+  low: number;
+  vwap: number | null;
+}
+
+export interface IntradayBreadth {
+  total_constituents: number;
+  advance_count: number;
+  decline_count: number;
+  unchanged_count: number;
+  advance_pct: number;
+  decline_pct: number;
+  unchanged_pct: number;
+  advance_decline_ratio: number;
+  above_vwap_count: number;
+  below_vwap_count: number;
+  above_vwap_pct: number;
+  below_vwap_pct: number;
+  at_high_count: number;
+  at_low_count: number;
+  breadth_state: 'STRONG_POSITIVE' | 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE' | 'STRONG_NEGATIVE';
+}
+
+export interface IntradaySectorStrength {
+  sector: string;
+  constituent_count: number;
+  average_return: number;
+  median_return: number;
+  advance_count: number;
+  decline_count: number;
+  advance_pct: number;
+  above_vwap_pct: number;
+  relative_strength_vs_nifty: number | null;
+  rank: number;
+}
+
+export interface StockIntradayContextItem {
+  symbol: string;
+  company_name?: string;
+  last_price: number;
+  previous_close: number;
+  open: number;
+  high: number;
+  low: number;
+  change_pct: number;
+  vwap: number | null;
+  distance_from_vwap: number | null;
+  is_above_vwap: boolean | null;
+  volume: number;
+  relative_volume: number | null;
+  momentum_5m: number | null;
+  momentum_15m: number | null;
+  momentum_30m: number | null;
+  relative_strength_vs_market: number | null;
+  relative_strength_vs_sector: number | null;
+  sector: string;
+  sector_return: number | null;
+  volume_confirmation: 'CONFIRMED_UP' | 'WEAK_UP' | 'CONFIRMED_DOWN' | 'WEAK_DOWN' | 'NEUTRAL';
+  opening_gap_pct: number;
+  opening_range_state: 'ABOVE_ORB' | 'BELOW_ORB' | 'INSIDE_ORB';
+  component_scores: {
+    momentum_score: number;
+    relative_strength_score: number;
+    volume_confirmation_score: number;
+    vwap_alignment_score: number;
+    sector_alignment_score: number;
+    market_alignment_score: number;
+  };
+  context_score: number;
+}
+
+export interface IntradayMarketContextResponse {
+  as_of: string;
+  freshness: 'FRESH' | 'STALE' | 'UNAVAILABLE';
+  freshness_age_seconds: number | null;
+  is_fresh: boolean;
+  market_direction: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  market_regime: 'TRENDING_UP' | 'TRENDING_DOWN' | 'RANGE' | 'VOLATILE' | 'TRANSITIONING' | 'UNKNOWN';
+  regime_confidence: number;
+  regime_reasons: string[];
+  index_confirmation: 'CONFIRMED_BULLISH' | 'CONFIRMED_BEARISH' | 'DIVERGENT' | 'NEUTRAL';
+  market_volatility: 'HIGH' | 'NORMAL';
+  nifty: IntradayIndexState;
+  banknifty: IntradayIndexState;
+  breadth: IntradayBreadth;
+  sectors: IntradaySectorStrength[];
+  sector_leader: string | null;
+  sector_laggard: string | null;
+}
+
+export interface IntradayStocksResponse {
+  as_of: string;
+  freshness: 'FRESH' | 'STALE' | 'UNAVAILABLE';
+  count: number;
+  stocks: StockIntradayContextItem[];
+}
+
+export interface IntradaySectorsResponse {
+  as_of: string;
+  freshness: 'FRESH' | 'STALE' | 'UNAVAILABLE';
+  sector_leader: string | null;
+  sector_laggard: string | null;
+  count: number;
+  sectors: IntradaySectorStrength[];
+}
+
+// ==============================================================================
+// Phase 17D — Intraday Opportunity Engine Types
+// ==============================================================================
+
+export type OpportunityType =
+  | 'MOMENTUM_CONTINUATION'
+  | 'RELATIVE_STRENGTH'
+  | 'VWAP_TREND'
+  | 'OPENING_RANGE_BREAKOUT'
+  | 'OPENING_RANGE_BREAKDOWN'
+  | 'SECTOR_LEADERSHIP'
+  | 'MEAN_REVERSION_CONTEXT'
+  | 'NO_CLEAR_OPPORTUNITY';
+
+export type OpportunityState =
+  | 'EMERGING'
+  | 'CONFIRMED'
+  | 'WEAKENING'
+  | 'INVALIDATED'
+  | 'STALE';
+
+export interface OpportunityScoreBreakdown {
+  momentum_score: number;
+  relative_strength_score: number;
+  volume_score: number;
+  vwap_score: number;
+  market_alignment_score: number;
+  sector_alignment_score: number;
+  orb_score: number;
+  data_quality_score: number;
+}
+
+export interface IntradayOpportunityItem {
+  symbol: string;
+  company_name?: string;
+  timestamp: string;
+  opportunity_type: OpportunityType;
+  state: OpportunityState;
+  score: number;
+  base_score: number;
+  confidence: number;
+  bias: 'BULLISH' | 'BEARISH' | 'BULLISH_EXHAUSTION' | 'BEARISH_EXHAUSTION' | 'NEUTRAL';
+  score_change?: number;
+  component_scores: OpportunityScoreBreakdown;
+  penalties: Array<{ reason: string; points: number }>;
+  supporting_factors: string[];
+  contradicting_factors: string[];
+  warnings: string[];
+  invalidation_condition: string;
+  metrics: {
+    last_price: number;
+    change_pct: number;
+    vwap: number | null;
+    vwap_diff_pct: number;
+    volume: number;
+    relative_volume: number;
+    momentum_5m: number;
+    momentum_15m: number;
+    relative_strength_vs_market: number;
+    relative_strength_vs_sector: number;
+    opening_range_state: string;
+    volume_confirmation: string;
+  };
+  rank?: number;
+  sector: {
+    name: string;
+    rank?: number | null;
+    return_pct?: number;
+  };
+  market_alignment: 'STRONGLY_ALIGNED' | 'ALIGNED' | 'NEUTRAL' | 'DIVERGENT' | 'STRONGLY_DIVERGENT';
+  sector_alignment: 'STRONGLY_ALIGNED' | 'ALIGNED' | 'NEUTRAL' | 'DIVERGENT';
+  data_quality: 'HIGH' | 'MEDIUM' | 'LOW';
+  freshness: 'FRESH' | 'STALE' | 'UNAVAILABLE';
+  first_detected_at?: string;
+  last_updated_at?: string;
+}
+
+export interface IntradayOpportunityResponse {
+  timestamp: string;
+  market_context: {
+    regime: string;
+    regime_confidence: number;
+    breadth_state: string;
+    advance_decline_ratio: number;
+    sector_leader: string | null;
+    sector_laggard: string | null;
+  };
+  total_evaluated: number;
+  total_eligible: number;
+  total_excluded: number;
+  excluded_candidates: Array<{
+    symbol: string;
+    eligible: boolean;
+    exclusion_reason: string;
+    sector?: string;
+  }>;
+  ranking_mode: 'RAW_RANKING' | 'SECTOR_DIVERSIFIED';
+  sector_concentration: Record<string, number>;
+  opportunities: IntradayOpportunityItem[];
+}
+
+export interface IntradayTopOpportunitiesResponse {
+  timestamp: string;
+  market_regime: string;
+  breadth_state: string;
+  top_opportunities: IntradayOpportunityItem[];
+}
+
+// ── Phase 17E — On-Demand Research Engine ─────────────────────────────────────
+
+export interface StructuredResearchOutput {
+  summary: string;
+  observed_facts: string[];
+  analyst_interpretation: string;
+  why_interesting: string[];
+  supporting_evidence: string[];
+  contradicting_evidence: string[];
+  key_risks: string[];
+  unknowns: string[];
+  market_context_interpretation: string;
+  sector_context_interpretation: string;
+  thesis: string;
+  thesis_strength: 'HIGH' | 'MEDIUM' | 'LOW';
+  what_to_monitor: string[];
+  invalidating_developments: string[];
+  research_confidence: 'HIGH' | 'MEDIUM' | 'LOW';
+}
+
+export interface ResearchBasis {
+  score: number | null;
+  rank: number | null;
+  state: string;
+  market_regime: string;
+  sector_name: string;
+  sector_rank: number | null;
+  timestamp: string | null;
+}
+
+export interface ResearchRunItem {
+  id: string;
+  symbol: string;
+  mode: 'INTRADAY' | 'LONG_TERM' | 'GENERAL';
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  started_at: string;
+  completed_at: string | null;
+  evidence_hash: string;
+  output: StructuredResearchOutput;
+  basis: ResearchBasis;
+  model_name: string;
+  provider: string;
+  tokens_used: number;
+  duration_ms: number;
+  error_message?: string;
+  error_category?: string;
+}
+
+export interface ResearchDeltaItem {
+  research_id: string;
+  symbol: string;
+  mode: string;
+  research_timestamp: string;
+  evaluated_at: string;
+  age_minutes: number;
+  freshness: 'FRESH' | 'AGING' | 'STALE';
+  staleness_reasons: string[];
+  has_material_changes: boolean;
+  changes_summary: string[];
+  basis: {
+    score: number | null;
+    rank: number | null;
+    state: string;
+    market_regime: string;
+    sector_rank: number | null;
+    momentum_5m?: number | null;
+    distance_from_vwap?: number | null;
+    rs_vs_market?: number | null;
+  };
+  current: {
+    score: number | null;
+    rank: number | null;
+    state: string;
+    market_regime: string;
+    sector_rank: number | null;
+    momentum_5m?: number | null;
+    distance_from_vwap?: number | null;
+    rs_vs_market?: number | null;
+  };
+  deltas: {
+    score_change: number;
+    rank_change: number;
+    state_changed: boolean;
+    regime_changed: boolean;
+    sector_rank_change: number;
+    momentum_change: number;
+    vwap_diff_change: number;
+    relative_strength_change: number;
+  };
+  zero_llm_call_verified: boolean;
+}
+
+export interface ExamineResponse {
+  reused: boolean;
+  llm_calls_made: number;
+  research: ResearchRunItem;
+  delta?: ResearchDeltaItem | null;
+}

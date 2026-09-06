@@ -5,6 +5,8 @@ from typing import Dict, Any, Optional
 
 from django.db.models import Q
 from django.utils import timezone
+from django.views import View
+from django.http import HttpResponseRedirect
 from rest_framework import status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -14,7 +16,8 @@ from .models import (
     Company, Instrument, MarketSnapshot, OHLCVBar, TechnicalFeature,
     IncomeStatement, BalanceSheetStatement, CashFlowStatement, DerivedFundamentalMetric,
     NewsItem, CorporateDisclosure, MarketContextSnapshot,
-    StockOpportunitySnapshot, StockRecommendation, RecommendationOutcome, BacktestRun
+    StockOpportunitySnapshot, StockRecommendation, RecommendationOutcome, BacktestRun,
+    IntradayOpportunitySnapshot
 )
 from .serializers import (
     CompanySerializer, InstrumentSerializer, InstrumentSearchSerializer,
@@ -24,7 +27,7 @@ from .serializers import (
     CorporateDisclosureSerializer, MarketContextSnapshotSerializer,
     StockOpportunitySnapshotSerializer, StockRecommendationSerializer,
     RecommendationOutcomeSerializer, BacktestRunSerializer, BacktestRunRequestSerializer,
-    ResearchQueryRequestSerializer
+    ResearchQueryRequestSerializer, IntradayOpportunitySnapshotSerializer
 )
 from .pagination import StandardResultsSetPagination, LargeResultsSetPagination
 
@@ -825,3 +828,495 @@ class StockResearchAPIView(APIView):
                     'timestamp': timezone.now().isoformat()
                 }
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ==============================================================================
+# 9. Kite Authentication Lifecycle & Intraday Data Health Views (Phase 17B)
+# ==============================================================================
+
+class KiteLoginAPIView(APIView):
+    """
+    GET /api/v1/kite/auth/login/
+    Generates Zerodha Kite Connect login URL.
+    Query param ?redirect=true triggers HTTP 302 redirect directly to Zerodha.
+    """
+    def get(self, request):
+        from market.services.kite_auth import KiteCredentialService
+        try:
+            login_url = KiteCredentialService.generate_login_url()
+            if request.GET.get('redirect', '').lower() in ('true', '1', 'yes'):
+                return HttpResponseRedirect(login_url)
+            return Response({"login_url": login_url}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class KiteCallbackView(View):
+    """
+    GET /kite/callback/ (and /api/v1/kite/callback/)
+    Handles Zerodha's redirect callback with request_token.
+    Performs server-side token exchange and securely stores the access_token.
+    Redirects back to frontend without exposing tokens.
+    """
+    def get(self, request):
+        import urllib.parse
+        from django.http import HttpResponseRedirect
+        from django.conf import settings
+        from market.services.kite_auth import KiteCredentialService
+
+        frontend_base = getattr(settings, "KITE_FRONTEND_REDIRECT_URL", "http://localhost:5173/intraday")
+
+        # Handle user cancellation or errors from Zerodha
+        req_status = request.GET.get("status")
+        req_error = request.GET.get("message") or request.GET.get("error")
+        if req_status == "cancelled" or req_error:
+            logger.warning(f"Kite login cancelled or errored: status={req_status}, error={req_error}")
+            target = f"{frontend_base}?kite_auth=cancelled&msg={urllib.parse.quote(req_error or 'Authentication cancelled')}"
+            return HttpResponseRedirect(target)
+
+        request_token = request.GET.get("request_token")
+        if not request_token:
+            logger.error("Kite callback received without request_token.")
+            target = f"{frontend_base}?kite_auth=error&msg=Missing+request_token"
+            return HttpResponseRedirect(target)
+
+        try:
+            result = KiteCredentialService.exchange_request_token(request_token)
+            logger.info(f"Kite authentication successful for user {result.get('user_id')}.")
+            target = f"{frontend_base}?kite_auth=success&user={urllib.parse.quote(result.get('user_id') or '')}"
+            return HttpResponseRedirect(target)
+        except Exception as e:
+            logger.error(f"Kite token exchange error: {e}")
+            target = f"{frontend_base}?kite_auth=error&msg={urllib.parse.quote(str(e))}"
+            return HttpResponseRedirect(target)
+
+
+class KiteStatusAPIView(APIView):
+    """
+    GET /api/v1/kite/status/
+    Returns safe, non-sensitive Kite connection & authentication lifecycle status.
+    Never exposes API secret, access_token, or request_token.
+    """
+    def get(self, request):
+        from market.services.kite_auth import KiteCredentialService
+        status_data = KiteCredentialService.get_safe_status()
+        return Response(status_data, status=status.HTTP_200_OK)
+
+
+class KiteDisconnectAPIView(APIView):
+    """
+    POST /api/v1/kite/auth/disconnect/
+    Clears local Kite session and marks connection AUTHENTICATION_REQUIRED.
+    """
+    def post(self, request):
+        from market.services.kite_auth import KiteCredentialService
+        success = KiteCredentialService.disconnect()
+        return Response({
+            "success": success,
+            "message": "Kite session disconnected successfully."
+        }, status=status.HTTP_200_OK)
+
+
+class KiteDataHealthAPIView(APIView):
+    """
+    GET /api/v1/kite/data-health/
+    Returns real-time data ingestion health:
+    - Provider connection status
+    - Current trading session (PRE_MARKET, REGULAR, POST_MARKET, CLOSED)
+    - Data status (LIVE, WAITING_FOR_DATA, MARKET CLOSED)
+    - Latest tick details and snapshot timestamp
+    - Subscribed instrument count
+    """
+    def get(self, request):
+        from django.core.cache import cache
+        from market.services.kite_auth import KiteCredentialService
+        from market.services.trading_session import TradingSessionService
+        from market.models import MarketSnapshot
+
+        auth_status = KiteCredentialService.get_safe_status()
+        is_authenticated = auth_status.get("authenticated", False)
+        
+        session = TradingSessionService.get_current_session()
+        is_market_open = TradingSessionService.is_market_open()
+
+        # Check last tick from cache
+        last_tick = cache.get("kite_last_tick")
+
+        # Check last market snapshot from DB
+        latest_snapshot = MarketSnapshot.objects.order_by("-timestamp").first()
+        last_snapshot_time = latest_snapshot.timestamp.isoformat() if latest_snapshot else None
+
+        if not is_authenticated:
+            data_status = "DISCONNECTED"
+        elif not is_market_open:
+            data_status = "MARKET CLOSED"
+        elif last_tick:
+            data_status = "LIVE"
+        else:
+            data_status = "WAITING_FOR_DATA"
+
+        return Response({
+            "provider": "kite",
+            "authenticated": is_authenticated,
+            "connection_status": auth_status.get("status"),
+            "market_session": session.value,
+            "is_market_open": is_market_open,
+            "data_status": data_status,
+            "subscribed_instruments_count": 52,
+            "last_tick": last_tick,
+            "last_snapshot_timestamp": last_snapshot_time,
+            "as_of": timezone.now().isoformat(),
+        }, status=status.HTTP_200_OK)
+
+
+# ==============================================================================
+# 10. Phase 17C — Intraday Market Context & Signal Foundation Views
+# ==============================================================================
+
+class IntradayMarketContextAPIView(APIView):
+    """
+    GET /api/v1/intraday/market-context/
+    Returns unified real-time intraday market context:
+    - Market direction & regime classification with explainable reasons
+    - Breadth (Advances/Declines, Above/Below VWAP %, A/D ratio)
+    - NIFTY 50 and BANKNIFTY live states
+    - Ranked sector strengths and leaders/laggards
+    - Data freshness tier (FRESH, STALE, UNAVAILABLE)
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        context = mgr.compute_current_context()
+
+        # Remove heavy stocks array from the high-level market context endpoint
+        response_data = {
+            "as_of": context["as_of"],
+            "freshness": context["freshness"],
+            "freshness_age_seconds": context["freshness_age_seconds"],
+            "is_fresh": context["is_fresh"],
+            "market_direction": context["market_direction"],
+            "market_regime": context["market_regime"],
+            "regime_confidence": context["regime_confidence"],
+            "regime_reasons": context["regime_reasons"],
+            "index_confirmation": context["index_confirmation"],
+            "market_volatility": context["market_volatility"],
+            "nifty": context["nifty"],
+            "banknifty": context["banknifty"],
+            "breadth": context["breadth"],
+            "sectors": context["sectors"],
+            "sector_leader": context["sector_leader"],
+            "sector_laggard": context["sector_laggard"],
+        }
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
+class IntradayStocksAPIView(APIView):
+    """
+    GET /api/v1/intraday/stocks/
+    Filterable and sortable list of NIFTY 50 stock-level intraday contexts:
+    Price, VWAP, Distance from VWAP, Relative Strength vs NIFTY & Sector,
+    Volume Confirmation, Opening Range state, and Foundation component scores.
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        context = mgr.compute_current_context()
+        stocks = list(context.get("stocks", []))
+
+        # Query parameter filters
+        sector_filter = request.GET.get("sector")
+        if sector_filter:
+            stocks = [s for s in stocks if s.get("sector", "").lower() == sector_filter.lower()]
+
+        vol_filter = request.GET.get("volume_confirmation")
+        if vol_filter:
+            stocks = [s for s in stocks if s.get("volume_confirmation", "").upper() == vol_filter.upper()]
+
+        search_filter = request.GET.get("search")
+        if search_filter:
+            q = search_filter.strip().lower()
+            stocks = [s for s in stocks if q in s.get("symbol", "").lower()]
+
+        # Sorting
+        sort_by = request.GET.get("sort_by", "change_pct")
+        order = request.GET.get("order", "desc").lower()
+        reverse = (order == "desc")
+
+        def sort_key(st):
+            val = st.get(sort_by)
+            if val is None:
+                return float("-inf") if reverse else float("inf")
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return str(val)
+
+        stocks.sort(key=sort_key, reverse=reverse)
+
+        # Convert Decimal values for JSON response
+        serializable_stocks = []
+        for st in stocks:
+            item = {}
+            for k, v in st.items():
+                if isinstance(v, Decimal):
+                    item[k] = float(v)
+                else:
+                    item[k] = v
+            serializable_stocks.append(item)
+
+        return Response({
+            "as_of": context["as_of"],
+            "freshness": context["freshness"],
+            "count": len(serializable_stocks),
+            "stocks": serializable_stocks,
+        }, status=status.HTTP_200_OK)
+
+
+class IntradayStockDetailAPIView(APIView):
+    """
+    GET /api/v1/intraday/stocks/<symbol>/
+    Returns detailed intraday context and latest 1m/5m bars for a single constituent.
+    """
+    def get(self, request, symbol):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        context = mgr.compute_current_context()
+
+        stock_item = None
+        for s in context.get("stocks", []):
+            if s.get("symbol", "").upper() == symbol.upper():
+                stock_item = s
+                break
+
+        if not stock_item:
+            raise NotFound(f"Symbol '{symbol}' not found in active NIFTY 50 intraday universe.")
+
+        # Serialize
+        serialized = {}
+        for k, v in stock_item.items():
+            serialized[k] = float(v) if isinstance(v, Decimal) else v
+
+        # Add latest 1m bar from aggregator if available
+        current_1m = mgr.aggregator.get_current_bar(symbol.upper(), "1m")
+        serialized["current_1m_bar"] = current_1m.to_dict() if current_1m else None
+
+        current_5m = mgr.aggregator.get_current_bar(symbol.upper(), "5m")
+        serialized["current_5m_bar"] = current_5m.to_dict() if current_5m else None
+
+        return Response(serialized, status=status.HTTP_200_OK)
+
+
+class IntradaySectorsAPIView(APIView):
+    """
+    GET /api/v1/intraday/sectors/
+    Ranked list of NIFTY 50 sectors by equal-weighted average return,
+    breadth, above-VWAP percentage, and relative strength vs NIFTY.
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        context = mgr.compute_current_context()
+
+        serializable_sectors = []
+        for sec in context.get("sectors", []):
+            item = {}
+            for k, v in sec.items():
+                item[k] = float(v) if isinstance(v, Decimal) else v
+            serializable_sectors.append(item)
+
+        return Response({
+            "as_of": context["as_of"],
+            "freshness": context["freshness"],
+            "sector_leader": context["sector_leader"],
+            "sector_laggard": context["sector_laggard"],
+            "count": len(serializable_sectors),
+            "sectors": serializable_sectors,
+        }, status=status.HTTP_200_OK)
+
+
+class IntradayIndicesAPIView(APIView):
+    """
+    GET /api/v1/intraday/indices/
+    Head-to-head comparison of NIFTY 50 and BANKNIFTY:
+    Returns, VWAP alignment, momentum, day range, and index confirmation state.
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        context = mgr.compute_current_context()
+
+        return Response({
+            "as_of": context["as_of"],
+            "freshness": context["freshness"],
+            "index_confirmation": context["index_confirmation"],
+            "nifty": context["nifty"],
+            "banknifty": context["banknifty"],
+        }, status=status.HTTP_200_OK)
+
+
+class IntradayDataHealthAPIView(APIView):
+    """
+    GET /api/v1/intraday/data-health/
+    Detailed telemetry on intraday data layer health:
+    Feed freshness, active vs missing NIFTY 50 constituents,
+    suspicious timestamps count, and aggregation statistics.
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        from market.services.kite_auth import KiteCredentialService
+        from market.services.trading_session import TradingSessionService
+
+        mgr = IntradayStateManager()
+        freshness_info = mgr.get_freshness_status()
+        auth_status = KiteCredentialService.get_safe_status()
+        session = TradingSessionService.get_current_session()
+
+        # Check universe coverage
+        total_universe = 50
+        active_stocks = len(mgr._stock_states)
+        missing_count = max(0, total_universe - active_stocks)
+
+        return Response({
+            "as_of": timezone.now().isoformat(),
+            "market_session": session.value,
+            "is_market_open": TradingSessionService.is_market_open(),
+            "kite_authenticated": auth_status.get("authenticated", False),
+            "kite_status": auth_status.get("status"),
+            "freshness": freshness_info["freshness"],
+            "freshness_age_seconds": freshness_info["age_seconds"],
+            "last_tick_at": freshness_info["last_tick_at"],
+            "universe_coverage": {
+                "total_constituents": total_universe,
+                "active_streaming": active_stocks,
+                "missing": missing_count,
+                "coverage_pct": round((active_stocks / total_universe) * 100.0, 1) if total_universe > 0 else 0.0,
+            },
+            "indices_active": {
+                "nifty": "NIFTY" in mgr._index_states,
+                "banknifty": "BANKNIFTY" in mgr._index_states,
+            },
+            "aggregation": {
+                "active_1m_bars": len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "1m"]),
+                "active_5m_bars": len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "5m"]),
+                "active_15m_bars": len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "15m"]),
+            },
+        }, status=status.HTTP_200_OK)
+
+
+# ==============================================================================
+# 11. Intraday Opportunity Engine Views (Phase 17D)
+# ==============================================================================
+
+class IntradayOpportunitiesAPIView(APIView):
+    """
+    GET /api/v1/intraday/opportunities/
+    Returns ranked, explainable intraday opportunities across the NIFTY 50 universe.
+    Supports filters: limit, sector, opportunity_type, state, min_score, mode.
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+
+        limit = int(request.GET.get('limit', 10))
+        sector = request.GET.get('sector')
+        opp_type = request.GET.get('opportunity_type')
+        state_filter = request.GET.get('state')
+        min_score = request.GET.get('min_score')
+        min_score_val = float(min_score) if min_score else None
+        mode = request.GET.get('mode', 'RAW_RANKING').upper()
+        if mode not in ('RAW_RANKING', 'SECTOR_DIVERSIFIED'):
+            mode = 'RAW_RANKING'
+
+        result = mgr.compute_current_opportunities(
+            mode=mode,
+            limit=limit,
+            sector_filter=sector,
+            opportunity_type_filter=opp_type,
+            state_filter=state_filter,
+            min_score=min_score_val,
+        )
+
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class IntradayOpportunityDetailAPIView(APIView):
+    """
+    GET /api/v1/intraday/opportunities/<str:symbol>/
+    Returns single-stock opportunity evaluation including 8-dimensional scores,
+    supporting factors, contradicting factors, warnings, and invalidation context.
+    """
+    def get(self, request, symbol: str):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        sym_clean = symbol.strip().upper()
+
+        result = mgr.compute_current_opportunities(limit=50)
+        matching = next((o for o in result.get("all_eligible_opportunities", []) if o.get("symbol") == sym_clean), None)
+
+        if not matching:
+            # Check if excluded
+            excluded = next((e for e in result.get("excluded_candidates", []) if e.get("symbol") == sym_clean), None)
+            if excluded:
+                return Response({
+                    "symbol": sym_clean,
+                    "eligible": False,
+                    "exclusion_reason": excluded.get("exclusion_reason"),
+                    "market_context": result.get("market_context"),
+                }, status=status.HTTP_200_OK)
+
+            # Check database for latest persisted snapshot
+            db_snap = IntradayOpportunitySnapshot.objects.filter(symbol=sym_clean).order_by('-timestamp').first()
+            if db_snap:
+                serializer = IntradayOpportunitySnapshotSerializer(db_snap)
+                return Response({
+                    "symbol": sym_clean,
+                    "eligible": True,
+                    "opportunity": serializer.data,
+                    "source": "persisted_snapshot"
+                }, status=status.HTTP_200_OK)
+
+            raise NotFound(f"No active opportunity context found for '{sym_clean}'.")
+
+        return Response({
+            "symbol": sym_clean,
+            "eligible": True,
+            "opportunity": matching,
+            "market_context": result.get("market_context"),
+        }, status=status.HTTP_200_OK)
+
+
+class IntradayOpportunityHistoryAPIView(APIView):
+    """
+    GET /api/v1/intraday/opportunities/<str:symbol>/history/
+    Returns historical opportunity snapshots for that symbol to observe score
+    transitions and lifecycle changes.
+    """
+    def get(self, request, symbol: str):
+        sym_clean = symbol.strip().upper()
+        limit = int(request.GET.get('limit', 20))
+        snapshots = IntradayOpportunitySnapshot.objects.filter(symbol=sym_clean).order_by('-timestamp')[:limit]
+        serializer = IntradayOpportunitySnapshotSerializer(snapshots, many=True)
+        return Response({
+            "symbol": sym_clean,
+            "count": len(snapshots),
+            "history": serializer.data,
+        }, status=status.HTTP_200_OK)
+
+
+class IntradayTopOpportunitiesAPIView(APIView):
+    """
+    GET /api/v1/intraday/opportunities/top/
+    Lightweight endpoint returning top 5/10/20 opportunities for dashboard cards.
+    """
+    def get(self, request):
+        from market.services.intraday_state_manager import IntradayStateManager
+        mgr = IntradayStateManager()
+        limit = min(20, int(request.GET.get('limit', 5)))
+
+        result = mgr.compute_current_opportunities(limit=limit)
+        return Response({
+            "timestamp": result["timestamp"],
+            "market_regime": result["market_context"]["regime"],
+            "breadth_state": result["market_context"]["breadth_state"],
+            "top_opportunities": result["opportunities"],
+        }, status=status.HTTP_200_OK)
