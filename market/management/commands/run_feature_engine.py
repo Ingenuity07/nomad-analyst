@@ -61,7 +61,7 @@ class Command(BaseCommand):
                 data = json.load(f)
             symbols = [c["symbol"] for c in data["constituents"]]
             if include_benchmarks:
-                symbols += ["^NSEI", "^NSEBANK"]
+                symbols += ["^NSEI", "^NSEBANK", "^BSESN", "^CNXIT"]
 
         svc = MarketService()
         total = len(symbols)

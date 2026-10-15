@@ -6041,30 +6041,44 @@ class IntradayMarketContextTests(TestCase):
     def test_data_freshness_tiers(self):
         """
         Tests FRESH, STALE, and UNAVAILABLE classification based on elapsed time.
+        Validates exact boundary conditions: 0s, 14.999s, 15s, 59.999s, 60s, 120s, 179.999s, 180s, 181s.
         """
         from market.services.intraday_state_manager import IntradayStateManager
-        from django.utils import timezone as dj_timezone
+        from django.core.cache import cache
 
+        cache.delete("kite_last_tick")
         mgr = IntradayStateManager()
-        now = datetime.now(timezone.utc)
+        fixed_now = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
 
-        # 1. Fresh: 2 seconds ago
-        mgr._last_tick_time = now - timedelta(seconds=2)
-        f1 = mgr.get_freshness_status()
-        self.assertEqual(f1["freshness"], "FRESH")
-        self.assertTrue(f1["is_fresh"])
+        boundaries = [
+            (0.0, "FRESH", True),
+            (14.999, "FRESH", True),
+            (15.0, "STALE", False),
+            (59.999, "STALE", False),
+            (60.0, "STALE", False),
+            (120.0, "STALE", False),
+            (179.999, "STALE", False),
+            (180.0, "UNAVAILABLE", False),
+            (181.0, "UNAVAILABLE", False),
+        ]
 
-        # 2. Stale: 15 seconds ago
-        mgr._last_tick_time = now - timedelta(seconds=15)
-        f2 = mgr.get_freshness_status()
-        self.assertEqual(f2["freshness"], "STALE")
-        self.assertFalse(f2["is_fresh"])
+        with patch("market.services.intraday_state_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat = datetime.fromisoformat
 
-        # 3. Unavailable: 90 seconds ago
-        mgr._last_tick_time = now - timedelta(seconds=90)
-        f3 = mgr.get_freshness_status()
-        self.assertEqual(f3["freshness"], "UNAVAILABLE")
-        self.assertFalse(f3["is_fresh"])
+            for age_sec, expected_status, expected_is_fresh in boundaries:
+                mgr._last_tick_time = fixed_now - timedelta(seconds=age_sec)
+                res = mgr.get_freshness_status()
+                self.assertEqual(
+                    res["freshness"],
+                    expected_status,
+                    f"Boundary failure at {age_sec}s: expected {expected_status}, got {res['freshness']}"
+                )
+                self.assertEqual(
+                    res["is_fresh"],
+                    expected_is_fresh,
+                    f"is_fresh failure at {age_sec}s: expected {expected_is_fresh}, got {res['is_fresh']}"
+                )
 
     def test_intraday_rest_api_endpoints(self):
         """
@@ -6222,8 +6236,13 @@ class IntradayOpportunityEngineTests(TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "INSUFFICIENT_LIQUIDITY_VOLUME")
 
-        # Stale data
+        # Stale data within tolerance (120s <= 180s) remains eligible
         eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(valid_stock, freshness_age_seconds=120.0)
+        self.assertTrue(eligible)
+        self.assertIsNone(reason)
+
+        # Unavailable data exceeding max age (> 180s) is excluded
+        eligible, reason = IntradayOpportunityDetector.evaluate_eligibility(valid_stock, freshness_age_seconds=185.0)
         self.assertFalse(eligible)
         self.assertEqual(reason, "STALE_MARKET_DATA")
 
@@ -6562,6 +6581,442 @@ class IntradayOpportunityEngineTests(TestCase):
         self.assertEqual(eval_replayed_at_10["opportunities"][0]["state"], state_at_10)
         self.assertEqual(eval_replayed_at_10["opportunities"][0]["component_scores"], eval_at_10["opportunities"][0]["component_scores"])
         self.assertEqual(eval_replayed_at_10["opportunities"][0]["supporting_factors"], eval_at_10["opportunities"][0]["supporting_factors"])
+
+
+class Phase19CorePipelineRemediationTests(TestCase):
+    """
+    Phase 19: Core Pipeline Remediation Regression Test Suite.
+    Verifies:
+      1. Index routing and isolation (^NSEI -> NIFTY, ^NSEBANK -> BANKNIFTY, ^BSESN -> SENSEX, ^CNXIT -> NIFTYIT)
+      2. Sector context lookup contract alignment (schema 'sector' key) and absence of false MISSING_SECTOR_CONTEXT penalties
+      3. SECTOR_LEADERSHIP opportunity detection when leading top sector
+      4. Explicit penalty retention when sector is genuinely absent
+      5. Cold-cache PostgreSQL fallback for context and opportunities
+      6. IntradayOpportunitySnapshot de-duplication
+      7. Breadth response SMA participation metrics (pct_above_sma50, pct_above_sma200)
+      8. Malformed & out-of-session OHLCV bar rejection
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+        from market.services.intraday_state_manager import IntradayStateManager
+        cache.clear()
+        IntradayStateManager.reset_singleton()
+
+        # Create test companies and instruments
+        self.comp_rel = Company.objects.create(name="Reliance Industries", sector="Energy", is_active=True)
+        self.inst_rel = Instrument.objects.create(symbol="RELIANCE", exchange="NSE", instrument_type="EQUITY", company=self.comp_rel, is_active=True)
+
+        self.comp_tata = Company.objects.create(name="Tata Steel", sector="Metals", is_active=True)
+        self.inst_tata = Instrument.objects.create(symbol="TATASTEEL", exchange="NSE", instrument_type="EQUITY", company=self.comp_tata, is_active=True)
+
+        self.comp_infy = Company.objects.create(name="Infosys", sector="IT", is_active=True)
+        self.inst_infy = Instrument.objects.create(symbol="INFY", exchange="NSE", instrument_type="EQUITY", company=self.comp_infy, is_active=True)
+
+        # Universe
+        self.u_nifty, _ = Universe.objects.get_or_create(name="NIFTY50", defaults={"description": "NIFTY 50"})
+        UniverseMembership.objects.get_or_create(universe=self.u_nifty, instrument=self.inst_rel, defaults={"is_active": True})
+        UniverseMembership.objects.get_or_create(universe=self.u_nifty, instrument=self.inst_tata, defaults={"is_active": True})
+        UniverseMembership.objects.get_or_create(universe=self.u_nifty, instrument=self.inst_infy, defaults={"is_active": True})
+
+    def test_explicit_index_routing_and_isolation(self):
+        """
+        Tests that ^NSEI, ^NSEBANK, ^BSESN, ^CNXIT route explicitly to their respective index states
+        without cross-contamination or string collision.
+        """
+        from market.services.intraday_state_manager import IntradayStateManager
+        from market.normalizers.kite import NomadMarketTick
+
+        mgr = IntradayStateManager()
+        now = datetime.now(timezone.utc)
+
+        # Ingest tick for ^NSEI
+        mgr.on_tick(NomadMarketTick(
+            symbol="^NSEI",
+            instrument_token=256265,
+            last_price=Decimal("25000.0"),
+            change_percent=Decimal("0.85"),
+            received_timestamp=now,
+        ))
+
+        # Ingest tick for ^NSEBANK
+        mgr.on_tick(NomadMarketTick(
+            symbol="^NSEBANK",
+            instrument_token=260105,
+            last_price=Decimal("52000.0"),
+            change_percent=Decimal("-0.45"),
+            received_timestamp=now,
+        ))
+
+        # Ingest tick for ^BSESN
+        mgr.on_tick(NomadMarketTick(
+            symbol="^BSESN",
+            instrument_token=265,
+            last_price=Decimal("82000.0"),
+            change_percent=Decimal("0.72"),
+            received_timestamp=now,
+        ))
+
+        # Ingest tick for ^CNXIT
+        mgr.on_tick(NomadMarketTick(
+            symbol="^CNXIT",
+            instrument_token=259849,
+            last_price=Decimal("41000.0"),
+            change_percent=Decimal("1.25"),
+            received_timestamp=now,
+        ))
+
+        self.assertIn("NIFTY", mgr._index_states)
+        self.assertIn("BANKNIFTY", mgr._index_states)
+        self.assertIn("SENSEX", mgr._index_states)
+        self.assertIn("NIFTYIT", mgr._index_states)
+
+        self.assertEqual(float(mgr._index_states["NIFTY"]["last_price"]), 25000.0)
+        self.assertEqual(float(mgr._index_states["NIFTY"]["change_percent"]), 0.85)
+
+        self.assertEqual(float(mgr._index_states["BANKNIFTY"]["last_price"]), 52000.0)
+        self.assertEqual(float(mgr._index_states["BANKNIFTY"]["change_percent"]), -0.45)
+
+        self.assertEqual(float(mgr._index_states["SENSEX"]["last_price"]), 82000.0)
+        self.assertEqual(float(mgr._index_states["SENSEX"]["change_percent"]), 0.72)
+
+        self.assertEqual(float(mgr._index_states["NIFTYIT"]["last_price"]), 41000.0)
+        self.assertEqual(float(mgr._index_states["NIFTYIT"]["change_percent"]), 1.25)
+
+    def test_sector_context_lookup_and_no_false_penalties(self):
+        """
+        Tests that market context sector rankings with 'sector' key align with the opportunity engine
+        and produce zero false MISSING_SECTOR_CONTEXT penalties.
+        """
+        from market.services.intraday_opportunity_engine import IntradayOpportunityEngine
+
+        engine = IntradayOpportunityEngine()
+        now = datetime.now(timezone.utc)
+
+        # Build market context with standard 'sector' key schema from calculate_sector_strengths
+        market_context = {
+            "market_regime": "TRENDING_UP",
+            "market_direction": "BULLISH",
+            "regime_confidence": 0.85,
+            "breadth": {"breadth_state": "STRONG_POSITIVE", "advance_decline_ratio": 2.5},
+            "nifty": {"change_percent": 0.95},
+            "banknifty": {"change_percent": 0.50},
+            "sectors": [
+                {
+                    "sector": "Metals",
+                    "constituent_count": 5,
+                    "average_return": Decimal("1.85"),
+                    "rank": 1,
+                    "above_vwap_pct": Decimal("80.0"),
+                },
+                {
+                    "sector": "Energy",
+                    "constituent_count": 6,
+                    "average_return": Decimal("0.65"),
+                    "rank": 2,
+                    "above_vwap_pct": Decimal("60.0"),
+                }
+            ]
+        }
+
+        constituent_contexts = [
+            {
+                "symbol": "TATASTEEL",
+                "sector": "Metals",
+                "last_price": Decimal("165.0"),
+                "previous_close": Decimal("160.0"),
+                "volume": 250000,
+                "change_pct": Decimal("2.80"),
+                "vwap": Decimal("162.0"),
+                "distance_from_vwap": Decimal("1.85"),
+                "relative_volume": Decimal("2.10"),
+                "momentum_5m": Decimal("0.45"),
+                "momentum_15m": Decimal("1.10"),
+                "relative_strength_vs_market": Decimal("1.85"),
+                "relative_strength_vs_sector": Decimal("0.95"),
+                "volume_confirmation": "CONFIRMED_UP",
+                "opening_range_state": "INSIDE_ORB",
+            }
+        ]
+
+        result = engine.evaluate_universe_opportunities(
+            market_context=market_context,
+            constituent_contexts=constituent_contexts,
+            as_of=now,
+            persist_to_db=False,
+        )
+
+        self.assertEqual(len(result["opportunities"]), 1)
+        opp = result["opportunities"][0]
+
+        # Assert NO false MISSING_SECTOR_CONTEXT penalty
+        penalty_reasons = [p["reason"] for p in opp["penalties"]]
+        self.assertNotIn("MISSING_SECTOR_CONTEXT", penalty_reasons)
+
+        # Assert sector alignment is properly populated
+        self.assertEqual(opp["sector"]["name"], "Metals")
+        self.assertEqual(opp["sector"]["rank"], 1)
+        self.assertEqual(opp["sector"]["return_pct"], 1.85)
+
+        # Assert SECTOR_LEADERSHIP opportunity detected
+        self.assertEqual(opp["opportunity_type"], "SECTOR_LEADERSHIP")
+        self.assertEqual(opp["sector_alignment"], "STRONGLY_ALIGNED")
+
+    def test_explicit_penalty_when_sector_data_genuinely_absent(self):
+        """
+        Tests that MISSING_SECTOR_CONTEXT penalty is preserved when a stock's sector is truly missing or Unknown.
+        """
+        from market.services.intraday_opportunity_engine import IntradayOpportunityEngine
+
+        engine = IntradayOpportunityEngine()
+        now = datetime.now(timezone.utc)
+
+        market_context = {
+            "market_regime": "NEUTRAL",
+            "breadth": {"advance_decline_ratio": 1.0},
+            "sectors": [] # Empty sectors
+        }
+
+        constituent_contexts = [
+            {
+                "symbol": "UNKNOWN_STOCK",
+                "sector": "Unknown",
+                "last_price": Decimal("100.0"),
+                "previous_close": Decimal("99.5"),
+                "volume": 200000,
+                "change_pct": Decimal("0.5"),
+                "vwap": Decimal("100.0"),
+                "distance_from_vwap": Decimal("0.1"),
+                "relative_volume": Decimal("1.2"),
+                "volume_confirmation": "NEUTRAL",
+                "opening_range_state": "INSIDE_ORB",
+            }
+        ]
+
+        result = engine.evaluate_universe_opportunities(
+            market_context=market_context,
+            constituent_contexts=constituent_contexts,
+            as_of=now,
+            persist_to_db=False,
+        )
+
+        self.assertEqual(len(result["opportunities"]), 1)
+        opp = result["opportunities"][0]
+        penalty_reasons = [p["reason"] for p in opp["penalties"]]
+        self.assertIn("MISSING_SECTOR_CONTEXT", penalty_reasons)
+
+    def test_cold_cache_postgresql_fallback(self):
+        """
+        Tests that when Redis/memory state is empty or expired, compute_current_context recovers
+        the latest valid persisted snapshot from PostgreSQL with source='persisted_snapshot' and non-live status.
+        """
+        from django.core.cache import cache
+        from market.services.intraday_state_manager import IntradayStateManager
+        from market.models import MarketContextSnapshot, StockIntradayContext
+
+        past_ts = datetime(2026, 9, 3, 11, 30, 0, tzinfo=timezone.utc)
+
+        # Seed historical database snapshot
+        snap = MarketContextSnapshot.objects.create(
+            as_of=past_ts,
+            universe="NIFTY50",
+            market_direction="BULLISH",
+            market_regime="TRENDING_UP",
+            nifty_return=Decimal("1.25"),
+            banknifty_return=Decimal("0.90"),
+            advance_count=35,
+            decline_count=12,
+            unchanged_count=3,
+            advance_decline_ratio=Decimal("2.91"),
+            above_vwap_pct=Decimal("72.0"),
+            below_vwap_pct=Decimal("28.0"),
+            sector_leader="Metals",
+            sector_laggard="FMCG",
+            market_volatility="NORMAL",
+            breadth_state="STRONG_POSITIVE",
+            index_confirmation="CONFIRMED_BULLISH",
+            index_regimes={
+                "nifty": {"last_price": 25100.0, "change_percent": 1.25},
+                "banknifty": {"last_price": 52100.0, "change_percent": 0.90},
+                "regime": "TRENDING_UP",
+            },
+            breadth={"advance_count": 35, "decline_count": 12, "advance_decline_ratio": 2.91, "breadth_state": "STRONG_POSITIVE"},
+            sector_rankings=[{"sector": "Metals", "average_return": 2.1, "rank": 1}],
+            data_quality={"freshness": "STALE"},
+        )
+
+        StockIntradayContext.objects.create(
+            instrument=self.inst_rel,
+            timestamp=past_ts,
+            last_price=Decimal("2950.0"),
+            change_pct=Decimal("1.80"),
+            vwap=Decimal("2930.0"),
+            distance_from_vwap=Decimal("0.68"),
+            volume=1500000,
+            relative_volume=Decimal("1.85"),
+            momentum_5m=Decimal("0.35"),
+            momentum_15m=Decimal("0.75"),
+            momentum_30m=Decimal("1.20"),
+            relative_strength_vs_market=Decimal("0.55"),
+            relative_strength_vs_sector=Decimal("0.40"),
+            sector="Energy",
+            sector_return=Decimal("1.40"),
+            volume_confirmation="CONFIRMED_UP",
+            opening_range_state="ABOVE_ORB",
+            intraday_high=Decimal("2960.0"),
+            intraday_low=Decimal("2910.0"),
+            context_score=Decimal("82.0"),
+        )
+
+        # Clear in-memory and Redis caches
+        cache.clear()
+        IntradayStateManager.reset_singleton()
+        mgr = IntradayStateManager()
+
+        # Compute context over completely cold cache
+        recovered_context = mgr.compute_current_context()
+
+        self.assertEqual(recovered_context["source"], "persisted_snapshot")
+        self.assertEqual(recovered_context["as_of"], past_ts.isoformat())
+        self.assertFalse(recovered_context["is_fresh"])
+        self.assertEqual(recovered_context["freshness"], "UNAVAILABLE")
+        self.assertGreater(recovered_context["freshness_age_seconds"], 1000)
+
+        # Check recovered stocks
+        symbols = [s["symbol"] for s in recovered_context.get("stocks", [])]
+        self.assertIn("RELIANCE", symbols)
+
+    def test_opportunity_snapshot_deduplication(self):
+        """
+        Tests that _persist_opportunities avoids creating duplicate records for the same symbol and timestamp.
+        """
+        from market.services.intraday_opportunity_engine import IntradayOpportunityEngine
+        from market.models import IntradayOpportunitySnapshot
+
+        engine = IntradayOpportunityEngine()
+        t = datetime(2026, 9, 5, 10, 0, 0, tzinfo=timezone.utc)
+
+        opp = {
+            "symbol": "RELIANCE",
+            "opportunity_type": "VWAP_TREND",
+            "state": "CONFIRMED",
+            "score": 85.0,
+            "confidence": 0.85,
+            "component_scores": {
+                "momentum_score": 80.0, "relative_strength_score": 85.0, "volume_score": 80.0,
+                "vwap_score": 90.0, "market_alignment_score": 80.0, "sector_alignment_score": 80.0,
+                "orb_score": 75.0, "data_quality_score": 100.0,
+            },
+            "supporting_factors": ["VWAP confirmed"],
+            "contradicting_factors": [],
+            "warnings": [],
+            "penalties": [],
+            "metrics": {"last_price": 2950.0},
+            "rank": 1,
+            "sector": {"name": "Energy"},
+            "market_alignment": "ALIGNED",
+            "sector_alignment": "ALIGNED",
+            "data_quality": "HIGH",
+            "freshness": "FRESH",
+            "first_detected_at": t.isoformat(),
+        }
+
+        # First persist
+        engine._persist_opportunities([opp], t)
+        count1 = IntradayOpportunitySnapshot.objects.filter(symbol="RELIANCE", timestamp=t).count()
+        self.assertEqual(count1, 1)
+
+        # Second persist with same timestamp
+        engine._persist_opportunities([opp], t)
+        count2 = IntradayOpportunitySnapshot.objects.filter(symbol="RELIANCE", timestamp=t).count()
+        self.assertEqual(count2, 1, "Duplicate record created for identical symbol and timestamp!")
+
+    def test_intraday_breadth_sma_participation(self):
+        """
+        Tests that calculate_market_breadth exposes pct_above_sma50 and pct_above_sma200 metrics.
+        """
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+
+        constituent_states = [
+            {"symbol": "S1", "last_price": 100.0, "change_pct": 1.0, "above_sma50": True, "above_sma200": True},
+            {"symbol": "S2", "last_price": 200.0, "change_pct": 0.5, "above_sma50": True, "above_sma200": False},
+            {"symbol": "S3", "last_price": 150.0, "change_pct": -0.5, "above_sma50": False, "above_sma200": False},
+            {"symbol": "S4", "last_price": 300.0, "change_pct": -1.0, "above_sma50": False, "above_sma200": True},
+        ]
+
+        breadth = IntradayMarketContextEngine.calculate_market_breadth(constituent_states)
+
+        self.assertIn("pct_above_sma50", breadth)
+        self.assertIn("pct_above_sma200", breadth)
+        self.assertIn("participation", breadth)
+        self.assertEqual(float(breadth["pct_above_sma50"]), 50.0)
+        self.assertEqual(float(breadth["pct_above_sma200"]), 50.0)
+        self.assertEqual(breadth["participation"]["pct_above_sma50"], 50.0)
+        self.assertEqual(breadth["participation"]["pct_above_sma200"], 50.0)
+
+    def test_malformed_and_out_of_session_bar_rejection(self):
+        """
+        Tests that IntradayBarAggregator rejects malformed bars (high < low, non-positive price, negative volume)
+        and out-of-session bars.
+        """
+        from zoneinfo import ZoneInfo
+        from market.services.intraday_aggregator import IntradayBarAggregator, AggregatedBar
+
+        agg = IntradayBarAggregator(persist_to_db=False)
+        t_valid = datetime(2026, 9, 4, 10, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata")) # Friday 10:00 IST
+        t_weekend = datetime(2026, 9, 6, 10, 0, 0, tzinfo=ZoneInfo("Asia/Kolkata")) # Sunday 10:00 IST
+
+        # Valid bar
+        valid_bar = AggregatedBar("RELIANCE", "5m", t_valid, Decimal("2950.0"))
+        is_valid, reason = agg.validate_bar(valid_bar)
+        self.assertTrue(is_valid)
+        self.assertIsNone(reason)
+
+        # Malformed bar: High < Low
+        bad_bar1 = AggregatedBar("RELIANCE", "5m", t_valid, Decimal("2950.0"))
+        bad_bar1.high = Decimal("2900.0")
+        bad_bar1.low = Decimal("2960.0")
+        is_valid, reason = agg.validate_bar(bad_bar1)
+        self.assertFalse(is_valid)
+        self.assertIn("cannot be less than low", reason)
+
+        # Malformed bar: Non-positive price
+        bad_bar2 = AggregatedBar("RELIANCE", "5m", t_valid, Decimal("-50.0"))
+        is_valid, reason = agg.validate_bar(bad_bar2)
+        self.assertFalse(is_valid)
+        self.assertIn("Non-positive price", reason)
+
+        # Malformed bar: Negative volume
+        bad_bar3 = AggregatedBar("RELIANCE", "5m", t_valid, Decimal("2950.0"))
+        bad_bar3.volume = -100
+        is_valid, reason = agg.validate_bar(bad_bar3)
+        self.assertFalse(is_valid)
+        self.assertIn("cannot be negative", reason)
+
+        # Out-of-session bar: Weekend
+        weekend_bar = AggregatedBar("RELIANCE", "5m", t_weekend, Decimal("2950.0"))
+        is_valid, reason = agg.validate_bar(weekend_bar)
+        self.assertFalse(is_valid)
+        self.assertIn("outside plausible market session hours", reason)
+
+    def test_kite_registry_sensex_and_niftyit_mapping(self):
+        """
+        Tests that KiteInstrumentRegistry resolves ^BSESN and ^CNXIT correctly to their authoritative tokens.
+        """
+        from market.services.kite_registry import KiteInstrumentRegistry
+
+        sensex_token = KiteInstrumentRegistry.get_token("^BSESN")
+        niftyit_token = KiteInstrumentRegistry.get_token("^CNXIT")
+
+        self.assertEqual(sensex_token, 265)
+        self.assertEqual(niftyit_token, 259849)
+
+        sensex_sym = KiteInstrumentRegistry.get_symbol(265)
+        niftyit_sym = KiteInstrumentRegistry.get_symbol(259849)
+
+        self.assertEqual(sensex_sym, "^BSESN")
+        self.assertEqual(niftyit_sym, "^CNXIT")
+
 
 
 

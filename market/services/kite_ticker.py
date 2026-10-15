@@ -42,8 +42,9 @@ class KiteTickerManager:
         update_db_snapshot: bool = True,
         ticker_client: Optional[Any] = None,
     ):
-        self.api_key = api_key or getattr(settings, "KITE_API_KEY", "")
-        self.access_token = access_token or getattr(settings, "KITE_ACCESS_TOKEN", "")
+        from market.services.kite_auth import KiteCredentialService
+        self.api_key = api_key or KiteCredentialService.get_api_key()
+        self.access_token = access_token or KiteCredentialService.get_valid_access_token()
         self.on_tick_callback = on_tick_callback
         self.update_db_snapshot = update_db_snapshot
 
@@ -77,11 +78,6 @@ class KiteTickerManager:
 
         # Wire callbacks
         self.kws.on_ticks = self._on_ticks
-        self.kws.on_connect = self._on_connect
-        self.kws.on_close = self._on_close
-        self.kws.on_error = self._on_error
-        self.kws.on_reconnect = self._on_reconnect
-        self.kws.on_noreconnect = self._on_noreconnect
         self.kws.on_connect = self._on_connect
         self.kws.on_close = self._on_close
         self.kws.on_error = self._on_error
@@ -146,6 +142,9 @@ class KiteTickerManager:
         self.is_connected = False
 
     def _on_error(self, ws, code, reason):
+        if self._stop_requested:
+            logger.debug(f"KiteTicker: Connection closing during shutdown (code: {code})")
+            return
         logger.error(f"KiteTicker: Error encountered (code: {code}, reason: {reason})")
         self.stats["errors"] += 1
 
@@ -185,9 +184,15 @@ class KiteTickerManager:
         self._init_kws()
 
         if threaded:
-            self._worker_thread = threading.Thread(target=self._run, daemon=True)
-            self._worker_thread.start()
-            logger.info("KiteTicker worker thread started.")
+            if hasattr(self.kws, "connect"):
+                # KiteTicker.connect(threaded=True) suppresses Twisted signal handlers
+                # and runs reactor on its own daemon background thread safely on Python 3.14.
+                self.kws.connect(threaded=True)
+                logger.info("KiteTicker connected in background threaded mode.")
+            else:
+                self._worker_thread = threading.Thread(target=self._run, daemon=True)
+                self._worker_thread.start()
+                logger.info("KiteTicker worker thread started.")
         else:
             self._run()
 
@@ -211,6 +216,8 @@ class KiteTickerManager:
                 logger.warning(f"Error during KiteTicker close: {e}")
 
         self.is_connected = False
+        if hasattr(self.kws, "websocket_thread") and self.kws.websocket_thread and self.kws.websocket_thread.is_alive():
+            self.kws.websocket_thread.join(timeout=3.0)
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3.0)
         logger.info("KiteTicker: Shutdown complete.")

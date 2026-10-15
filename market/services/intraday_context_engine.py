@@ -296,10 +296,53 @@ class IntradayMarketContextEngine:
         }
 
     @classmethod
+    def get_daily_smas(cls) -> Dict[str, Dict[str, float]]:
+        """
+        Retrieves latest daily SMA50 and SMA200 values from cache or TechnicalFeature DB.
+        Caches for 5 minutes.
+        """
+        from django.core.cache import cache
+        cache_key = "market:intraday:daily_smas"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        smas: Dict[str, Dict[str, float]] = {}
+        try:
+            from market.models import TechnicalFeature
+            from django.db.models import Max
+            latest_ts = TechnicalFeature.objects.filter(
+                timeframe="1d",
+                name__in=["SMA_50", "SMA_200"]
+            ).aggregate(m=Max("timestamp"))["m"]
+
+            if latest_ts:
+                records = TechnicalFeature.objects.filter(
+                    timeframe="1d",
+                    name__in=["SMA_50", "SMA_200"],
+                    timestamp=latest_ts
+                ).select_related("instrument")
+                for r in records:
+                    sym = r.instrument.symbol
+                    if sym not in smas:
+                        smas[sym] = {}
+                    if r.name == "SMA_50" and r.value is not None:
+                        smas[sym]["sma50"] = float(r.value)
+                    elif r.name == "SMA_200" and r.value is not None:
+                        smas[sym]["sma200"] = float(r.value)
+
+            cache.set(cache_key, smas, timeout=300)
+        except Exception as e:
+            logger.debug(f"Error loading daily SMAs for breadth: {e}")
+
+        return smas
+
+    @classmethod
     def calculate_market_breadth(cls, constituent_states: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Calculates NIFTY 50 breadth metrics:
-        advances, declines, unchanged, A/D ratio, above/below VWAP, new highs/lows.
+        advances, declines, unchanged, A/D ratio, above/below VWAP, new highs/lows,
+        and daily SMA participation (SMA50, SMA200).
         """
         total = len(constituent_states)
         if total == 0:
@@ -319,6 +362,14 @@ class IntradayMarketContextEngine:
                 "at_high_count": 0,
                 "at_low_count": 0,
                 "breadth_state": "NEUTRAL",
+                "pct_above_sma50": Decimal("0.0"),
+                "pct_above_sma200": Decimal("0.0"),
+                "pct_above_50_sma": Decimal("0.0"),
+                "pct_above_200_sma": Decimal("0.0"),
+                "participation": {
+                    "pct_above_sma50": 0.0,
+                    "pct_above_sma200": 0.0,
+                },
             }
 
         advances = 0
@@ -328,6 +379,13 @@ class IntradayMarketContextEngine:
         below_vwap = 0
         at_high = 0
         at_low = 0
+
+        # SMA Participation counters
+        above_sma50_count = 0
+        above_sma200_count = 0
+        sma_covered_50 = 0
+        sma_covered_200 = 0
+        daily_smas = cls.get_daily_smas()
 
         for state in constituent_states:
             chg = state.get("change_pct")
@@ -360,6 +418,31 @@ class IntradayMarketContextEngine:
             if low > 0 and (price - low) / low * Decimal("100.0") <= PROXIMITY_TO_EXTREME_PCT:
                 at_low += 1
 
+            # SMA participation
+            sym = state.get("symbol")
+            p_float = float(price)
+            if "above_sma50" in state and state["above_sma50"] is not None:
+                sma_covered_50 += 1
+                if state["above_sma50"]:
+                    above_sma50_count += 1
+            else:
+                s50 = state.get("sma50") or (daily_smas.get(sym, {}).get("sma50") if sym else None)
+                if s50 and s50 > 0:
+                    sma_covered_50 += 1
+                    if p_float >= s50:
+                        above_sma50_count += 1
+
+            if "above_sma200" in state and state["above_sma200"] is not None:
+                sma_covered_200 += 1
+                if state["above_sma200"]:
+                    above_sma200_count += 1
+            else:
+                s200 = state.get("sma200") or (daily_smas.get(sym, {}).get("sma200") if sym else None)
+                if s200 and s200 > 0:
+                    sma_covered_200 += 1
+                    if p_float >= s200:
+                        above_sma200_count += 1
+
         total_dec = Decimal(str(total))
         adv_pct = round((Decimal(str(advances)) / total_dec) * Decimal("100.0"), 2)
         dec_pct = round((Decimal(str(declines)) / total_dec) * Decimal("100.0"), 2)
@@ -370,6 +453,9 @@ class IntradayMarketContextEngine:
         below_vwap_pct = round((Decimal(str(below_vwap)) / Decimal(str(vwap_total))) * Decimal("100.0"), 2) if vwap_total > 0 else Decimal("0.0")
 
         ad_ratio = round(Decimal(str(advances)) / Decimal(str(max(declines, 1))), 2)
+
+        pct_above_sma50 = round(Decimal(str(above_sma50_count)) / Decimal(str(sma_covered_50)) * Decimal("100.0"), 2) if sma_covered_50 > 0 else Decimal("0.0")
+        pct_above_sma200 = round(Decimal(str(above_sma200_count)) / Decimal(str(sma_covered_200)) * Decimal("100.0"), 2) if sma_covered_200 > 0 else Decimal("0.0")
 
         # Breadth State determination
         if adv_pct >= BREADTH_STRONG_PCT and ad_ratio >= BREADTH_STRONG_RATIO:
@@ -399,6 +485,14 @@ class IntradayMarketContextEngine:
             "at_high_count": at_high,
             "at_low_count": at_low,
             "breadth_state": breadth_state,
+            "pct_above_sma50": pct_above_sma50,
+            "pct_above_sma200": pct_above_sma200,
+            "pct_above_50_sma": pct_above_sma50,
+            "pct_above_200_sma": pct_above_sma200,
+            "participation": {
+                "pct_above_sma50": float(pct_above_sma50),
+                "pct_above_sma200": float(pct_above_sma200),
+            },
         }
 
     @classmethod
@@ -446,8 +540,10 @@ class IntradayMarketContextEngine:
 
             results.append({
                 "sector": sector_name,
+                "name": sector_name,
                 "constituent_count": count,
                 "average_return": avg_return,
+                "return_pct": avg_return,
                 "median_return": med_return,
                 "advance_count": adv_count,
                 "decline_count": dec_count,

@@ -11,9 +11,9 @@ from typing import Dict, Any
 # ==============================================================================
 # Data Freshness Thresholds (in seconds)
 # ==============================================================================
-FRESH_THRESHOLD_SEC = 5.0        # < 5s: Active streaming, highly reliable
-STALE_THRESHOLD_SEC = 30.0       # 5s - 30s: Delayed or intermittent feed
-UNAVAILABLE_THRESHOLD_SEC = 60.0 # > 60s: Disconnected or inactive feed
+FRESH_THRESHOLD_SEC = 15.0        # < 15s: Active streaming, highly reliable
+STALE_THRESHOLD_SEC = 180.0       # 15s - 180s: Delayed or intermittent feed
+UNAVAILABLE_THRESHOLD_SEC = 180.0 # >= 180s: Disconnected or inactive feed
 
 # ==============================================================================
 # Market Breadth Thresholds

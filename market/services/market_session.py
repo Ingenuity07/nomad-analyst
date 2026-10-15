@@ -127,11 +127,14 @@ class IndianMarketSession:
         return True
 
     @classmethod
-    def is_market_open(cls, dt: datetime) -> bool:
+    def is_market_open(cls, dt: Optional[datetime] = None) -> bool:
         """
         Return True if `dt` falls within the NSE regular trading session
         (09:15:00–15:30:00 IST) on a valid trading day.
+        Defaults to current datetime if dt is None.
         """
+        if dt is None:
+            dt = datetime.now(UTC)
         dt_ist = cls.to_ist(dt)
         if not cls.is_trading_day(dt_ist.date()):
             return False

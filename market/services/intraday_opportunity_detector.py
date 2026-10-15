@@ -95,7 +95,7 @@ class IntradayOpportunityDetector:
         orb_state = stock_context.get("opening_range_state", "INSIDE_ORB")
         
         sec_rank = sector_info.get("rank") if sector_info else None
-        sec_ret = Decimal(str(sector_info.get("return_pct", 0.0))) if sector_info else None
+        sec_ret = Decimal(str(sector_info.get("return_pct") if sector_info.get("return_pct") is not None else sector_info.get("average_return", 0.0))) if sector_info else None
 
         # 1. Check Mean Reversion Context first (extreme deviation with exhaustion)
         if abs(vwap_diff_pct) >= VWAP_MEAN_REVERSION_EXTREME_PCT:

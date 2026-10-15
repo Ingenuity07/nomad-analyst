@@ -231,8 +231,9 @@ class GeminiReliabilityTestCase(TestCase):
         result = router._generate_with_logging("gemini-flash", adapter, "hello", "", None)
 
         self.assertEqual(result["status_code"], 503)
-        self.assertEqual(adapter.generate.call_count, 3)
-        self.assertEqual(mock_sleep.call_count, 2)
+        # In FIX-4, per-model attempts are limited to 2 (1 attempt + 1 retry) to enable faster model fallback
+        self.assertEqual(adapter.generate.call_count, 2)
+        self.assertEqual(mock_sleep.call_count, 1)
 
 
 class PromptRegistryTestCase(TestCase):

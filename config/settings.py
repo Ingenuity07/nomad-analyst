@@ -217,6 +217,20 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 CELERY_TASK_ALWAYS_EAGER = 'test' in sys.argv
 CELERY_TASK_EAGER_PROPAGATES = CELERY_TASK_ALWAYS_EAGER
+CELERY_BEAT_SCHEDULE = {
+    'run-intraday-strategy-scan-5min': {
+        'task': 'market.tasks.run_intraday_strategy_scan',
+        'schedule': 300.0,
+    },
+    'expire-intraday-session-recs-close': {
+        'task': 'market.tasks.expire_intraday_session_recommendations',
+        'schedule': 300.0,
+    },
+    'evaluate-recommendation-outcomes-5min': {
+        'task': 'market.tasks.evaluate_recommendation_outcomes',
+        'schedule': 300.0,
+    },
+}
 
 
 # Cache backend (Redis) for distributed task locking

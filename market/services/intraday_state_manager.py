@@ -27,7 +27,7 @@ from market.services.intraday_aggregator import IntradayBarAggregator
 from market.services.intraday_context_engine import IntradayMarketContextEngine
 from market.services.intraday_config import (
     FRESH_THRESHOLD_SEC,
-    STALE_THRESHOLD_SEC,
+    UNAVAILABLE_THRESHOLD_SEC,
     WS_CONTEXT_THROTTLE_SEC,
     WS_STOCKS_THROTTLE_SEC,
 )
@@ -44,6 +44,11 @@ class IntradayStateManager:
     """
 
     _instance: Optional["IntradayStateManager"] = None
+
+    @classmethod
+    def reset_singleton(cls):
+        """Resets the singleton instance (primarily for tests)."""
+        cls._instance = None
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -127,14 +132,30 @@ class IntradayStateManager:
         }
 
         # 4. Partition Index vs Equity
-        is_index = symbol in ("^NSEI", "NIFTY", "NIFTY 50", "NIFTY50", "^NSEBANK", "BANKNIFTY", "NIFTY BANK")
-        if is_index:
-            idx_key = "NIFTY" if "NIFTY" in symbol and "BANK" not in symbol else "BANKNIFTY"
+        INDEX_SYMBOL_MAP = {
+            "^NSEI": "NIFTY",
+            "NIFTY": "NIFTY",
+            "NIFTY 50": "NIFTY",
+            "NIFTY50": "NIFTY",
+            "^NSEBANK": "BANKNIFTY",
+            "BANKNIFTY": "BANKNIFTY",
+            "NIFTY BANK": "BANKNIFTY",
+            "^BSESN": "SENSEX",
+            "SENSEX": "SENSEX",
+            "BSE SENSEX": "SENSEX",
+            "^CNXIT": "NIFTYIT",
+            "NIFTY IT": "NIFTYIT",
+            "CNXIT": "NIFTYIT",
+        }
+        idx_key = INDEX_SYMBOL_MAP.get(symbol)
+        if idx_key:
             self._index_states[idx_key] = state_item
             cache.set(f"index_state:{idx_key}", state_item, timeout=3600)
+            cache.set(f"live_tick:{symbol}", state_item, timeout=3600)
         else:
             self._stock_states[symbol] = state_item
             cache.set(f"stock_state:{symbol}", state_item, timeout=3600)
+            cache.set(f"live_tick:{symbol}", state_item, timeout=3600)
 
         # 5. Throttle real-time broadcast and periodic recalculation
         current_time = time.time()
@@ -144,31 +165,45 @@ class IntradayStateManager:
 
     def get_freshness_status(self) -> Dict[str, Any]:
         """
-        Evaluates feed freshness based on elapsed time since the latest tick.
+        Evaluates feed freshness based on elapsed time since the latest tick
+        across both local in-memory state and shared Redis cache.
         """
         now = datetime.now(timezone.utc)
-        if self._last_tick_time is None:
-            # Check redis
-            cached_last_tick = cache.get("kite_last_tick")
-            if not cached_last_tick:
-                return {
-                    "freshness": "UNAVAILABLE",
-                    "age_seconds": None,
-                    "last_tick_at": None,
-                    "is_fresh": False,
-                }
+        cached_last_tick = cache.get("kite_last_tick")
+        redis_age = None
+        redis_rec_ts = None
+        if cached_last_tick and "received_timestamp" in cached_last_tick:
             try:
                 rec_ts = datetime.fromisoformat(cached_last_tick["received_timestamp"])
-                age = (now - rec_ts).total_seconds()
+                redis_age = max(0.0, (now - rec_ts).total_seconds())
+                redis_rec_ts = rec_ts
             except Exception:
-                age = 999.0
+                pass
+
+        if self._last_tick_time is not None:
+            mem_age = max(0.0, (now - self._last_tick_time).total_seconds())
+            if redis_age is not None:
+                age = min(mem_age, redis_age)
+                latest_ts = max(self._last_tick_time, redis_rec_ts) if redis_rec_ts else self._last_tick_time
+            else:
+                age = mem_age
+                latest_ts = self._last_tick_time
         else:
-            age = (now - self._last_tick_time).total_seconds()
+            age = redis_age
+            latest_ts = redis_rec_ts
+
+        if age is None:
+            return {
+                "freshness": "UNAVAILABLE",
+                "age_seconds": None,
+                "last_tick_at": None,
+                "is_fresh": False,
+            }
 
         if age < FRESH_THRESHOLD_SEC:
             freshness = "FRESH"
             is_fresh = True
-        elif age <= STALE_THRESHOLD_SEC:
+        elif age < UNAVAILABLE_THRESHOLD_SEC:
             freshness = "STALE"
             is_fresh = False
         else:
@@ -177,14 +212,16 @@ class IntradayStateManager:
 
         return {
             "freshness": freshness,
-            "age_seconds": round(age, 1) if age is not None else None,
-            "last_tick_at": self._last_tick_time.isoformat() if self._last_tick_time else None,
+            "age_seconds": round(age, 1),
+            "last_tick_at": latest_ts.isoformat() if latest_ts else None,
             "is_fresh": is_fresh,
         }
 
     def compute_current_context(self) -> Dict[str, Any]:
         """
         Runs IntradayMarketContextEngine over current memory/cache state.
+        If in-memory and Redis caches are cold or empty, falls back to the
+        latest persisted PostgreSQL MarketContextSnapshot and StockIntradayContext.
         """
         # Collect stock states
         stock_list = list(self._stock_states.values())
@@ -203,26 +240,90 @@ class IntradayStateManager:
             except Exception as e:
                 logger.warning(f"Error loading stock states from cache: {e}")
 
+        # If cache and memory are cold/expired, fall back to PostgreSQL MarketContextSnapshot and StockIntradayContext
+        is_from_db = False
+        db_snapshot = None
+        if not stock_list:
+            try:
+                from market.models import MarketContextSnapshot, StockIntradayContext
+                db_snapshot = MarketContextSnapshot.objects.order_by('-as_of').first()
+                if db_snapshot:
+                    sic_records = StockIntradayContext.objects.filter(
+                        timestamp=db_snapshot.as_of
+                    ).select_related('instrument')
+                    for sic in sic_records:
+                        stock_list.append({
+                            "symbol": sic.instrument.symbol,
+                            "last_price": float(sic.last_price),
+                            "previous_close": float(sic.last_price / (1 + (sic.change_pct or 0) / 100)) if sic.change_pct is not None else float(sic.last_price),
+                            "change_pct": float(sic.change_pct or 0.0),
+                            "change_percent": float(sic.change_pct or 0.0),
+                            "vwap": float(sic.vwap) if sic.vwap is not None else None,
+                            "distance_from_vwap": float(sic.distance_from_vwap or 0.0),
+                            "volume": sic.volume,
+                            "relative_volume": float(sic.relative_volume or 1.0),
+                            "momentum_5m": float(sic.momentum_5m or 0.0),
+                            "momentum_15m": float(sic.momentum_15m or 0.0),
+                            "momentum_30m": float(sic.momentum_30m or 0.0),
+                            "relative_strength_vs_market": float(sic.relative_strength_vs_market or 0.0),
+                            "relative_strength_vs_sector": float(sic.relative_strength_vs_sector or 0.0),
+                            "sector": sic.sector or self._symbol_sector_map.get(sic.instrument.symbol, "Unknown"),
+                            "sector_return": float(sic.sector_return or 0.0),
+                            "volume_confirmation": sic.volume_confirmation,
+                            "opening_range_state": sic.opening_range_state,
+                            "high": float(sic.intraday_high) if sic.intraday_high is not None else None,
+                            "low": float(sic.intraday_low) if sic.intraday_low is not None else None,
+                            "component_scores": sic.component_scores or {},
+                            "context_score": float(sic.context_score) if sic.context_score is not None else None,
+                        })
+                    if stock_list:
+                        is_from_db = True
+            except Exception as e:
+                logger.warning(f"Error restoring context from database snapshot: {e}")
+
         # Collect index states
         index_states = dict(self._index_states)
         if not index_states:
             nifty_c = cache.get("index_state:NIFTY") or cache.get("live_tick:^NSEI")
             bank_c = cache.get("index_state:BANKNIFTY") or cache.get("live_tick:^NSEBANK")
+            sensex_c = cache.get("index_state:SENSEX") or cache.get("live_tick:^BSESN")
+            it_c = cache.get("index_state:NIFTYIT") or cache.get("live_tick:^CNXIT")
             if nifty_c:
                 index_states["NIFTY"] = nifty_c
             if bank_c:
                 index_states["BANKNIFTY"] = bank_c
+            if sensex_c:
+                index_states["SENSEX"] = sensex_c
+            if it_c:
+                index_states["NIFTYIT"] = it_c
+
+        if not index_states and db_snapshot and db_snapshot.index_regimes:
+            ir = db_snapshot.index_regimes
+            if isinstance(ir, dict):
+                if "nifty" in ir and isinstance(ir["nifty"], dict):
+                    index_states["NIFTY"] = ir["nifty"]
+                if "banknifty" in ir and isinstance(ir["banknifty"], dict):
+                    index_states["BANKNIFTY"] = ir["banknifty"]
 
         context = IntradayMarketContextEngine.build_market_context_snapshot(
             constituent_states=stock_list,
             index_states=index_states,
-            as_of=datetime.now(timezone.utc),
+            as_of=db_snapshot.as_of if (is_from_db and db_snapshot) else datetime.now(timezone.utc),
         )
 
-        freshness_info = self.get_freshness_status()
-        context["freshness"] = freshness_info["freshness"]
-        context["freshness_age_seconds"] = freshness_info["age_seconds"]
-        context["is_fresh"] = freshness_info["is_fresh"]
+        if is_from_db and db_snapshot:
+            snap_age = max(0.0, (datetime.now(timezone.utc) - db_snapshot.as_of).total_seconds())
+            context["as_of"] = db_snapshot.as_of.isoformat()
+            context["freshness"] = "UNAVAILABLE" if snap_age >= UNAVAILABLE_THRESHOLD_SEC else "STALE"
+            context["freshness_age_seconds"] = round(snap_age, 1)
+            context["is_fresh"] = False
+            context["source"] = "persisted_snapshot"
+        else:
+            freshness_info = self.get_freshness_status()
+            context["freshness"] = freshness_info["freshness"]
+            context["freshness_age_seconds"] = freshness_info["age_seconds"]
+            context["is_fresh"] = freshness_info["is_fresh"]
+            context["source"] = "live_stream"
 
         self._last_calculated_context = context
         return context

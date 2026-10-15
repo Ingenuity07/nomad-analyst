@@ -76,7 +76,7 @@ export const SectorRotationMatrix: React.FC<SectorRotationMatrixProps> = ({ sect
     },
     {
       key: 'average_return',
-      header: '1D Return %',
+      header: '1D Close-to-Close %',
       isNumeric: true,
       render: (item) => {
         const ret = item.average_return ?? item.change_percent ?? null;

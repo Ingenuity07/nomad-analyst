@@ -21,10 +21,12 @@ OPPORTUNITY_SCORE_WEIGHTS: Dict[str, Decimal] = {
     "data_quality": Decimal("0.10"),      # Data completeness, recency, and depth
 }
 
+from market.services.intraday_config import UNAVAILABLE_THRESHOLD_SEC
+
 # ── 2. Candidate Eligibility & Filtering Thresholds ──────────────────────────
 # Minimum criteria a stock must satisfy to be eligible for opportunity evaluation.
 MIN_PRICE_INR = Decimal("10.0")
-MAX_FRESHNESS_AGE_SECONDS = 60.0        # Stale if data older than 60 seconds
+MAX_FRESHNESS_AGE_SECONDS = UNAVAILABLE_THRESHOLD_SEC       # Ineligible if data older than 180 seconds (3 mins)
 MIN_CUMULATIVE_VOLUME = 1000            # Flag / exclude extreme low liquidity
 MIN_INTRADAY_BARS_REQUIRED = 3          # At least three 1m/5m observations
 

@@ -28,7 +28,7 @@ export const IntradaySectorStrengthPanel: React.FC<IntradaySectorStrengthProps> 
     <Card style={{ padding: 'var(--space-4)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-3)' }}>
         <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-          Sectoral Strength & Relative Rotation
+          Sectoral Strength & Relative Rotation (Intraday Move %)
         </span>
         <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
           {sectorLeader && (

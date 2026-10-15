@@ -83,6 +83,8 @@ class MarketService:
             # ── Index / Macro / Global indicators ────────────────────────────
             "^NSEI":    {"name": "Nifty 50 Index",                  "sector": "Index",        "industry": "Index",           "website": None},
             "^NSEBANK": {"name": "Nifty Bank Index",                "sector": "Index",        "industry": "Index",           "website": None},
+            "^BSESN":   {"name": "S&P BSE SENSEX",                  "sector": "Index",        "industry": "Index",           "website": None},
+            "^CNXIT":   {"name": "Nifty IT Index",                  "sector": "Index",        "industry": "Index",           "website": None},
             "^GSPC":    {"name": "S&P 500 Index",                   "sector": "Global Index", "industry": "Global Index",    "website": None},
             "^IXIC":    {"name": "Nasdaq Composite Index",          "sector": "Global Index", "industry": "Global Index",    "website": None},
             "^DJI":     {"name": "Dow Jones Industrial Average",    "sector": "Global Index", "industry": "Global Index",    "website": None},
@@ -131,8 +133,11 @@ class MarketService:
         # 4. Resolve and create/update Instrument
         if clean_symbol.startswith("^"):
             instrument_type = "INDEX"
-            if clean_symbol in ("^NSEI", "^NSEBANK", "^CNXSC"):
+            if clean_symbol in ("^NSEI", "^NSEBANK", "^CNXSC", "^CNXIT"):
                 exchange = "NSE"
+                currency = "INR"
+            elif clean_symbol == "^BSESN":
+                exchange = "BSE"
                 currency = "INR"
             else:
                 exchange = "GLOBAL"
@@ -207,14 +212,19 @@ class MarketService:
         if not raw_symbol or not isinstance(raw_symbol, str):
             raise ValueError("Invalid symbol in historical metadata.")
         clean_symbol = raw_symbol.split('.')[0].strip()
+        if clean_symbol == "TMPV" or symbol.strip().upper() in ("TATAMOTORS", "TATAMOTORS.NS"):
+            clean_symbol = "TATAMOTORS"
         if not clean_symbol or not re.match(r"^[A-Za-z0-9_\-\^=&]+$", clean_symbol):
             raise ValueError(f"Invalid symbol characters: '{clean_symbol}'")
             
         # Determine exchange, instrument type and currency
         if clean_symbol.startswith("^"):
             instrument_type = "INDEX"
-            if clean_symbol in ("^NSEI", "^NSEBANK", "^CNXSC"):
+            if clean_symbol in ("^NSEI", "^NSEBANK", "^CNXSC", "^CNXIT"):
                 exchange = "NSE"
+                currency = "INR"
+            elif clean_symbol == "^BSESN":
+                exchange = "BSE"
                 currency = "INR"
             else:
                 exchange = "GLOBAL"

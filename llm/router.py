@@ -5,6 +5,7 @@ import time
 import threading
 from typing import Dict, Any, List, Optional, Set, Type
 from pydantic import BaseModel, ValidationError
+from django.conf import settings
 
 from llm.base import BaseLLMProvider
 from llm.scoring import calculate_complexity_score, get_complexity_tier
@@ -195,14 +196,16 @@ class IntelligentRouter(BaseLLMProvider):
             logger.warning(f"Error starting OTel span: {o_err}")
 
         # Retry transient upstream failures before moving to the next provider.
-        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        # Limit per-model attempts so a single failing/hung model fails over quickly to the next candidate.
+        max_model_attempts = getattr(settings, "LLM_MAX_MODEL_ATTEMPTS", 2)
+        retryable_statuses = {429, 500, 502, 503, 504}
         retry_count = 0
         error_type = ""
         error_code = ""
         error_message = ""
         provider_status_code = None
 
-        for attempt in range(3):
+        for attempt in range(max_model_attempts):
             retry_count = attempt
             try:
                 result = adapter.generate(prompt=prompt, system_prompt=system_prompt, tools=tools)
@@ -236,17 +239,19 @@ class IntelligentRouter(BaseLLMProvider):
                     error_type = "UNKNOWN"
                     error_code = "500"
 
+                # Note: 408 Timeout is retryable at router level (model fallback), but should NOT
+                # retry the exact same timed-out endpoint to prevent double-hanging.
                 is_transient = (
                     status_code in retryable_statuses
                     or "too many requests" in err_text.lower()
                     or "service unavailable" in err_text.lower()
                 )
-                if is_transient and attempt < 2:
+                if is_transient and attempt < (max_model_attempts - 1):
                     retry_after = result.get("retry_after")
                     wait_time = int(retry_after) if (retry_after and retry_after.isdigit()) else (attempt + 1)
                     logger.warning(
                         f"Provider '{provider_key}' returned transient status {status_code or 'error'}. "
-                        f"Retrying in {wait_time}s (attempt {attempt + 1}/3)..."
+                        f"Retrying in {wait_time}s (attempt {attempt + 1}/{max_model_attempts})..."
                     )
                     time.sleep(wait_time)
                     continue
@@ -389,6 +394,15 @@ class IntelligentRouter(BaseLLMProvider):
             except Exception as e:
                 logger.warning(f"Failed to resolve system_prompt_key '{system_prompt_key}': {e}")
 
+        # If request.schema is specified, ensure schema instructions are in system_prompt
+        if request.schema:
+            try:
+                schema_json = json.dumps(request.schema.model_json_schema(), indent=2)
+                if "REQUIRED JSON SCHEMA:" not in system_prompt:
+                    system_prompt = f"{system_prompt}\n\nREQUIRED JSON SCHEMA:\nYou MUST respond with a single, valid JSON object strictly conforming to this JSON Schema:\n{schema_json}"
+            except Exception as s_err:
+                logger.debug(f"Could not dump schema to json: {s_err}")
+
         # Get candidate models from preferred pool
         candidate_configs = get_pool_models(request.complexity)
         attempt_count = 0
@@ -400,8 +414,8 @@ class IntelligentRouter(BaseLLMProvider):
         for config in candidate_configs:
             if config.model_name in attempted_model_keys:
                 continue
-            if not self.health_monitor.is_healthy(config.provider_key):
-                logger.info(f"Provider '{config.provider_key}' is blacklisted/cooldown, skipping model '{config.model_name}'.")
+            if not self.health_monitor.is_healthy(config.provider_key, config.model_name):
+                logger.info(f"Provider '{config.provider_key}' / model '{config.model_name}' is in cooldown, skipping.")
                 continue
 
             attempted_model_keys.add(config.model_name)
@@ -429,7 +443,7 @@ class IntelligentRouter(BaseLLMProvider):
                 cat = classify_error(status_code, err_text)
                 last_error_category = cat
                 last_error_message = err_text
-                self.health_monitor.report_failure(config.provider_key, status_code=status_code)
+                self.health_monitor.report_failure(config.provider_key, model_name=config.model_name, status_code=status_code)
 
                 if cat not in RETRYABLE_ERROR_CATEGORIES:
                     logger.warning(f"Non-retryable error ({cat}) on model '{config.model_name}': {err_text}")
@@ -492,7 +506,7 @@ class IntelligentRouter(BaseLLMProvider):
         fallback_configs = get_global_fallback_models(exclude_keys=attempted_model_keys)
 
         for config in fallback_configs:
-            if not self.health_monitor.is_healthy(config.provider_key):
+            if not self.health_monitor.is_healthy(config.provider_key, config.model_name):
                 continue
 
             attempted_model_keys.add(config.model_name)
@@ -520,10 +534,10 @@ class IntelligentRouter(BaseLLMProvider):
                 cat = classify_error(status_code, err_text)
                 last_error_category = cat
                 last_error_message = err_text
-                self.health_monitor.report_failure(config.provider_key, status_code=status_code)
+                self.health_monitor.report_failure(config.provider_key, model_name=config.model_name, status_code=status_code)
                 continue
 
-            self.health_monitor.report_success(config.provider_key)
+            self.health_monitor.report_success(config.provider_key, model_name=config.model_name)
             raw_text = res_dict.get("text", "")
             usage = {
                 "prompt_tokens": res_dict.get("prompt_tokens", 0),

@@ -186,7 +186,7 @@ class IntradayOpportunityScorer:
 
         # ── 6. Sector Alignment Dimension (0-100) ────────────────────────────
         sector_alignment_state = "NEUTRAL"
-        sec_ret = Decimal(str(sector_info.get("return_pct", 0.0))) if sector_info else Decimal("0.0")
+        sec_ret = Decimal(str(sector_info.get("return_pct") if sector_info.get("return_pct") is not None else sector_info.get("average_return", 0.0))) if sector_info else Decimal("0.0")
         sec_rank = sector_info.get("rank") if sector_info else None
 
         if sector_info is None or stock_context.get("sector") in (None, "Unknown"):

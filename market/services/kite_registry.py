@@ -107,8 +107,8 @@ class KiteInstrumentRegistry:
                 # If NSE Equity, add direct symbol mapping
                 if exchange == "NSE" and inst_type == "EQ":
                     symbol_to_token[tradingsymbol] = token
-                elif segment == "INDICES" and exchange == "NSE":
-                    # Indices e.g. NIFTY 50, NIFTY BANK
+                elif segment == "INDICES":
+                    # Indices e.g. NIFTY 50, NIFTY BANK, NIFTY IT, SENSEX
                     symbol_to_token[tradingsymbol] = token
 
             except (KeyError, ValueError) as err:
@@ -127,7 +127,11 @@ class KiteInstrumentRegistry:
         Handles:
         - Regular equity: 'RELIANCE' -> 738561
         - Tata Motors demerger: 'TATAMOTORS' -> 'TMPV' (884737)
-        - Benchmark indices: '^NSEI' -> 'NIFTY 50' (256265), '^NSEBANK' -> 'NIFTY BANK' (260105)
+        - Benchmark indices:
+          '^NSEI' -> 'NIFTY 50' (256265)
+          '^NSEBANK' -> 'NIFTY BANK' (260105)
+          '^BSESN' -> 'SENSEX' (265)
+          '^CNXIT' -> 'NIFTY IT' (259849)
         """
         if cls._symbol_to_token is None:
             cls.load_master()
@@ -139,6 +143,10 @@ class KiteInstrumentRegistry:
             return cls._symbol_to_token.get("NIFTY 50", 256265)
         if sym in ("^NSEBANK", "BANKNIFTY", "NIFTY BANK"):
             return cls._symbol_to_token.get("NIFTY BANK", 260105)
+        if sym in ("^BSESN", "SENSEX", "BSE SENSEX"):
+            return cls._symbol_to_token.get("SENSEX", 265)
+        if sym in ("^CNXIT", "NIFTYIT", "NIFTY IT"):
+            return cls._symbol_to_token.get("NIFTY IT", 259849)
 
         # Handle Tata Motors corporate action / demerger
         if sym == "TATAMOTORS":
@@ -163,6 +171,10 @@ class KiteInstrumentRegistry:
             return "^NSEI"
         if meta["tradingsymbol"] == "NIFTY BANK" and meta["segment"] == "INDICES":
             return "^NSEBANK"
+        if (meta["tradingsymbol"] == "SENSEX" or token == 265) and meta["segment"] == "INDICES":
+            return "^BSESN"
+        if (meta["tradingsymbol"] == "NIFTY IT" or token == 259849) and meta["segment"] == "INDICES":
+            return "^CNXIT"
 
         return meta["tradingsymbol"]
 

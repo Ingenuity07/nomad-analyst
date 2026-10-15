@@ -65,3 +65,31 @@ class StructuredResearchOutput(BaseModel):
         default="MEDIUM",
         description="Confidence level in the research findings based on evidence coverage and freshness."
     )
+
+    from pydantic import model_validator
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fields(cls, values):
+        if isinstance(values, dict):
+            # If summary is missing but thesis or other summary exists
+            if not values.get("summary"):
+                values["summary"] = values.get("thesis") or values.get("executive_summary") or values.get("asset_identification", "") or "Intraday opportunity analysis synthesized from evidence package."
+            if not values.get("thesis"):
+                values["thesis"] = values.get("summary") or "Analytical thesis synthesized from quantitative evidence package."
+            # If observed_facts is dict, flatten to list of strings
+            if isinstance(values.get("observed_facts"), dict):
+                flattened = []
+                for k, v in values["observed_facts"].items():
+                    if isinstance(v, dict):
+                        for sub_k, sub_v in v.items():
+                            flattened.append(f"{sub_k}: {sub_v}")
+                    else:
+                        flattened.append(f"{k}: {v}")
+                values["observed_facts"] = flattened
+            elif isinstance(values.get("observed_facts"), str):
+                values["observed_facts"] = [values["observed_facts"]]
+            # If analyst_interpretation is dict, flatten to string
+            if isinstance(values.get("analyst_interpretation"), dict):
+                values["analyst_interpretation"] = "\n".join(f"{k}: {v}" for k, v in values["analyst_interpretation"].items())
+        return values

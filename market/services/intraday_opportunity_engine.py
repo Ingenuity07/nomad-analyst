@@ -53,9 +53,13 @@ class IntradayOpportunityEngine:
         now = as_of or datetime.now(timezone.utc)
         as_of_iso = now.isoformat()
 
-        # Build sector lookup from market context
+        # Build sector lookup from market context (handling both 'sector' and 'name' schema contracts)
         sectors_list = market_context.get("sectors", [])
-        sector_lookup = {sec.get("name"): sec for sec in sectors_list if sec.get("name")}
+        sector_lookup = {
+            (sec.get("sector") or sec.get("name")): sec
+            for sec in sectors_list
+            if (sec.get("sector") or sec.get("name"))
+        }
 
         eligible_opportunities: List[Dict[str, Any]] = []
         excluded_candidates: List[Dict[str, Any]] = []
@@ -156,7 +160,7 @@ class IntradayOpportunityEngine:
                 "sector": {
                     "name": stock.get("sector", "Unknown"),
                     "rank": sec_info.get("rank") if sec_info else None,
-                    "return_pct": float(sec_info.get("return_pct", 0.0)) if sec_info else 0.0,
+                    "return_pct": float(sec_info.get("return_pct") if sec_info.get("return_pct") is not None else sec_info.get("average_return", 0.0)) if sec_info else 0.0,
                 },
                 "market_alignment": score_data["market_alignment"],
                 "sector_alignment": score_data["sector_alignment"],
@@ -252,7 +256,68 @@ class IntradayOpportunityEngine:
 
         if snapshots_to_create:
             try:
-                IntradayOpportunitySnapshot.objects.bulk_create(snapshots_to_create)
-                logger.info(f"Persisted {len(snapshots_to_create)} IntradayOpportunitySnapshot records @ {timestamp}")
+                # Avoid duplicate snapshots for the exact same symbol and timestamp
+                existing_symbols = set(
+                    IntradayOpportunitySnapshot.objects.filter(
+                        timestamp=timestamp,
+                        symbol__in=[s.symbol for s in snapshots_to_create]
+                    ).values_list('symbol', flat=True)
+                )
+                to_create = [s for s in snapshots_to_create if s.symbol not in existing_symbols]
+                if to_create:
+                    IntradayOpportunitySnapshot.objects.bulk_create(to_create)
+                    logger.info(f"Persisted {len(to_create)} IntradayOpportunitySnapshot records @ {timestamp}")
             except Exception as e:
                 logger.error(f"Failed to bulk_create IntradayOpportunitySnapshot records: {e}")
+
+    def scan_and_rank(
+        self,
+        market_context: Optional[Dict[str, Any]] = None,
+        constituent_contexts: Optional[List[Dict[str, Any]]] = None,
+        freshness_info: Optional[Dict[str, Any]] = None,
+        mode: str = "RAW_RANKING",
+        limit: int = 10,
+        sector_filter: Optional[str] = None,
+        opportunity_type_filter: Optional[str] = None,
+        state_filter: Optional[str] = None,
+        min_score: Optional[float] = None,
+        as_of: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Convenience execution method to evaluate, rank, and format universe opportunities.
+        If market_context is not passed, fetches current live state via IntradayStateManager.
+        """
+        if market_context is None or constituent_contexts is None:
+            from market.services.intraday_state_manager import IntradayStateManager
+            mgr = IntradayStateManager()
+            return mgr.compute_current_opportunities(
+                mode=mode,
+                limit=limit,
+                sector_filter=sector_filter,
+                opportunity_type_filter=opportunity_type_filter,
+                state_filter=state_filter,
+                min_score=min_score,
+                as_of=as_of,
+            )
+
+        eval_result = self.evaluate_universe_opportunities(
+            market_context=market_context,
+            constituent_contexts=constituent_contexts,
+            freshness_info=freshness_info,
+            as_of=as_of,
+            persist_to_db=False,
+        )
+
+        ranked = IntradayOpportunityRanker.rank_opportunities(
+            opportunities=eval_result.get("all_eligible_opportunities", []),
+            mode=mode,
+            limit=limit,
+            sector_filter=sector_filter,
+            opportunity_type_filter=opportunity_type_filter,
+            state_filter=state_filter,
+            min_score=min_score,
+        )
+        eval_result["opportunities"] = ranked["opportunities"]
+        eval_result["ranking_mode"] = ranked["mode"]
+        eval_result["sector_concentration"] = ranked["sector_concentration"]
+        return eval_result

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 CONSTITUENT_FILE = "data/universe/nifty50_constituents_2026-09-03.json"
 DEFAULT_DAYS_BACK = 730       # 2 years
 RATE_LIMIT_SLEEP = 2.0        # seconds between HTTP requests
-BENCHMARK_SYMBOLS = ["^NSEI", "^NSEBANK"]
+BENCHMARK_SYMBOLS = ["^NSEI", "^NSEBANK", "^BSESN", "^CNXIT"]
 
 
 class Command(BaseCommand):

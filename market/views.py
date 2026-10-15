@@ -1171,10 +1171,38 @@ class IntradayDataHealthAPIView(APIView):
         auth_status = KiteCredentialService.get_safe_status()
         session = TradingSessionService.get_current_session()
 
-        # Check universe coverage
+        # Check universe coverage (memory with Redis cache fallback for multi-process deployments)
         total_universe = 50
         active_stocks = len(mgr._stock_states)
+        from django.core.cache import cache
+        if active_stocks == 0:
+            from market.models import Instrument
+            symbols = list(Instrument.objects.filter(
+                universe_memberships__universe__name="NIFTY50",
+                universe_memberships__is_active=True
+            ).values_list("symbol", flat=True))
+            stock_keys = [f"stock_state:{s}" for s in symbols]
+            cached_states = cache.get_many(stock_keys)
+            active_stocks = len(cached_states)
+            if active_stocks < len(symbols):
+                # Fallback check on live_tick keys for any not in stock_state
+                missing_symbols = [s for s in symbols if f"stock_state:{s}" not in cached_states]
+                tick_keys = [f"live_tick:{s}" for s in missing_symbols]
+                active_stocks += len(cache.get_many(tick_keys))
         missing_count = max(0, total_universe - active_stocks)
+
+        nifty_active = ("NIFTY" in mgr._index_states) or bool(cache.get("index_state:NIFTY") or cache.get("live_tick:^NSEI"))
+        banknifty_active = ("BANKNIFTY" in mgr._index_states) or bool(cache.get("index_state:BANKNIFTY") or cache.get("live_tick:^NSEBANK"))
+
+        active_1m = len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "1m"])
+        active_5m = len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "5m"])
+        active_15m = len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "15m"])
+        if active_1m == 0:
+            from market.models import OHLCVBar
+            today = timezone.now().date()
+            active_1m = OHLCVBar.objects.filter(timestamp__date=today, timeframe="1m").values("instrument_id").distinct().count()
+            active_5m = OHLCVBar.objects.filter(timestamp__date=today, timeframe="5m").values("instrument_id").distinct().count()
+            active_15m = OHLCVBar.objects.filter(timestamp__date=today, timeframe="15m").values("instrument_id").distinct().count()
 
         return Response({
             "as_of": timezone.now().isoformat(),
@@ -1192,13 +1220,13 @@ class IntradayDataHealthAPIView(APIView):
                 "coverage_pct": round((active_stocks / total_universe) * 100.0, 1) if total_universe > 0 else 0.0,
             },
             "indices_active": {
-                "nifty": "NIFTY" in mgr._index_states,
-                "banknifty": "BANKNIFTY" in mgr._index_states,
+                "nifty": nifty_active,
+                "banknifty": banknifty_active,
             },
             "aggregation": {
-                "active_1m_bars": len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "1m"]),
-                "active_5m_bars": len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "5m"]),
-                "active_15m_bars": len([k for k in mgr.aggregator._current_bars.keys() if k[1] == "15m"]),
+                "active_1m_bars": active_1m,
+                "active_5m_bars": active_5m,
+                "active_15m_bars": active_15m,
             },
         }, status=status.HTTP_200_OK)
 

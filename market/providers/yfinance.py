@@ -13,6 +13,11 @@ from market.exceptions import (
 
 logger = logging.getLogger(__name__)
 
+PROVIDER_SYMBOL_OVERRIDES = {
+    "TATAMOTORS": "TMPV.NS",
+    "TATAMOTORS.NS": "TMPV.NS",
+}
+
 class YFinanceMarketProvider(MarketDataProvider):
     """
     Yahoo Finance chart API provider implementing the MarketDataProvider Protocol.
@@ -29,8 +34,10 @@ class YFinanceMarketProvider(MarketDataProvider):
     def get_quote(self, symbol: str) -> Dict[str, Any]:
         upper_symbol = symbol.strip().upper()
         
-        # Suffix handling: if symbol starts with ^, contains =, or has exchange suffix, use as-is
-        if upper_symbol.startswith("^") or "=" in upper_symbol or upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO"):
+        # Handle provider symbol overrides (e.g. Tata Motors demerger)
+        if upper_symbol in PROVIDER_SYMBOL_OVERRIDES:
+            yfinance_symbol = PROVIDER_SYMBOL_OVERRIDES[upper_symbol]
+        elif upper_symbol.startswith("^") or "=" in upper_symbol or upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO"):
             yfinance_symbol = upper_symbol
         else:
             yfinance_symbol = f"{upper_symbol}.NS"
@@ -94,8 +101,10 @@ class YFinanceMarketProvider(MarketDataProvider):
     def get_historical_ohlcv(self, symbol: str, timeframe: str = "1d", start_date: datetime = None, end_date: datetime = None) -> Dict[str, Any]:
         upper_symbol = symbol.strip().upper()
         
-        # Suffix handling: if symbol starts with ^, contains =, or has exchange suffix, use as-is
-        if upper_symbol.startswith("^") or "=" in upper_symbol or upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO"):
+        # Handle provider symbol overrides (e.g. Tata Motors demerger)
+        if upper_symbol in PROVIDER_SYMBOL_OVERRIDES:
+            yfinance_symbol = PROVIDER_SYMBOL_OVERRIDES[upper_symbol]
+        elif upper_symbol.startswith("^") or "=" in upper_symbol or upper_symbol.endswith(".NS") or upper_symbol.endswith(".BO"):
             yfinance_symbol = upper_symbol
         else:
             yfinance_symbol = f"{upper_symbol}.NS"

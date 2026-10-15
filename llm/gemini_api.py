@@ -1,15 +1,18 @@
 import json
 import os
 import requests
-from typing import Dict, Any
+from django.conf import settings
+from typing import Dict, Any, Optional
 from .base import BaseLLMProvider
+
+DEFAULT_GEMINI_TIMEOUT = 45  # seconds: balanced between complex JSON synthesis and prompt failover
 
 class GeminiAPIProvider(BaseLLMProvider):
     """
     LLM Provider that uses the official Gemini REST API.
     """
     
-    def __init__(self, api_key: str = None, model: str = None):
+    def __init__(self, api_key: str = None, model: str = None, timeout: Optional[int] = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -18,6 +21,8 @@ class GeminiAPIProvider(BaseLLMProvider):
             )
         self.model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
         self.url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        configured_timeout = getattr(settings, "LLM_TIMEOUT", DEFAULT_GEMINI_TIMEOUT) if hasattr(settings, "LLM_TIMEOUT") else DEFAULT_GEMINI_TIMEOUT
+        self.timeout = timeout or configured_timeout
 
     def generate(self, prompt: str, system_prompt: str = "", tools: list = None) -> Dict[str, Any]:
         headers = {
@@ -48,7 +53,7 @@ class GeminiAPIProvider(BaseLLMProvider):
         }
         
         try:
-            response = requests.post(self.url, headers=headers, json=payload, timeout=30)
+            response = requests.post(self.url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             
             data = response.json()
@@ -100,7 +105,10 @@ class GeminiAPIProvider(BaseLLMProvider):
                 
         except requests.exceptions.RequestException as e:
             response = getattr(e, "response", None)
-            status_code = response.status_code if response is not None else 500
+            if isinstance(e, requests.exceptions.Timeout):
+                status_code = 408
+            else:
+                status_code = response.status_code if response is not None else 500
             retry_after = None
             api_message = str(e)
 

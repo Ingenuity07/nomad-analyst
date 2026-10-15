@@ -89,12 +89,15 @@ class Command(BaseCommand):
         for t, sym in token_map.items():
             self.stdout.write(f"  {sym:<10} -> Token: {t}")
 
-        # Check credentials
-        has_creds = bool(getattr(settings, "KITE_API_KEY", "") and getattr(settings, "KITE_ACCESS_TOKEN", ""))
+        # Check credentials via KiteCredentialService (DB OAuth token + fallback)
+        from market.services.kite_auth import KiteCredentialService
+        api_key = KiteCredentialService.get_api_key()
+        access_token = KiteCredentialService.get_valid_access_token()
+        has_creds = bool(api_key and access_token)
         if not has_creds and not use_mock:
             self.stdout.write(
                 self.style.WARNING(
-                    "\nNo active Kite credentials found in settings/.env.\n"
+                    "\nNo active Kite credentials found in DB or settings/.env.\n"
                     "Automatically activating MOCK mode for live ticker validation."
                 )
             )

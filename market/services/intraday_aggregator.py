@@ -188,10 +188,36 @@ class IntradayBarAggregator:
                 if self.persist_to_db:
                     self._persist_bar(bar)
 
+    @classmethod
+    def validate_bar(cls, bar: AggregatedBar, allow_out_of_session: bool = False) -> Tuple[bool, Optional[str]]:
+        """
+        Validates OHLCV integrity and optional session plausibility for an aggregated bar.
+        Returns (is_valid, rejection_reason).
+        """
+        if bar.open <= 0 or bar.high <= 0 or bar.low <= 0 or bar.close <= 0:
+            return False, f"Non-positive price detected: O={bar.open}, H={bar.high}, L={bar.low}, C={bar.close}"
+        if bar.high < bar.low:
+            return False, f"High ({bar.high}) cannot be less than low ({bar.low})"
+        if bar.high < max(bar.open, bar.close):
+            return False, f"High ({bar.high}) must be >= max(open, close) ({max(bar.open, bar.close)})"
+        if bar.low > min(bar.open, bar.close):
+            return False, f"Low ({bar.low}) must be <= min(open, close) ({min(bar.open, bar.close)})"
+        if bar.volume < 0:
+            return False, f"Volume ({bar.volume}) cannot be negative"
+        if not allow_out_of_session and bar.timeframe != "1d":
+            if not TradingSessionService.is_plausible_exchange_timestamp(bar.timestamp):
+                return False, f"Timestamp {bar.timestamp} is outside plausible market session hours"
+        return True, None
+
     def _persist_bar(self, bar: AggregatedBar):
         """
-        Persists finalized bar into OHLCVBar table idempotently.
+        Persists finalized bar into OHLCVBar table idempotently after validating integrity and session.
         """
+        is_valid, reason = self.validate_bar(bar)
+        if not is_valid:
+            logger.warning(f"Rejected malformed or out-of-session bar for {bar.symbol} [{bar.timeframe}] @ {bar.timestamp}: {reason}")
+            return
+
         inst = self._get_instrument(bar.symbol)
         if not inst:
             return
@@ -219,6 +245,10 @@ class IntradayBarAggregator:
         """
         Safely updates an existing historical bar for an out-of-order tick without corrupting OHLC integrity.
         """
+        if price <= 0 or volume_delta < 0:
+            logger.warning(f"Rejected invalid historical update for {symbol} [{timeframe}]: price={price}, vol={volume_delta}")
+            return
+
         inst = self._get_instrument(symbol)
         if not inst:
             return
