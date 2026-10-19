@@ -3,7 +3,7 @@
 **Date:** 2026-10-19  
 **Repository:** `Ingenuity07/nomad-analyst`  
 **Baseline Commit:** `c9bc4f45a98fa972cfea4db3a5437e98adf26ef0`  
-**Remediation Implementation Commit:** `31a204ab7d287238a45f952fb3a00b3561871d10` (amended into final commit)  
+**Verified Implementation Commit:** `7cf8fc1725951d8306248c4298f0558a70f3e1a5`  
 **Scope:** F&O Paper Execution Quote-Freshness Guard and Public Validation-Clock Bypass Remediation  
 **Safety Boundary:** Simulated taker paper trading only. No live broker order capability enabled or invoked.
 
@@ -130,13 +130,13 @@ The engine, strategy validator, and feature snapshot generator have been upgrade
 4. **Full F&O Suite:**
    ```
    venv/bin/python manage.py test fno
-   Ran 113 tests in 2.773s
+   Ran 113 tests in 2.637s
    OK
    ```
 5. **Equity Regression Suite:**
    ```
    venv/bin/python manage.py test market.tests
-   Ran 298 tests in 6.508s
+   Ran 298 tests in 5.385s
    OK
    ```
 6. **Django Check & Migration Verification:**
@@ -193,3 +193,5 @@ Explicit assertions verified in regression tests:
    - *Mitigation:* Ensure NTP synchronization (e.g. `chrony` or `systemd-timesyncd`) is active on paper/live execution hosts.
 2. **Live Acceptance Validation:**
    - *Next Action:* Schedule observation during market hours (09:15 - 15:30 IST) to collect authentic telemetry on quote rejection frequency and fill rate under actual tick feed volatility.
+3. **Scope and Performance Disclaimer:**
+   - *Disclaimer:* This remediation strictly validates execution safety invariants, microstructure quote-freshness guards, and the closure of the public validation-clock bypass. It does not claim or evaluate strategy profitability, alpha performance, or live broker execution correctness.
