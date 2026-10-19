@@ -39,8 +39,10 @@ class StrategyManager:
         self,
         validator: Optional[SignalValidator] = None,
         on_signal_accepted: Optional[Callable[[OptionSignal], None]] = None,
+        clock: Optional[Callable[[], datetime]] = None,
     ):
-        self.validator = validator or SignalValidator()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.validator = validator or SignalValidator(clock=self.clock)
         self.on_signal_accepted = on_signal_accepted
         self.strategies: Dict[str, BaseStrategy] = {}
         self.audit_log: List[SignalAuditEntry] = []

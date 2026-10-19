@@ -1086,11 +1086,12 @@ class PaperExecutionTestCase(TestCase):
         )
 
         # 1. Entry fill records exchange_time (09:30:00), not arrival_time (09:30:01.850)
+        # Advance engine's trusted clock to arrival_time via controlled clock injection
+        self.engine.clock = lambda: arrival_time
         evt_buy = self.engine.process_signal(
             self.signal_buy,
             q_skew,
             execution_wall_time=None,
-            validation_time=arrival_time,
         )
         self.assertEqual(evt_buy.event_type, "ORDER_FILLED")
         self.assertEqual(evt_buy.timestamp, exch_time)
@@ -1127,11 +1128,11 @@ class PaperExecutionTestCase(TestCase):
             trigger_rationale="Target",
             snapshot_reference_id="snap-skew-exit",
         )
+        self.engine.clock = lambda: arrival_exit
         evt_exit = self.engine.process_signal(
             sig_exit,
             q_exit,
             execution_wall_time=None,
-            validation_time=arrival_exit,
         )
         self.assertEqual(evt_exit.event_type, "POSITION_CLOSED")
         self.assertEqual(evt_exit.timestamp, exch_exit)
@@ -1141,6 +1142,9 @@ class PaperExecutionTestCase(TestCase):
         self.assertEqual(trade.exit_timestamp, exch_exit)
         self.assertNotEqual(trade.exit_timestamp, arrival_exit)
         self.assertEqual(trade.friction_breakdown["effective_schedule_date"], "2026-04-01")
+
+        # Restore default test clock
+        self.engine.clock = lambda: self.now_utc
 
 
 class QuoteFreshnessGuardTestCase(TestCase):
@@ -1404,6 +1408,48 @@ class QuoteFreshnessGuardTestCase(TestCase):
         self.assertEqual(trade.rejection_reason, "REJECTED_EXCESSIVE_SPREAD")
         self.assertIsNone(trade.net_pnl)
         self.assertEqual(trade.total_frictions, Decimal("0.00"))
+
+    def test_public_process_signal_disallows_validation_time_bypass(self):
+        """Verifies public process_signal() strictly disallows caller-supplied validation_time."""
+        q_fresh = self._create_quote(exchange_timestamp_utc=self.now_utc)
+        sig = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+
+        # Calling with validation_time must raise TypeError
+        with self.assertRaises(TypeError):
+            self.engine.process_signal(
+                sig,
+                q_fresh,
+                validation_time=self.now_utc,  # type: ignore[call-arg]
+            )
+
+    def test_stale_quote_cannot_bypass_engine_trusted_clock(self):
+        """
+        Verifies that an old quote is strictly rejected against the engine's trusted clock.
+        Because public process_signal() cannot accept validation_time, callers cannot
+        forge decision time to make stale quotes appear fresh.
+        """
+        # Quote is 15 seconds old relative to engine's trusted clock (now_utc)
+        q_old = self._create_quote(
+            exchange_timestamp_utc=self.now_utc - timedelta(seconds=15),
+            is_stale=False,
+            quote_status="VALID",
+        )
+        sig = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt = self.engine.process_signal(sig, q_old)
+
+        self.assertEqual(evt.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt.message, "REJECTED_STALE_QUOTE")
+        self.assertIsNone(evt.fill_price)
+        self.assertEqual(evt.fill_quantity, 0)
+
+        # Database record confirmed rejected with zero fill, zero fees, zero PnL
+        trade = PaperTradeLedger.objects.get(signal_id=uuid.UUID(sig.signal_id))
+        self.assertEqual(trade.status, "REJECTED")
+        self.assertEqual(trade.entry_fill_price, Decimal("0.00"))
+        self.assertEqual(trade.total_frictions, Decimal("0.00"))
+        self.assertIsNone(trade.gross_pnl)
+        self.assertIsNone(trade.net_pnl)
+
 
 
 

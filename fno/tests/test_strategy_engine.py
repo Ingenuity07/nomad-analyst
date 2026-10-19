@@ -3,7 +3,7 @@ Unit tests for Generic Strategy Framework, SignalValidator, StrategyManager, and
 Reference: Phase 22C Specification
 """
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import zoneinfo
 from django.test import SimpleTestCase
@@ -19,17 +19,17 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 class StrategyEngineTestCase(SimpleTestCase):
     def setUp(self):
-        self.validator = SignalValidator()
+        # Valid mock feature snapshot at 10:15:00 IST (04:45:00 UTC)
+        self.dt_valid_ist = datetime(2026, 10, 19, 10, 15, 0, tzinfo=IST)
+        self.dt_valid_utc = self.dt_valid_ist.astimezone(timezone.utc)
+
+        self.validator = SignalValidator(clock=lambda: self.dt_valid_utc)
         self.manager = StrategyManager(validator=self.validator)
         self.strategy = NiftyOrbBreakoutStrategy()
         self.manager.register_strategy(self.strategy)
 
         # Set 15m opening range for NIFTY: High = 24550, Low = 24450
         self.strategy.set_opening_range(high=Decimal("24550.00"), low=Decimal("24450.00"))
-
-        # Valid mock feature snapshot at 10:15:00 IST (04:45:00 UTC)
-        self.dt_valid_ist = datetime(2026, 10, 19, 10, 15, 0, tzinfo=IST)
-        self.dt_valid_utc = self.dt_valid_ist.astimezone(timezone.utc)
 
         self.snapshot_ce = OptionFeatureSnapshot(
             snapshot_id="snap-ce-001",
@@ -247,4 +247,30 @@ class StrategyEngineTestCase(SimpleTestCase):
             a.status == "REJECTED" and a.rejection_code == "REJECTED_TIMEZONE_AMBIGUOUS"
             for a in self.manager.audit_log
         ))
+
+    def test_validator_disallows_validation_time_bypass(self):
+        """Verifies validate_snapshot_eligibility does not accept caller-controlled validation_time."""
+        with self.assertRaises(TypeError):
+            self.validator.validate_snapshot_eligibility(
+                self.snapshot_ce,
+                validation_time=self.dt_valid_utc,
+            )
+
+    def test_stale_snapshot_cannot_bypass_validator_trusted_clock(self):
+        """
+        Verifies that an old snapshot (10s old) cannot bypass the validator's trusted clock,
+        even if its static quote_age_seconds or is_quote_fresh flags claim it is valid.
+        """
+        old_exchange_time = self.dt_valid_utc - timedelta(seconds=10)
+        stale_snap = self.snapshot_ce.model_copy(update={
+            "exchange_timestamp_utc": old_exchange_time,
+            "quote_age_seconds": Decimal("0.5"),  # Misleading static age
+            "is_quote_fresh": True,
+            "is_stale": False,
+            "is_valid_for_signal": True,
+        })
+        result = self.validator.validate_snapshot_eligibility(stale_snap)
+        self.assertFalse(result.is_valid)
+        self.assertEqual(result.rejection_code, "REJECTED_STALE_QUOTE")
+        self.assertIn("exceeds 3.0s freshness limit", result.rejection_reason)
 

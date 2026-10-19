@@ -2,18 +2,18 @@
 
 **Date:** 2026-10-19  
 **Repository:** `Ingenuity07/nomad-analyst`  
-**Reviewed GitHub Baseline Commit:** `2df52f93b83504a78d0745dc79d60bf4c9165390`  
-**Implementation Working Tree Commit:** `2df52f93b83504a78d0745dc79d60bf4c9165390` (uncommitted working tree modifications in `fno/`)  
-**Scope:** F&O Paper Execution Quote-Freshness and Microstructure Safety Fix  
+**Baseline Commit:** `c9bc4f45a98fa972cfea4db3a5437e98adf26ef0`  
+**Remediation Implementation Commit:** `31a204ab7d287238a45f952fb3a00b3561871d10` (amended into final commit)  
+**Scope:** F&O Paper Execution Quote-Freshness Guard and Public Validation-Clock Bypass Remediation  
 **Safety Boundary:** Simulated taker paper trading only. No live broker order capability enabled or invoked.
 
 ---
 
 ## 1. Executive Summary
 
-This remediation resolves the quote-freshness safety gap identified in Phase 22D. Prior to this fix, the paper execution engine accepted limit order book quotes based merely on persisted ingestion-time flags (`is_stale=False`), without re-evaluating quote age at the execution decision boundary. Additionally, the exit order path lacked symmetrical quote eligibility validation (relying solely on zero/tiny-bid checks), creating a risk that stale, locked, crossed, or wide-spread quotes could close positions or distort simulated execution.
+This remediation resolves the quote-freshness safety gaps and closes the public validation-clock bypass identified in Phase 22D. Prior to this fix, the paper execution engine accepted limit order book quotes based merely on persisted ingestion-time flags (`is_stale=False`), without re-evaluating quote age at the execution decision boundary. Additionally, the exit order path lacked symmetrical quote eligibility validation (relying solely on zero/tiny-bid checks), and both `PaperExecutionEngine.process_signal()` and `SignalValidator.validate_snapshot_eligibility()` accepted a caller-supplied `validation_time` that could allow an untrusted caller to pass an artificially old decision time and bypass the freshness gate.
 
-The engine, strategy validator, and feature snapshot generator have been upgraded with a unified quote-freshness policy enforcing dynamic age recalculation against an explicit validation clock, fail-closed timezone validation, symmetrical exit gating with `PENDING_LIQUIDITY` exposure preservation, and mutual consistency across metadata flags.
+The engine, strategy validator, and feature snapshot generator have been upgraded with a unified quote-freshness policy enforcing dynamic age recalculation against the engine's trusted clock, fail-closed timezone validation, symmetrical exit gating with `PENDING_LIQUIDITY` exposure preservation, mutual consistency across metadata flags, and complete removal of caller-controlled `validation_time` from all public execution and validation APIs.
 
 ---
 
@@ -27,16 +27,18 @@ The engine, strategy validator, and feature snapshot generator have been upgrade
 * **Root Cause:** `_handle_exit_signal()` only checked for missing execution timestamps, zero bids, and bids below slippage. Stale, locked, crossed, future-timestamped, timezone-ambiguous, or excessive-spread quotes were not evaluated before calculating fills and closing trades.
 * **Remediation:** `_handle_exit_signal()` now executes `_check_quote_execution_eligibility(..., is_exit=True)`. When an exit quote is ineligible, the open trade transitions to `PENDING_LIQUIDITY` (preserving in-memory active tracking and DB ledger exposure), records the exact rejection code, and creates zero fills, zero fees, and zero realized P&L.
 
-### Finding C — Clock Provenance and Separation
-* **Root Cause:** The engine conflated matching engine event time with validation clock time.
-* **Remediation:** 
-  1. `PaperExecutionEngine` accepts a pluggable clock callable (`clock: Optional[Callable[[], datetime]] = None`), defaulting safely to UTC wall time (`lambda: datetime.now(timezone.utc)`).
-  2. Public execution methods accept an explicit `validation_time: Optional[datetime] = None` for deterministic backtests and simulations.
-  3. Authoritative matching engine event time (`execution_time`) is preserved for transaction recording, while decision time is strictly isolated for quote age recalculation.
+### Finding C — Clock Provenance, Trust Boundary, and Public Bypass Closure
+* **Root Cause:** `PaperExecutionEngine.process_signal()` and `SignalValidator.validate_snapshot_eligibility()` accepted an optional caller-controlled `validation_time` parameter. A caller could supply an artificially historical timestamp to fool `get_decision_time()` or snapshot validation into evaluating an actually stale quote as fresh.
+* **Remediation & Clock Trust Boundary:**
+  1. The public `PaperExecutionEngine.process_signal()` API now rejects `validation_time` completely (`TypeError`). Normal runtime execution evaluates freshness strictly using the engine's trusted clock (`self.clock()`).
+  2. `PaperExecutionEngine` accepts a pluggable clock callable at construction (`clock: Optional[Callable[[], datetime]] = None`), defaulting securely to UTC wall time (`lambda: datetime.now(timezone.utc)`). Controlled clock injection on initialization or attribute assignment (`engine.clock = lambda: test_time`) preserves deterministic simulation and backtesting without exposing a bypass in the execution API.
+  3. Non-production test overrides for synthetic schedules are isolated in `_test_only_process_signal_with_override()`.
+  4. Public `SignalValidator.validate_snapshot_eligibility()` similarly removed `validation_time`; it validates freshness strictly against its trusted clock (`self.clock()`), which can be injected at initialization.
+  5. Authoritative matching engine event time (`execution_time`) is preserved for transaction recording, while decision time is strictly isolated for quote age recalculation.
 
 ### Finding D — Strategy Snapshot Validation Gaps
 * **Root Cause:** `SignalValidator.validate_snapshot_eligibility()` only verified `snapshot.is_stale`. Inconsistent snapshots (`is_stale=False` while `is_quote_fresh=False`, quote age > 3.0s, negative age, or timezone-naive timestamps) were not rejected.
-* **Remediation:** `SignalValidator` now validates `quote_age_seconds` (rejecting missing, negative, and >3.0s values), enforces metadata consistency (`is_stale` vs `is_quote_fresh`), fails closed on timezone-naive timestamps, and supports optional decision-time re-verification.
+* **Remediation:** `SignalValidator` validates `quote_age_seconds` (rejecting missing, negative, and >3.0s values), enforces metadata consistency (`is_stale` vs `is_quote_fresh`), fails closed on timezone-naive timestamps, and dynamically validates snapshot freshness against its trusted clock.
 
 ---
 
@@ -60,29 +62,33 @@ The engine, strategy validator, and feature snapshot generator have been upgrade
 ## 4. Exact Files Changed
 
 1. **`fno/execution/paper_engine.py`**:
-   - Added `clock: Optional[Callable[[], datetime]] = None` dependency injection and `get_decision_time()` helper.
-   - Added `validation_time: Optional[datetime] = None` parameter across `process_signal()`, `_test_only_process_signal_with_override()`, `_process_signal_internal()`, `_handle_buy_signal()`, and `_handle_exit_signal()`.
-   - Updated `_check_quote_execution_eligibility()` to recalculate quote age dynamically against the decision clock, fail closed on timezone-naive timestamps, and reject future timestamps.
-   - Symmetrically integrated quote eligibility checks into `_handle_exit_signal()` while preserving `PENDING_LIQUIDITY` and zero fee/P&L guarantees.
-   - Preserved `allow_default_schedule` isolation for explicit synthetic unit test helpers.
+   - Removed `validation_time` from public `process_signal()` signature, removing caller-controlled decision time bypass.
+   - Enforced `self.clock()` as authoritative decision time in `_process_signal_internal()`.
+   - Maintained `_test_only_process_signal_with_override()` for explicit synthetic test schedule overrides.
+   - Preserved dynamic recalculation of quote age against trusted clock, fail-closed timezone validation, and future timestamp rejection.
+   - Symmetrically integrated quote eligibility checks into `_handle_exit_signal()` with `PENDING_LIQUIDITY` and zero friction/P&L guarantees.
 2. **`fno/strategies/validator.py`**:
-   - Updated `SignalValidator.validate_snapshot_eligibility()` to reject missing, negative, and >3.0s quote ages.
-   - Enforced rejection of inconsistent freshness metadata (`is_stale=False` while `is_quote_fresh=False`).
-   - Added timezone-naive fail-closed rejection (`REJECTED_TIMEZONE_AMBIGUOUS`).
-   - Added optional decision-time re-verification against `validation_time`.
-3. **`fno/services/feature_engine.py`**:
+   - Added `clock: Optional[Callable[[], datetime]] = None` to `SignalValidator.__init__`.
+   - Removed `validation_time` from `validate_snapshot_eligibility()` public signature.
+   - Evaluates dynamic age against `self.clock()` with fail-closed timezone-naive and future timestamp rejection.
+   - Rejects missing, negative, and >3.0s quote ages, and inconsistent freshness metadata (`is_stale=False` while `is_quote_fresh=False`).
+3. **`fno/strategies/manager.py`**:
+   - Added `clock: Optional[Callable[[], datetime]] = None` to `StrategyManager.__init__`, propagating to `SignalValidator`.
+4. **`fno/services/feature_engine.py`**:
    - Updated `OptionFeatureEngine.construct_snapshot()` to detect negative time deltas, setting `exch_status = "FUTURE_SKEW_REJECTED"`, `is_fresh = False`, and `is_stale = True`.
    - Enforced strict mutual consistency: `is_stale` is synchronized with `not is_fresh`.
    - Handled timezone-naive datetimes defensively with `exch_status = "TIMEZONE_AMBIGUOUS_REJECTED"`.
-4. **`fno/tests/test_paper_execution.py`**:
+5. **`fno/tests/test_paper_execution.py`**:
    - Injected deterministic clock (`clock=lambda: self.now_utc`) in `setUp()`.
-   - Provided authentic `validation_time` in provenance isolation tests.
-   - Added `QuoteFreshnessGuardTestCase` covering threshold boundaries (0.0s, 3.0s, 3.001s), quotes aging after ingestion, future timestamps, timezone-naive datetimes, open exposure preservation in `PENDING_LIQUIDITY`, zero friction/P&L assertions, and exit microstructure rejections.
-5. **`fno/tests/test_strategy_engine.py`**:
-   - Added `exchange_timestamp_utc` to `self.snapshot_ce` in `setUp()`.
-   - Added regression test cases for inconsistent freshness metadata, quote ages exceeding 3.0s, negative quote age, missing quote age, and timezone-naive timestamps.
-6. **`fno/tests/test_feature_engine.py`**:
-   - Added regression tests for future exchange timestamp detection (`FUTURE_SKEW_REJECTED`) and quote aging after arrival.
+   - Updated timestamp provenance isolation tests to use controlled engine clock injection (`self.engine.clock = lambda: ...`) and call public `process_signal()`.
+   - Added regression test `test_public_process_signal_disallows_validation_time_bypass` verifying `TypeError` on caller bypass attempt.
+   - Added regression test `test_stale_quote_cannot_bypass_engine_trusted_clock` proving old quotes (>3.0s) cannot bypass the trusted clock.
+6. **`fno/tests/test_strategy_engine.py`**:
+   - Initialized `SignalValidator` with deterministic clock (`clock=lambda: self.dt_valid_utc`) in `setUp()`.
+   - Added regression test `test_validator_disallows_validation_time_bypass` verifying `TypeError` on caller bypass attempt.
+   - Added regression test `test_stale_snapshot_cannot_bypass_validator_trusted_clock` proving stale snapshots cannot bypass validator clock.
+7. **`fno/tests/test_feature_engine.py`**:
+   - Retained regression tests for future exchange timestamp detection (`FUTURE_SKEW_REJECTED`) and quote aging after arrival.
 
 ---
 
@@ -92,10 +98,10 @@ The engine, strategy validator, and feature snapshot generator have been upgrade
 
 | Test Suite / Command | Exit Code | Tests Run | Result | Evidence Notes |
 |---|---|---|---|---|
-| `venv/bin/python manage.py test fno.tests.test_paper_execution` | `0` | 38 | `PASS` | All 32 legacy tests + 6 new freshness guard tests passed. |
-| `venv/bin/python manage.py test fno.tests.test_strategy_engine` | `0` | 10 | `PASS` | All 6 legacy tests + 4 new snapshot freshness tests passed. |
+| `venv/bin/python manage.py test fno.tests.test_paper_execution` | `0` | 40 | `PASS` | All 32 legacy tests + 8 quote freshness & clock bypass regression tests passed. |
+| `venv/bin/python manage.py test fno.tests.test_strategy_engine` | `0` | 12 | `PASS` | All 6 legacy tests + 6 snapshot freshness & validator clock bypass tests passed. |
 | `venv/bin/python manage.py test fno.tests.test_feature_engine` | `0` | 14 | `PASS` | All 12 legacy tests + 2 new future skew/aging tests passed. |
-| `venv/bin/python manage.py test fno` | `0` | 109 | `PASS` | Full F&O suite passed (up from 97 baseline tests). |
+| `venv/bin/python manage.py test fno` | `0` | 113 | `PASS` | Full F&O suite passed (up from 97 baseline tests). |
 | `venv/bin/python manage.py test market.tests` | `0` | 298 | `PASS` | Full equity regression suite passed with zero regressions. |
 | `git diff --name-only market/normalizers/kite.py` | `0` | 0 lines | `PASS` | Confirmed zero edits to equity Kite normalizer. |
 | `venv/bin/python manage.py check` | `0` | N/A | `PASS` | System check identified no issues (0 silenced). |
@@ -106,13 +112,13 @@ The engine, strategy validator, and feature snapshot generator have been upgrade
 1. **Paper Execution Test Suite:**
    ```
    venv/bin/python manage.py test fno.tests.test_paper_execution
-   Ran 38 tests in 0.153s
+   Ran 40 tests in 0.192s
    OK
    ```
 2. **Strategy Engine Test Suite:**
    ```
    venv/bin/python manage.py test fno.tests.test_strategy_engine
-   Ran 10 tests in 0.004s
+   Ran 12 tests in 0.005s
    OK
    ```
 3. **Feature Engine Test Suite:**
@@ -124,13 +130,13 @@ The engine, strategy validator, and feature snapshot generator have been upgrade
 4. **Full F&O Suite:**
    ```
    venv/bin/python manage.py test fno
-   Ran 109 tests in 2.613s
+   Ran 113 tests in 2.773s
    OK
    ```
 5. **Equity Regression Suite:**
    ```
    venv/bin/python manage.py test market.tests
-   Ran 298 tests in 5.510s
+   Ran 298 tests in 6.508s
    OK
    ```
 6. **Django Check & Migration Verification:**
@@ -164,13 +170,14 @@ Explicit assertions verified in regression tests:
 | Criterion | Status | Evidence / Notes |
 |---|---|---|
 | Quote age independently checked at execution decision boundary | `PASS` | `_check_quote_execution_eligibility` computes `(decision_time - quote.exchange_timestamp_utc)`. |
+| Public validation-clock bypass closed; decision clock trusted and tamper-resistant | `PASS` | Removed `validation_time` from `process_signal()` and `validate_snapshot_eligibility()`; evaluated strictly against `self.clock()`. |
 | 3.0-second threshold applied symmetrically to entry and exit | `PASS` | Verified in `QuoteFreshnessGuardTestCase.test_fresh_quote_at_exact_threshold_boundary` and `test_stale_exit_rejected_preserves_unresolved_exposure`. |
 | Future, missing, invalid, and timezone-naive timestamps fail closed | `PASS` | Returns `REJECTED_FUTURE_TIMESTAMP`, `REJECTED_UNVERIFIED_TIMESTAMP`, `REJECTED_TIMEZONE_AMBIGUOUS`. |
 | Strategy snapshot validator rejects inconsistent freshness metadata | `PASS` | Verified in `test_signal_rejection_on_inconsistent_freshness_metadata`. |
 | Invalid/stale entry cannot create a fill, fee, or P&L | `PASS` | Verified in DB assertions in `test_quote_aging_after_ingestion_rejection`. |
 | Invalid/stale exit preserves unresolved exposure in `PENDING_LIQUIDITY` with 0 fill/fee/P&L | `PASS` | Verified in `test_stale_exit_rejected_preserves_unresolved_exposure`. |
 | Existing pending-liquidity, expiry, fee-schedule, and timestamp protections pass | `PASS` | Zero-bid, tiny-bid, cutoff, fee-schedule, and statutory tests all pass. |
-| Targeted and full F&O tests pass with command evidence | `PASS` | 109/109 tests passed (exit code 0). |
+| Targeted and full F&O tests pass with command evidence | `PASS` | 113/113 tests passed (exit code 0). |
 | Equity regression tests pass with command evidence | `PASS` | 298/298 tests passed (exit code 0); `market/normalizers/kite.py` untouched. |
 | Django check and migration dry-run pass | `PASS` | 0 issues; no migrations created. |
 | Remediation report written | `PASS` | `docs/audits/phase_22d_quote_freshness_guard_remediation_report.md` |

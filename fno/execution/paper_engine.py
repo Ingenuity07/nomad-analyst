@@ -221,13 +221,11 @@ class PaperExecutionEngine:
         market_regime: Optional[str] = None,
         vix_level: Optional[Decimal] = None,
         execution_wall_time: Optional[datetime] = None,
-        *,
-        validation_time: Optional[datetime] = None,
     ) -> Optional[PaperTradeEvent]:
         """
         Executes an incoming OptionSignal against the current quote state.
         Enforces strict statutory fee-schedule date validation, exchange timestamp verification,
-        and quote-freshness evaluation at the decision boundary.
+        and quote-freshness evaluation at the decision boundary using the engine's trusted clock.
         Returns a PaperTradeEvent reflecting the outcome.
         """
         return self._process_signal_internal(
@@ -237,7 +235,7 @@ class PaperExecutionEngine:
             vix_level=vix_level,
             execution_wall_time=execution_wall_time,
             allow_default_schedule=False,
-            validation_time=validation_time,
+            validation_time=None,
         )
 
     def _test_only_process_signal_with_override(

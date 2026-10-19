@@ -7,9 +7,9 @@ before signals can be forwarded to the paper execution engine.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from fno.services.feature_engine import OptionFeatureSnapshot
 from fno.strategies.base import OptionSignal
@@ -36,14 +36,17 @@ class SignalValidator:
     }
     ALLOWED_OPTION_TYPES = {"CE", "PE"}
 
+    def __init__(self, clock: Optional[Callable[[], datetime]] = None):
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
     def validate_snapshot_eligibility(
         self,
         snapshot: OptionFeatureSnapshot,
-        validation_time: Optional[datetime] = None,
     ) -> SignalValidationResult:
         """
         Validates feature snapshot before a strategy can use it for signal generation.
-        Enforces quote freshness, timestamp integrity, metadata consistency, and order-book health.
+        Enforces quote freshness, timestamp integrity, metadata consistency, and order-book health
+        using the validator's trusted clock.
         """
         if snapshot.is_partial_bar:
             return SignalValidationResult(
@@ -111,27 +114,27 @@ class SignalValidator:
                 rejection_reason="Inconsistent freshness metadata: is_quote_fresh is False while is_stale is False.",
             )
 
-        # Dynamic validation against validation_time clock if provided
-        if validation_time is not None:
-            if validation_time.tzinfo is None:
-                return SignalValidationResult(
-                    is_valid=False,
-                    rejection_code="REJECTED_TIMEZONE_AMBIGUOUS",
-                    rejection_reason="Validation time is timezone-naive.",
-                )
-            dynamic_age = Decimal(str(round((validation_time - snapshot.exchange_timestamp_utc).total_seconds(), 4)))
-            if dynamic_age < Decimal("0.0"):
-                return SignalValidationResult(
-                    is_valid=False,
-                    rejection_code="REJECTED_FUTURE_TIMESTAMP",
-                    rejection_reason=f"Exchange timestamp is in the future relative to validation time ({dynamic_age}s).",
-                )
-            if dynamic_age > Decimal("3.0"):
-                return SignalValidationResult(
-                    is_valid=False,
-                    rejection_code="REJECTED_STALE_QUOTE",
-                    rejection_reason=f"Quote age at validation time ({dynamic_age}s) exceeds 3.0s freshness limit.",
-                )
+        # Dynamic validation against validator's trusted clock
+        decision_time = self.clock()
+        if decision_time.tzinfo is None:
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_TIMEZONE_AMBIGUOUS",
+                rejection_reason="Validator clock is timezone-naive.",
+            )
+        dynamic_age = Decimal(str(round((decision_time - snapshot.exchange_timestamp_utc).total_seconds(), 4)))
+        if dynamic_age < Decimal("0.0"):
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_FUTURE_TIMESTAMP",
+                rejection_reason=f"Exchange timestamp is in the future relative to validator clock ({dynamic_age}s).",
+            )
+        if dynamic_age > Decimal("3.0"):
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_STALE_QUOTE",
+                rejection_reason=f"Quote age at evaluation ({dynamic_age}s) exceeds 3.0s freshness limit.",
+            )
 
         if snapshot.is_locked:
             return SignalValidationResult(
