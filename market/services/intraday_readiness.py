@@ -205,17 +205,38 @@ class IntradayReadinessService:
             f"<= {MAX_DATA_GAPS_LAST_SESSION}."
         )
 
-        # ── Check 5: Technical features exist ────────────────────────────────
-        has_features = TechnicalFeature.objects.filter(
-            instrument=instrument,
-            timeframe=timeframe,
-            timestamp__lte=as_of,
-        ).exists()
+        # ── Check 5: Intraday indicator computability & OHLCV integrity ──────
+        # Intraday strategies calculate technical features dynamically in-memory from
+        # raw OHLCVBar series (via compute_intraday_indicators), rather than persisting
+        # or querying offline TechnicalFeature database rows.
+        # This gate validates the actual strategy inputs: that recent warmup bars have
+        # non-null, valid numeric OHLCV relationships and that intraday indicators
+        # can be computed deterministically without calculation or convergence errors.
+        warmup_bars = list(
+            OHLCVBar.objects.filter(
+                instrument=instrument,
+                timeframe=timeframe,
+                timestamp__lte=as_of,
+            )
+            .order_by("-timestamp")[:min_bars]
+        )
+        warmup_bars.reverse()
 
-        if not has_features:
+        integrity_error = None
+        for b in warmup_bars:
+            if b.open is None or b.high is None or b.low is None or b.close is None or b.volume is None:
+                integrity_error = f"Null OHLCV value at {b.timestamp.isoformat()}"
+                break
+            if b.open <= 0 or b.high <= 0 or b.low <= 0 or b.close <= 0 or b.volume < 0:
+                integrity_error = f"Non-positive price or negative volume at {b.timestamp.isoformat()}"
+                break
+            if b.low > b.high or b.open > b.high or b.close > b.high or b.open < b.low or b.close < b.low:
+                integrity_error = f"OHLC boundary violation at {b.timestamp.isoformat()}"
+                break
+
+        if integrity_error:
             checks_failed.append(
-                f"No technical features found for {instrument.symbol} [{timeframe}] "
-                f"at or before {as_of.isoformat()}. Run feature calculation first."
+                f"Data integrity error in warmup bars for {instrument.symbol} [{timeframe}]: {integrity_error}"
             )
             return ReadinessResult(
                 is_ready=False,
@@ -226,7 +247,40 @@ class IntradayReadinessService:
                 checks_passed=checks_passed,
                 checks_failed=checks_failed,
             )
-        checks_passed.append(f"Technical features exist for {timeframe}.")
+
+        try:
+            from market.services.intraday_indicators import compute_intraday_indicators
+            from market.services.market_session import IST
+            session_date = as_of.astimezone(IST).date()
+            indicators = compute_intraday_indicators(warmup_bars, session_date)
+            if indicators.close is None or indicators.ema_fast is None or indicators.atr is None:
+                checks_failed.append(
+                    f"Intraday indicators failed to compute for {instrument.symbol} [{timeframe}]."
+                )
+                return ReadinessResult(
+                    is_ready=False,
+                    reason=checks_failed[-1],
+                    quality=quality,
+                    bar_count=bar_count,
+                    required_bars=min_bars,
+                    checks_passed=checks_passed,
+                    checks_failed=checks_failed,
+                )
+        except Exception as e:
+            checks_failed.append(
+                f"Intraday indicator computation error for {instrument.symbol} [{timeframe}]: {e}"
+            )
+            return ReadinessResult(
+                is_ready=False,
+                reason=checks_failed[-1],
+                quality=quality,
+                bar_count=bar_count,
+                required_bars=min_bars,
+                checks_passed=checks_passed,
+                checks_failed=checks_failed,
+            )
+
+        checks_passed.append(f"Intraday indicators computable from {len(warmup_bars)} warmup bars.")
 
         # ── All checks passed ─────────────────────────────────────────────────
         reason = (

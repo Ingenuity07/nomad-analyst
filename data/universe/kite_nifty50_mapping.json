@@ -1,13 +1,13 @@
 {
   "metadata": {
-    "generated_at": "2026-09-07T07:43:26.243585+00:00",
+    "generated_at": "2026-10-18T04:46:14.191881+00:00",
     "provider": "Zerodha Kite Connect",
     "master_source": "https://api.kite.trade/instruments",
     "nifty50_constituents_total": 50,
     "nifty50_mapped_count": 50,
     "nifty50_unmapped_count": 0,
-    "benchmarks_total": 4,
-    "benchmarks_mapped_count": 4,
+    "benchmarks_total": 2,
+    "benchmarks_mapped_count": 2,
     "coverage_percent": 100.0
   },
   "benchmarks": [
@@ -26,26 +26,6 @@
       "benchmark_name": "NIFTY Bank Index",
       "kite_tradingsymbol": "NIFTY BANK",
       "kite_instrument_token": 260105,
-      "exchange": "NSE",
-      "segment": "INDICES",
-      "instrument_type": "EQ",
-      "status": "VALID"
-    },
-    {
-      "nomad_symbol": "^BSESN",
-      "benchmark_name": "S&P BSE SENSEX",
-      "kite_tradingsymbol": "SENSEX",
-      "kite_instrument_token": 265,
-      "exchange": "BSE",
-      "segment": "INDICES",
-      "instrument_type": "EQ",
-      "status": "VALID"
-    },
-    {
-      "nomad_symbol": "^CNXIT",
-      "benchmark_name": "NIFTY IT Index",
-      "kite_tradingsymbol": "NIFTY IT",
-      "kite_instrument_token": 259849,
       "exchange": "NSE",
       "segment": "INDICES",
       "instrument_type": "EQ",

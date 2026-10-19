@@ -440,6 +440,8 @@ class IntradayStateManager:
                 index_regimes={
                     "nifty": context["nifty"],
                     "banknifty": context["banknifty"],
+                    "sensex": context.get("sensex"),
+                    "nifty_it": context.get("nifty_it"),
                     "regime": context["market_regime"],
                     "confidence": context["regime_confidence"],
                     "reasons": context["regime_reasons"],

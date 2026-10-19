@@ -213,8 +213,9 @@ def compute_intraday_indicators(
 
     # ── VWAP — session-anchored ────────────────────────────────────────────────
     # Filter bars that belong to this session_date only (in IST)
-    from market.services.market_session import IndianMarketSession
+    # Ensure VWAP uses only valid regular-session bars (09:15 IST <= time < 15:30 IST)
     from market.services.market_session import IST
+    from market.services.trading_session import REGULAR_SESSION_START, REGULAR_SESSION_END
 
     session_bars = []
     for b in bars:
@@ -223,7 +224,9 @@ def compute_intraday_indicators(
             bar_ts = bar_ts.replace(tzinfo=timezone.utc)
         bar_ist = bar_ts.astimezone(IST)
         if bar_ist.date() == session_date:
-            session_bars.append(b)
+            bar_time = bar_ist.time()
+            if REGULAR_SESSION_START <= bar_time < REGULAR_SESSION_END:
+                session_bars.append(b)
 
     if session_bars:
         typical_prices = np.array(

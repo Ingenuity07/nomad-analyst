@@ -675,8 +675,12 @@ class IntradayMarketContextEngine:
         # Extract index states
         nifty_state = index_states.get("NIFTY") or index_states.get("^NSEI") or {}
         banknifty_state = index_states.get("BANKNIFTY") or index_states.get("^NSEBANK") or {}
+        sensex_state = index_states.get("SENSEX") or index_states.get("^BSESN") or {}
+        nifty_it_state = index_states.get("NIFTYIT") or index_states.get("^CNXIT") or {}
         nifty_ret = Decimal(str(nifty_state.get("change_percent") or nifty_state.get("change_pct", 0) or 0))
         banknifty_ret = Decimal(str(banknifty_state.get("change_percent") or banknifty_state.get("change_pct", 0) or 0))
+        sensex_ret = Decimal(str(sensex_state.get("change_percent") or sensex_state.get("change_pct", 0) or 0))
+        nifty_it_ret = Decimal(str(nifty_it_state.get("change_percent") or nifty_it_state.get("change_pct", 0) or 0))
 
         # 1. Breadth
         breadth = cls.calculate_market_breadth(constituent_states)
@@ -746,6 +750,28 @@ class IntradayMarketContextEngine:
                 "low": float(banknifty_state.get("low", 0) or 0),
                 "vwap": float(banknifty_state.get("vwap") or banknifty_state.get("average_price") or 0) or None,
             },
+            "sensex": {
+                "symbol": "^BSESN",
+                "name": "S&P BSE SENSEX",
+                "price": float(sensex_state.get("last_price", 0) or 0),
+                "change": float(sensex_state.get("change", 0) or 0),
+                "change_percent": float(sensex_ret),
+                "open": float(sensex_state.get("open", 0) or 0),
+                "high": float(sensex_state.get("high", 0) or 0),
+                "low": float(sensex_state.get("low", 0) or 0),
+                "vwap": float(sensex_state.get("vwap") or sensex_state.get("average_price") or 0) or None,
+            } if sensex_state else None,
+            "nifty_it": {
+                "symbol": "^CNXIT",
+                "name": "NIFTY IT",
+                "price": float(nifty_it_state.get("last_price", 0) or 0),
+                "change": float(nifty_it_state.get("change", 0) or 0),
+                "change_percent": float(nifty_it_ret),
+                "open": float(nifty_it_state.get("open", 0) or 0),
+                "high": float(nifty_it_state.get("high", 0) or 0),
+                "low": float(nifty_it_state.get("low", 0) or 0),
+                "vwap": float(nifty_it_state.get("vwap") or nifty_it_state.get("average_price") or 0) or None,
+            } if nifty_it_state else None,
             "breadth": breadth,
             "sectors": sector_strengths,
             "sector_leader": sector_leader,

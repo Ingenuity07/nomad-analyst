@@ -135,20 +135,30 @@ class KiteNormalizer(BaseNormalizer):
         )
 
     @staticmethod
-    def normalize_candle(raw_candle: List[Any], symbol: str, timeframe: str = "1d") -> Dict[str, Any]:
+    def normalize_candle(raw_candle: Any, symbol: str, timeframe: str = "1d") -> Dict[str, Any]:
         """
         Normalizes a Kite historical candle item:
-        Format: [timestamp, open, high, low, close, volume, (oi)]
+        Supports either dict format: {'date': dt, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v}
+        or list format: [timestamp, open, high, low, close, volume, (oi)]
         
         Validates OHLC constraints:
         - high >= max(open, close)
         - low <= min(open, close)
         - volume >= 0
         """
-        if len(raw_candle) < 6:
-            raise InvalidPayloadError(f"Malformed candle for {symbol}: length {len(raw_candle)} < 6")
-
-        raw_ts, open_val, high_val, low_val, close_val, vol = raw_candle[:6]
+        if isinstance(raw_candle, dict):
+            raw_ts = raw_candle.get("date") or raw_candle.get("timestamp")
+            open_val = raw_candle.get("open")
+            high_val = raw_candle.get("high")
+            low_val = raw_candle.get("low")
+            close_val = raw_candle.get("close")
+            vol = raw_candle.get("volume", 0)
+        elif isinstance(raw_candle, (list, tuple)):
+            if len(raw_candle) < 6:
+                raise InvalidPayloadError(f"Malformed candle for {symbol}: length {len(raw_candle)} < 6")
+            raw_ts, open_val, high_val, low_val, close_val, vol = raw_candle[:6]
+        else:
+            raise InvalidPayloadError(f"Unexpected candle format for {symbol}: {type(raw_candle)}")
 
         # Timestamp normalization to IST
         if isinstance(raw_ts, datetime):

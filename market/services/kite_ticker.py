@@ -41,12 +41,14 @@ class KiteTickerManager:
         on_tick_callback: Optional[Callable[[NomadMarketTick], None]] = None,
         update_db_snapshot: bool = True,
         ticker_client: Optional[Any] = None,
+        fno_consumer: Optional[Any] = None,
     ):
         from market.services.kite_auth import KiteCredentialService
         self.api_key = api_key or KiteCredentialService.get_api_key()
         self.access_token = access_token or KiteCredentialService.get_valid_access_token()
         self.on_tick_callback = on_tick_callback
         self.update_db_snapshot = update_db_snapshot
+        self.fno_consumer = fno_consumer
 
         self.kws = ticker_client
         self.is_connected = False
@@ -54,6 +56,7 @@ class KiteTickerManager:
         self.subscribed_tokens: List[int] = []
         self._stop_requested = False
         self._worker_thread: Optional[threading.Thread] = None
+        self._connect_lock = threading.Lock()
 
         # Statistics
         self.stats = {
@@ -91,15 +94,40 @@ class KiteTickerManager:
             logger.info(f"KiteTicker: Resubscribing to {len(self.subscribed_tokens)} tokens...")
             ws.subscribe(self.subscribed_tokens)
             ws.set_mode(ws.MODE_FULL, self.subscribed_tokens)
+        if self.fno_consumer:
+            try:
+                self.fno_consumer.on_connect(ws)
+            except Exception as e:
+                logger.error(f"KiteTicker: Error in fno_consumer.on_connect: {e}", exc_info=True)
 
     def _on_ticks(self, ws, ticks: List[Dict[str, Any]]):
         received_at = datetime.now(timezone.utc)
         from django.core.cache import cache
 
         for raw_tick in ticks:
+            # 0. Route F&O derivative contracts strictly to isolated FnoTickerConsumer
+            token = raw_tick.get("instrument_token") if isinstance(raw_tick, dict) else None
+            if self.fno_consumer and token and self.fno_consumer.is_fno_token(token):
+                try:
+                    self.fno_consumer.on_tick(raw_tick, ws=ws, received_wall_clock_utc=received_at)
+                except Exception as ex:
+                    logger.error(f"KiteTicker: Error in fno_consumer.on_tick for token {token}: {ex}", exc_info=True)
+                continue
+
             try:
                 self.stats["ticks_received"] += 1
                 norm_tick = KiteNormalizer.normalize_tick(raw_tick, received_at=received_at)
+
+                # Update F&O consumer underlying spot price if benchmark index ticks
+                if self.fno_consumer and norm_tick.symbol in ("^NSEI", "NIFTY 50", "NIFTY"):
+                    try:
+                        self.fno_consumer.on_underlying_spot_update(
+                            norm_tick.last_price,
+                            ws=ws,
+                            as_of_datetime=norm_tick.exchange_timestamp or received_at
+                        )
+                    except Exception as ex:
+                        logger.debug(f"KiteTicker: Updating FNO underlying spot failed: {ex}")
 
                 # 1. Update in-memory / Redis cache live state
                 cache_payload = {
@@ -140,6 +168,17 @@ class KiteTickerManager:
     def _on_close(self, ws, code, reason):
         logger.warning(f"KiteTicker: Connection closed (code: {code}, reason: {reason})")
         self.is_connected = False
+        if self.fno_consumer:
+            if hasattr(self.fno_consumer, "on_disconnect"):
+                try:
+                    self.fno_consumer.on_disconnect(code=code, reason=reason)
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: notifying fno_consumer of disconnect failed: {ex}")
+            elif hasattr(self.fno_consumer, "bar_aggregator") and hasattr(self.fno_consumer.bar_aggregator, "mark_partial_bars"):
+                try:
+                    self.fno_consumer.bar_aggregator.mark_partial_bars()
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: marking partial bars on disconnect failed: {ex}")
 
     def _on_error(self, ws, code, reason):
         if self._stop_requested:
@@ -152,10 +191,37 @@ class KiteTickerManager:
         logger.info(f"KiteTicker: Reconnecting attempt {attempts_count}...")
         self.reconnect_count += 1
         self.stats["reconnects"] += 1
+        if self.fno_consumer:
+            if hasattr(self.fno_consumer, "on_reconnect"):
+                try:
+                    self.fno_consumer.on_reconnect(attempts_count=attempts_count)
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: notifying fno_consumer of reconnect failed: {ex}")
+            elif hasattr(self.fno_consumer, "on_disconnect"):
+                try:
+                    self.fno_consumer.on_disconnect(code=None, reason=f"Reconnecting attempt {attempts_count}")
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: notifying fno_consumer of reconnect failed: {ex}")
+            elif hasattr(self.fno_consumer, "bar_aggregator") and hasattr(self.fno_consumer.bar_aggregator, "mark_partial_bars"):
+                try:
+                    self.fno_consumer.bar_aggregator.mark_partial_bars()
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: marking partial bars on reconnect failed: {ex}")
 
     def _on_noreconnect(self, ws):
         logger.error("KiteTicker: Maximum reconnection attempts exhausted.")
         self.is_connected = False
+        if self.fno_consumer:
+            if hasattr(self.fno_consumer, "on_disconnect"):
+                try:
+                    self.fno_consumer.on_disconnect(code=None, reason="Max reconnection attempts exhausted")
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: notifying fno_consumer of disconnect failed: {ex}")
+            elif hasattr(self.fno_consumer, "bar_aggregator") and hasattr(self.fno_consumer.bar_aggregator, "mark_partial_bars"):
+                try:
+                    self.fno_consumer.bar_aggregator.mark_partial_bars()
+                except Exception as ex:
+                    logger.debug(f"KiteTicker: marking partial bars failed: {ex}")
 
     def subscribe(self, tokens: List[int], mode: str = "full"):
         """
@@ -203,24 +269,73 @@ class KiteTickerManager:
             logger.error(f"KiteTicker connect failed: {e}")
             self.is_connected = False
 
+    def reconnect(self) -> bool:
+        """
+        Safely reconnects the WebSocket client.
+        Guards against duplicate connections. Preserves subscribed tokens.
+        """
+        with self._connect_lock:
+            if self.is_connected:
+                logger.info("KiteTickerManager: Already connected. Reconnect skipped.")
+                return True
+
+            logger.info("KiteTickerManager: Initiating safe reconnection...")
+            if self.fno_consumer:
+                if hasattr(self.fno_consumer, "on_disconnect"):
+                    try:
+                        self.fno_consumer.on_disconnect(code=None, reason="Reconnection initiated by manager")
+                    except Exception as ex:
+                        logger.debug(f"KiteTicker: notifying fno_consumer of reconnect failed: {ex}")
+                elif hasattr(self.fno_consumer, "bar_aggregator") and hasattr(self.fno_consumer.bar_aggregator, "mark_partial_bars"):
+                    try:
+                        self.fno_consumer.bar_aggregator.mark_partial_bars()
+                    except Exception as ex:
+                        logger.debug(f"KiteTicker: marking partial bars on reconnect failed: {ex}")
+
+            if self.kws:
+                try:
+                    self.kws.close()
+                except Exception as ex:
+                    logger.debug(f"Error closing existing kws: {ex}")
+                self.kws = None
+
+            try:
+                tokens_to_restore = list(self.subscribed_tokens)
+                self._init_kws()
+                if hasattr(self.kws, "connect"):
+                    self.kws.connect(threaded=True)
+                elif self._worker_thread is None or not self._worker_thread.is_alive():
+                    self._worker_thread = threading.Thread(target=self._run, daemon=True)
+                    self._worker_thread.start()
+
+                logger.info(
+                    f"KiteTickerManager: Reconnect initiated with {len(tokens_to_restore)} tokens preserved."
+                )
+                return True
+            except Exception as e:
+                logger.error(f"KiteTickerManager: Reconnection attempt failed: {e}")
+                self.is_connected = False
+                return False
+
     def stop(self):
         """
         Gracefully closes the WebSocket connection and terminates worker thread.
         """
         logger.info("KiteTicker: Graceful shutdown initiated.")
         self._stop_requested = True
-        if self.kws and hasattr(self.kws, "close"):
-            try:
-                self.kws.close()
-            except Exception as e:
-                logger.warning(f"Error during KiteTicker close: {e}")
+        with self._connect_lock:
+            if self.kws and hasattr(self.kws, "close"):
+                try:
+                    self.kws.close()
+                except Exception as e:
+                    logger.warning(f"Error during KiteTicker close: {e}")
 
-        self.is_connected = False
-        if hasattr(self.kws, "websocket_thread") and self.kws.websocket_thread and self.kws.websocket_thread.is_alive():
-            self.kws.websocket_thread.join(timeout=3.0)
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=3.0)
-        logger.info("KiteTicker: Shutdown complete.")
+            self.is_connected = False
+            if hasattr(self.kws, "websocket_thread") and self.kws.websocket_thread and self.kws.websocket_thread.is_alive():
+                self.kws.websocket_thread.join(timeout=3.0)
+            if self._worker_thread and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=3.0)
+            logger.info("KiteTicker: Shutdown complete.")
 
     def update_market_snapshot(self, tick: NomadMarketTick):
         """

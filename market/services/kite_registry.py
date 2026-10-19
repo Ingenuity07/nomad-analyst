@@ -176,6 +176,10 @@ class KiteInstrumentRegistry:
         if (meta["tradingsymbol"] == "NIFTY IT" or token == 259849) and meta["segment"] == "INDICES":
             return "^CNXIT"
 
+        # Reverse mapping for Tata Motors corporate action / demerger
+        if meta["tradingsymbol"] == "TMPV" or token == cls.get_token("TATAMOTORS"):
+            return "TATAMOTORS"
+
         return meta["tradingsymbol"]
 
     @classmethod

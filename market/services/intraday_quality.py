@@ -168,7 +168,7 @@ def get_data_quality(
     if expected_timestamp is not None:
         lag_seconds = (expected_timestamp - latest_ts).total_seconds()
 
-    # ── Compute session completeness ─────────────────────────────────────────
+    # ── Compute session completeness & last session gaps ──────────────────────
     completeness_pct: Optional[float] = None
     data_gaps_count = 0
 
@@ -177,8 +177,21 @@ def get_data_quality(
     assessment_end = latest_ts
 
     if assessment_start <= assessment_end:
-        gap_report = detect_gaps(instrument, timeframe, assessment_start, assessment_end)
-        data_gaps_count = gap_report.data_gap_count
+        # Evaluate data gaps specifically for the most recent trading session
+        last_session_date = session.session_date_for_bar(latest_ts)
+        if last_session_date is None:
+            last_session_date = session.to_ist(latest_ts).date()
+            if not session.is_trading_day(last_session_date):
+                last_session_date = session.previous_trading_day(last_session_date)
+
+        session_start_utc = session.session_open_utc(last_session_date)
+        session_end_utc = min(latest_ts, session.session_close_utc(last_session_date))
+        if session_start_utc <= session_end_utc:
+            gap_report = detect_gaps(instrument, timeframe, session_start_utc, session_end_utc)
+            data_gaps_count = gap_report.data_gap_count
+        else:
+            gap_report = detect_gaps(instrument, timeframe, assessment_start, assessment_end)
+            data_gaps_count = gap_report.data_gap_count
 
         # Completeness = actual / expected bars in that window
         expected_count = (

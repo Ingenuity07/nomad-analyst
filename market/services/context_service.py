@@ -541,6 +541,8 @@ class MarketContextService:
         # Calculate Regimes
         nifty_regime = self.calculate_market_regime("^NSEI", dt_as_of)
         bank_regime = self.calculate_market_regime("^NSEBANK", dt_as_of)
+        sensex_regime = self.calculate_market_regime("^BSESN", dt_as_of)
+        it_regime = self.calculate_market_regime("^CNXIT", dt_as_of)
         
         # Calculate Breadth
         breadth = self.calculate_market_breadth(universe, dt_as_of)
@@ -566,10 +568,14 @@ class MarketContextService:
             elif v.get("stale"):
                 stale_keys.append(k)
                 
-        for index in ("^NSEI", "^NSEBANK"):
+        for index in ("^NSEI", "^NSEBANK", "^BSESN", "^CNXIT"):
             if index == "^NSEI" and nifty_regime.get("status") != "active":
                 missing_keys.append(index)
-            if index == "^NSEBANK" and bank_regime.get("status") != "active":
+            elif index == "^NSEBANK" and bank_regime.get("status") != "active":
+                missing_keys.append(index)
+            elif index == "^BSESN" and sensex_regime.get("status") != "active":
+                missing_keys.append(index)
+            elif index == "^CNXIT" and it_regime.get("status") != "active":
                 missing_keys.append(index)
 
         quality_score = 100
@@ -590,7 +596,9 @@ class MarketContextService:
             "universe": universe,
             "index_regimes": {
                 "^NSEI": nifty_regime,
-                "^NSEBANK": bank_regime
+                "^NSEBANK": bank_regime,
+                "^BSESN": sensex_regime,
+                "^CNXIT": it_regime,
             },
             "breadth": breadth,
             "sector_rankings": sectors,

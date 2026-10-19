@@ -102,14 +102,8 @@ class IntradaySignalEngine:
             return self._not_ready_draft(instrument, timeframe, dt_as_of,
                                          f"INTRADAY NOT_READY [{timeframe}]: {readiness.reason}")
 
-        # ── Load intraday bars (PIT-safe, bounded lookback) ───────────────────
-        # Load last 200 bars, all with timestamp <= as_of
-        bars = list(OHLCVBar.objects.filter(
-            instrument=instrument,
-            timeframe=timeframe,
-            timestamp__lte=dt_as_of,
-        ).order_by("-timestamp")[:200])
-        bars.reverse()  # oldest-first
+        # ── Load authoritative completed intraday bars (PIT-safe, boundary-aligned) ──
+        bars = self._load_completed_bars(instrument, timeframe, dt_as_of, lookback=200)
 
         min_bars = MIN_BARS_FOR_ANALYSIS.get(timeframe, 30)
         if len(bars) < min_bars:
@@ -123,11 +117,15 @@ class IntradaySignalEngine:
         close = float(latest_bar.close)
 
         # ── Gate 2: Stale data check ──────────────────────────────────────────
-        bar_age_minutes = (dt_as_of - latest_bar.timestamp).total_seconds() / 60
-        if bar_age_minutes > 10:
+        from market.services.market_session import INTRADAY_TIMEFRAME_MINUTES
+        interval_min = INTRADAY_TIMEFRAME_MINUTES.get(timeframe, 5)
+        bar_completion_time = latest_bar.timestamp + timedelta(minutes=interval_min)
+        completion_lag_minutes = (dt_as_of - bar_completion_time).total_seconds() / 60
+        max_allowed_lag = max(10, interval_min * 2)
+        if completion_lag_minutes > max_allowed_lag:
             return self._no_action_draft(
                 instrument, timeframe, dt_as_of,
-                f"Latest intraday bar is {bar_age_minutes:.0f} minutes old (stale data)",
+                f"Latest completed intraday bar is {completion_lag_minutes:.0f} minutes late (stale data)",
                 {}, {}, {"status": "STALE"}
             )
 
@@ -357,21 +355,110 @@ class IntradaySignalEngine:
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
+    def _load_completed_bars(
+        self,
+        instrument,
+        timeframe: str,
+        as_of: datetime,
+        lookback: int = 200,
+    ) -> List[Any]:
+        """
+        Loads authoritative, canonical completed intraday bars strictly up to as_of.
+
+        Guarantees:
+        1. PIT-Safety: Only completed bars are returned. A candle starting at T_start
+           covering duration Delta_T is completed if and only if T_start + Delta_T <= as_of.
+        2. Boundary Alignment: Only bars with second=0, microsecond=0, and aligned
+           to the canonical session grid in Asia/Kolkata (IST) are accepted. Unaligned
+           interim ticks (e.g. from Yahoo Finance polling) are rejected.
+        3. Source Precedence: If multiple records exist for the same timestamp,
+           NomadAggregator takes precedence over KiteHistoricalProvider, which takes
+           precedence over YFinanceMarketProvider.
+        4. Zero-Volume Preservation: Legitimate zero-volume bars (e.g. indices or illiquid periods)
+           are preserved; records are never discarded solely for volume == 0.
+        """
+        from market.models import OHLCVBar
+        from market.services.market_session import INTRADAY_TIMEFRAME_MINUTES
+        from zoneinfo import ZoneInfo
+        from datetime import time, timedelta
+
+        ist = ZoneInfo("Asia/Kolkata")
+        interval_minutes = INTRADAY_TIMEFRAME_MINUTES.get(timeframe, 5)
+        delta_t = timedelta(minutes=interval_minutes)
+
+        # Cutoff: maximum start timestamp for a candle that has completed by as_of
+        max_completed_start = as_of - delta_t
+
+        # Fetch recent candidate bars up to cutoff (with buffer for lookback)
+        raw_bars = list(
+            OHLCVBar.objects.filter(
+                instrument=instrument,
+                timeframe=timeframe,
+                timestamp__lte=max_completed_start,
+            ).order_by("-timestamp")[: lookback * 2]
+        )
+
+        if not raw_bars:
+            return []
+
+        # Source precedence ranking (lower rank number = higher precedence)
+        source_rank = {
+            "NomadAggregator": 1,
+            "KiteHistoricalProvider": 2,
+            "KiteHistorical": 2,
+            "YFinanceMarketProvider": 3,
+            "YahooFinance": 3,
+        }
+
+        # Filter for boundary alignment and deduplicate by timestamp with source precedence
+        selected_by_ts: Dict[Any, Any] = {}
+
+        for b in raw_bars:
+            b_ist = b.timestamp.astimezone(ist)
+
+            # Check regular session trading window in IST (09:15 to 15:30)
+            # Strictly reject pre-open (< 09:15) and post-market / closing auction (>= 15:30) bars.
+            b_time = b_ist.time()
+            if b_time < time(9, 15) or b_time >= time(15, 30):
+                continue
+
+            # Check boundary alignment: second == 0, microsecond == 0
+            if b_ist.second != 0 or b_ist.microsecond != 0:
+                continue
+
+            # Check session interval alignment in IST
+            # NSE trading starts at 09:15. Check that minute aligns with interval:
+            # (minute - 15) % interval == 0
+            if (b_ist.minute - 15) % interval_minutes != 0:
+                continue
+
+            # Candidate is valid and completed. Check source precedence:
+            rank = source_rank.get(b.source, 4)
+            ts = b.timestamp
+
+            if ts not in selected_by_ts:
+                selected_by_ts[ts] = (rank, b)
+            else:
+                existing_rank, _ = selected_by_ts[ts]
+                if rank < existing_rank:
+                    selected_by_ts[ts] = (rank, b)
+
+        # Extract bars sorted chronologically (oldest to newest)
+        sorted_timestamps = sorted(selected_by_ts.keys())
+        sorted_timestamps = sorted_timestamps[-lookback:]
+        completed_bars = [selected_by_ts[ts][1] for ts in sorted_timestamps]
+
+        return completed_bars
+
     def _load_index_bars(self, as_of, timeframe, stock_bars):
-        """Try to load NIFTY 5m bars for relative strength computation."""
+        """Try to load NIFTY index bars for relative strength computation using completed bar selection."""
         try:
-            from market.models import OHLCVBar, Instrument
+            from market.models import Instrument
             nifty = Instrument.objects.filter(symbol="^NSEI").first()
             if not nifty:
                 return None
-            lookback = min(25, len(stock_bars))
-            start_ts = stock_bars[-lookback].timestamp if stock_bars else as_of
-            index_bars = list(OHLCVBar.objects.filter(
-                instrument=nifty,
-                timeframe=timeframe,
-                timestamp__gte=start_ts,
-                timestamp__lte=as_of,
-            ).order_by("timestamp"))
+            lookback = min(50, len(stock_bars) + 10) if stock_bars else 50
+            index_bars = self._load_completed_bars(nifty, timeframe, as_of, lookback=lookback)
             return index_bars or None
         except Exception:
             return None

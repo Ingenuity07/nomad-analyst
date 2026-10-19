@@ -132,6 +132,11 @@ class IntradayBarAggregator:
         elif tick.last_traded_quantity is not None and tick.last_traded_quantity > 0:
             volume_delta = tick.last_traded_quantity
 
+        # Gate: Reject ticks outside regular NSE equity market hours (09:15-15:30 IST on trading days)
+        # Prevents pre-open auction prices (09:08-09:12 IST) from contaminating regular continuous OHLCV candles
+        if not TradingSessionService.is_trading_timestamp(tick_time):
+            return {}
+
         updated_bars = {}
 
         for tf in self.TIMEFRAMES:

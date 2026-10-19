@@ -335,30 +335,20 @@ def run_intraday_strategy_scan():
         logger.warning("run_intraday_strategy_scan: no active equity instruments found.")
         return {"status": "NO_INSTRUMENTS"}
 
-    results = {"total": len(instruments), "actionable": 0, "skipped": 0, "failed": 0}
+    results = {"total": len(instruments), "actionable": 0, "skipped": 0, "failed": 0, "skip_reasons": {}}
 
     for inst in instruments:
         try:
             draft = engine.generate_recommendation(inst, timeframe=timeframe, as_of=now)
 
             if draft.signal in (SignalDirection.BUY.value, SignalDirection.SELL.value):
-                # Persist actionable recommendation
-                rec = svc.generate_and_save(inst, draft.horizon, as_of=now)
-                # Apply intraday extras if present
-                extras = getattr(draft, "_intraday_extras", {})
-                if extras and rec:
-                    from market.models import StockRecommendation
-                    StockRecommendation.objects.filter(pk=rec.pk).update(
-                        timeframe=extras.get("timeframe"),
-                        target_2_price=extras.get("target_2_price"),
-                        target_2_method=extras.get("target_2_method"),
-                        session_window=extras.get("session_window"),
-                        strategy_version=extras.get("strategy_version"),
-                        expires_at=extras.get("expires_at"),
-                    )
+                # Persist actionable recommendation directly with all intraday fields intact
+                rec = svc.save_draft(draft, instrument=inst)
                 results["actionable"] += 1
             else:
                 results["skipped"] += 1
+                reason = draft.invalidation_reason or draft.signal or "NO_ACTION"
+                results["skip_reasons"][reason] = results["skip_reasons"].get(reason, 0) + 1
 
         except Exception as e:
             logger.error(f"run_intraday_strategy_scan: failed for {inst.symbol}: {e}")

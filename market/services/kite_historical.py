@@ -12,7 +12,7 @@ Enforces:
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Dict, Any, List, Optional
 from django.db import transaction
 from django.utils import timezone
@@ -20,7 +20,11 @@ from django.utils import timezone
 from market.models import Instrument, OHLCVBar
 from market.providers.kite import KiteMarketDataProvider
 from market.normalizers.kite import KiteNormalizer
-from market.services.trading_session import TradingSessionService
+from market.services.trading_session import (
+    TradingSessionService,
+    REGULAR_SESSION_START,
+    REGULAR_SESSION_END,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,11 @@ class KiteHistoricalIngestionService:
         for item in raw_candles:
             try:
                 bar_dict = KiteNormalizer.normalize_candle(item, symbol, timeframe=timeframe)
+                # Gate out pre-open (< 09:15:00 IST) and post-market (>= 15:30:00 IST) bars for intraday timeframes
+                if timeframe not in ("1d", "day"):
+                    bar_time = TradingSessionService.to_ist(bar_dict["timestamp"]).time()
+                    if bar_time < REGULAR_SESSION_START or bar_time >= REGULAR_SESSION_END:
+                        continue
                 normalized_bars.append(bar_dict)
                 timestamps.append(bar_dict["timestamp"])
             except Exception as e:

@@ -54,21 +54,19 @@ class RecommendationService:
 
     # ── Single instrument ──────────────────────────────────────────────────────
 
-    def generate_and_save(
+    def save_draft(
         self,
-        instrument: Instrument,
-        horizon: str,
-        as_of: Optional[Any] = None
+        draft: RecommendationDraft,
+        instrument: Optional[Instrument] = None
     ) -> StockRecommendation:
         """
-        Generate a deterministic recommendation for an instrument and persist it.
-        Returns the newly created StockRecommendation record.
+        Persists an already-computed RecommendationDraft without re-running any signal engine.
+        Seamlessly extracts and saves both standard fields and intraday-specific attributes.
         """
-        draft: RecommendationDraft = self.engine.generate_recommendation(
-            instrument=instrument,
-            horizon=horizon,
-            as_of=as_of
-        )
+        if instrument is None:
+            instrument = Instrument.objects.get(pk=draft.instrument_id)
+
+        extras = getattr(draft, "_intraday_extras", {}) or {}
 
         rec = StockRecommendation(
             instrument=instrument,
@@ -97,6 +95,13 @@ class RecommendationService:
             data_quality=draft.data_quality,
             status=draft.status,
             calculation_version=draft.calculation_version,
+            # Intraday-specific fields
+            timeframe=extras.get("timeframe"),
+            target_2_price=_to_decimal(extras.get("target_2_price")),
+            target_2_method=extras.get("target_2_method"),
+            session_window=extras.get("session_window"),
+            strategy_version=extras.get("strategy_version"),
+            expires_at=extras.get("expires_at"),
         )
         rec.save()
         logger.info(
@@ -104,6 +109,23 @@ class RecommendationService:
             f"for {instrument.symbol} @ {rec.as_of.date()} (id={rec.id})"
         )
         return rec
+
+    def generate_and_save(
+        self,
+        instrument: Instrument,
+        horizon: str,
+        as_of: Optional[Any] = None
+    ) -> StockRecommendation:
+        """
+        Generate a deterministic recommendation for an instrument and persist it.
+        Returns the newly created StockRecommendation record.
+        """
+        draft: RecommendationDraft = self.engine.generate_recommendation(
+            instrument=instrument,
+            horizon=horizon,
+            as_of=as_of
+        )
+        return self.save_draft(draft, instrument=instrument)
 
     # ── Batch universe scan ────────────────────────────────────────────────────
 

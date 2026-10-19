@@ -68,6 +68,7 @@ INSTALLED_APPS = [
     'chat',
     'market',
     'research',
+    'fno',
 ]
 
 MIDDLEWARE = [
@@ -217,6 +218,8 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 CELERY_TASK_ALWAYS_EAGER = 'test' in sys.argv
 CELERY_TASK_EAGER_PROPAGATES = CELERY_TASK_ALWAYS_EAGER
+from celery.schedules import crontab
+
 CELERY_BEAT_SCHEDULE = {
     'run-intraday-strategy-scan-5min': {
         'task': 'market.tasks.run_intraday_strategy_scan',
@@ -229,6 +232,11 @@ CELERY_BEAT_SCHEDULE = {
     'evaluate-recommendation-outcomes-5min': {
         'task': 'market.tasks.evaluate_recommendation_outcomes',
         'schedule': 300.0,
+    },
+    'purge-expired-option-quotes-daily': {
+        'task': 'fno.tasks.purge_expired_option_quotes',
+        'schedule': crontab(hour=11, minute=30),  # 17:00 IST daily post-market
+        'kwargs': {'days': 5},
     },
 }
 

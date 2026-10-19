@@ -1151,6 +1151,8 @@ class IntradayIndicesAPIView(APIView):
             "index_confirmation": context["index_confirmation"],
             "nifty": context["nifty"],
             "banknifty": context["banknifty"],
+            "sensex": context.get("sensex"),
+            "nifty_it": context.get("nifty_it"),
         }, status=status.HTTP_200_OK)
 
 

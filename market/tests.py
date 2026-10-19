@@ -2757,19 +2757,20 @@ class IntradayInfrastructureTests(TestCase):
         self.assertFalse(result.is_ready)
         self.assertEqual(result.bar_count, 5)
 
-    def test_readiness_fails_no_features(self):
-        """Sufficient bars but no TechnicalFeature records → not ready."""
+    def test_readiness_passes_without_db_technical_features(self):
+        """Sufficient valid bars without any TechnicalFeature records in DB → ready."""
         from market.services.intraday_readiness import IntradayReadinessService
-        # self.instrument has 100 5m bars but no TechnicalFeature records
-        # Quality will be STALE (data is old) → gate stops at quality check
-        # So we create a more specific instrument with healthy quality
+        from market.models import OHLCVBar, TechnicalFeature
+
         co2 = Company.objects.create(short_name="NOFEATURE", name="NoFeat Ltd",
                                      sector="T", industry="T", is_active=True)
         inst2 = Instrument.objects.create(company=co2, symbol="NOFEATURE", exchange="NSE",
                                           instrument_type="EQUITY", currency="INR", is_active=True)
-        # Insert 100 very recent 5m bars (so quality = HEALTHY or INCOMPLETE)
-        ts = datetime.now(timezone.utc) - timedelta(hours=2)
-        from market.models import OHLCVBar
+        # Ensure zero TechnicalFeature rows exist for this instrument
+        self.assertEqual(TechnicalFeature.objects.filter(instrument=inst2).count(), 0)
+
+        # Insert 100 valid 5m bars
+        ts = self.session_open_utc
         bars = []
         for i in range(100):
             bars.append(OHLCVBar(
@@ -2781,9 +2782,45 @@ class IntradayInfrastructureTests(TestCase):
         OHLCVBar.objects.bulk_create(bars)
 
         svc = IntradayReadinessService()
-        result = svc.check_readiness(inst2, "5m", datetime.now(timezone.utc) + timedelta(minutes=10))
-        # Should fail because no features (or stale — either way not ready)
+        # Evaluate as of 2 minutes after the latest bar during market session
+        eval_as_of = ts - timedelta(minutes=3)
+        result = svc.check_readiness(inst2, "5m", eval_as_of)
+        
+        # Verify readiness passes and bar_count == 100
+        self.assertEqual(result.bar_count, 100)
+        self.assertTrue(result.is_ready, f"Expected ready, but got: {result.reason}")
+        self.assertTrue(any("computable" in p for p in result.checks_passed))
+
+    def test_readiness_fails_invalid_ohlcv(self):
+        """100 bars but corrupted OHLCV (low > high) → not ready due to integrity check."""
+        from market.services.intraday_readiness import IntradayReadinessService
+        from market.models import OHLCVBar
+
+        co = Company.objects.create(short_name="CORRUPT", name="Corrupt Ltd",
+                                    sector="T", industry="T", is_active=True)
+        inst = Instrument.objects.create(company=co, symbol="CORRUPT", exchange="NSE",
+                                         instrument_type="EQUITY", currency="INR", is_active=True)
+        ts = self.session_open_utc
+        bars = []
+        for i in range(99):
+            bars.append(OHLCVBar(
+                instrument=inst, timeframe="5m", timestamp=ts,
+                open=Decimal("1000"), high=Decimal("1010"), low=Decimal("990"),
+                close=Decimal("1005"), volume=50000, source="test"
+            ))
+            ts += timedelta(minutes=5)
+        # Add a corrupt bar with low > high
+        bars.append(OHLCVBar(
+            instrument=inst, timeframe="5m", timestamp=ts,
+            open=Decimal("1000"), high=Decimal("950"), low=Decimal("990"),
+            close=Decimal("1000"), volume=50000, source="test"
+        ))
+        OHLCVBar.objects.bulk_create(bars)
+
+        svc = IntradayReadinessService()
+        result = svc.check_readiness(inst, "5m", ts + timedelta(minutes=2))
         self.assertFalse(result.is_ready)
+        self.assertTrue(any("integrity" in f.lower() or "violation" in f.lower() for f in result.checks_failed))
 
     def test_readiness_passes_with_bars_quality_and_features(self):
         """Sufficient bars + healthy quality + features → ready."""
@@ -3180,6 +3217,78 @@ class IntradayStrategyEngineTests(TestCase):
 
         inst, bars = self._make_bar_series("VWAP2", n=5, base_close=100.0)
         ind = compute_intraday_indicators(bars, future_date)
+        self.assertFalse(ind.vwap_available)
+        self.assertIsNone(ind.vwap)
+
+    def test_vwap_excludes_pre_open_and_post_market_bars(self):
+        """
+        Prove that pre-open bars (< 09:15 IST) and post-market bars (>= 15:30 IST)
+        cannot contaminate VWAP, and valid regular-session VWAP remains unchanged.
+        """
+        from market.services.intraday_indicators import compute_intraday_indicators
+        from market.services.market_session import IST
+        from datetime import date as _date, datetime, timezone
+        today = _date.today()
+
+        # 1. Clean regular-session series: 10 bars from 09:15 to 10:00 (5m spacing)
+        inst, regular_bars = self._make_bar_series(
+            "VWAP_CLEAN", n=10, base_close=200.0, session_date=today, start_hour=9, start_min=15
+        )
+        ind_clean = compute_intraday_indicators(regular_bars, today)
+        self.assertTrue(ind_clean.vwap_available)
+        clean_vwap = ind_clean.vwap
+
+        # 2. Create extreme contaminated pre-open bars (09:00, 09:05, 09:10 IST)
+        pre_open_bars = []
+        for minute in (0, 5, 10):
+            ts = datetime(today.year, today.month, today.day, 9, minute, tzinfo=IST).astimezone(timezone.utc)
+            _, bar = self._make_bar(
+                symbol="VWAP_CLEAN", timeframe="5m",
+                timestamp=ts, close=99999.0,
+                high=100000.0, low=99998.0,
+                volume=100_000_000,
+            )
+            pre_open_bars.append(bar)
+
+        # 3. Create extreme contaminated post-market bars (15:30, 15:35 IST)
+        post_market_bars = []
+        for minute in (30, 35):
+            ts = datetime(today.year, today.month, today.day, 15, minute, tzinfo=IST).astimezone(timezone.utc)
+            _, bar = self._make_bar(
+                symbol="VWAP_CLEAN", timeframe="5m",
+                timestamp=ts, close=88888.0,
+                high=88889.0, low=88887.0,
+                volume=50_000_000,
+            )
+            post_market_bars.append(bar)
+
+        # 4. Compute indicators on the combined contaminated list
+        combined_bars = pre_open_bars + regular_bars + post_market_bars
+        ind_combined = compute_intraday_indicators(combined_bars, today)
+
+        # VWAP must exactly match clean regular session VWAP (pre-open and post-market bars filtered out)
+        self.assertTrue(ind_combined.vwap_available)
+        self.assertEqual(ind_combined.vwap, clean_vwap)
+
+    def test_vwap_all_pre_open_bars_unavailable(self):
+        """When only pre-open bars (< 09:15 IST) exist, VWAP is unavailable (None)."""
+        from market.services.intraday_indicators import compute_intraday_indicators
+        from market.services.market_session import IST
+        from datetime import date as _date, datetime, timezone
+        today = _date.today()
+
+        pre_open_bars = []
+        for minute in (0, 5, 10):
+            ts = datetime(today.year, today.month, today.day, 9, minute, tzinfo=IST).astimezone(timezone.utc)
+            _, bar = self._make_bar(
+                symbol="VWAP_PREONLY", timeframe="5m",
+                timestamp=ts, close=500.0,
+                high=502.0, low=498.0,
+                volume=10000,
+            )
+            pre_open_bars.append(bar)
+
+        ind = compute_intraday_indicators(pre_open_bars, today)
         self.assertFalse(ind.vwap_available)
         self.assertIsNone(ind.vwap)
 
@@ -5762,8 +5871,8 @@ class KiteAuthAndDataLayerTests(TestCase):
 
         class MockProvider:
             def get_historical_ohlcv(self, symbol, timeframe, start_date, end_date):
-                t1 = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
-                t2 = datetime(2026, 9, 1, 10, 15, tzinfo=timezone.utc)
+                t1 = datetime(2026, 9, 1, 5, 0, tzinfo=timezone.utc)
+                t2 = datetime(2026, 9, 1, 5, 15, tzinfo=timezone.utc)
                 return {
                     "symbol": symbol,
                     "timeframe": timeframe,
@@ -6062,7 +6171,8 @@ class IntradayMarketContextTests(TestCase):
             (181.0, "UNAVAILABLE", False),
         ]
 
-        with patch("market.services.intraday_state_manager.datetime") as mock_dt:
+        with patch("market.services.intraday_state_manager.datetime") as mock_dt, \
+             patch("market.services.intraday_state_manager.cache.get", return_value=None):
             mock_dt.now.return_value = fixed_now
             mock_dt.fromisoformat = datetime.fromisoformat
 
@@ -6873,8 +6983,10 @@ class Phase19CorePipelineRemediationTests(TestCase):
         IntradayStateManager.reset_singleton()
         mgr = IntradayStateManager()
 
-        # Compute context over completely cold cache
-        recovered_context = mgr.compute_current_context()
+        # Compute context over completely cold cache (isolated from any concurrent live ticker writing to Redis)
+        from unittest.mock import patch
+        with patch.object(cache, "get", return_value=None):
+            recovered_context = mgr.compute_current_context()
 
         self.assertEqual(recovered_context["source"], "persisted_snapshot")
         self.assertEqual(recovered_context["as_of"], past_ts.isoformat())
@@ -7017,6 +7129,1111 @@ class Phase19CorePipelineRemediationTests(TestCase):
         self.assertEqual(sensex_sym, "^BSESN")
         self.assertEqual(niftyit_sym, "^CNXIT")
 
+    def test_phase19_5_recommendation_persistence_save_draft(self):
+        """
+        Phase 19.5 Regression (P1): Verifies that RecommendationService.save_draft
+        persists an IntradaySignalEngine RecommendationDraft directly with all intraday fields
+        intact without invoking the daily SignalEngine or losing intraday metadata.
+        """
+        from datetime import datetime, timezone, timedelta
+        from decimal import Decimal
+        from market.models import Instrument, Company, StockRecommendation
+        from market.services.recommendation_service import RecommendationService
+        from market.services.signal_engine import RecommendationDraft
+
+        company, _ = Company.objects.get_or_create(
+            name="Tata Consultancy Services Ltd",
+            defaults={"isin": "INE467B01029_TEST", "sector": "Technology"}
+        )
+        instrument, _ = Instrument.objects.get_or_create(
+            symbol="TCS_TEST",
+            defaults={"company": company, "exchange": "NSE", "instrument_type": "EQUITY", "is_active": True}
+        )
+
+        now = datetime(2026, 10, 15, 9, 30, tzinfo=timezone.utc)
+        expires = now + timedelta(hours=6)
+
+        draft = RecommendationDraft(
+            instrument_id=str(instrument.id),
+            horizon="INTRADAY",
+            signal="BUY",
+            setup_type="VWAP_RECLAIM",
+            as_of=now,
+            entry_type="MOMENTUM_CONFIRMATION",
+            entry_price=3500.0,
+            entry_condition="Enter above VWAP 3500.0",
+            stop_price=3475.0,
+            stop_method="STRUCTURAL",
+            invalidation_reason="Close below VWAP",
+            target_price=3550.0,
+            target_method="MEASURED_MOVE",
+            risk=25.0,
+            reward=50.0,
+            risk_reward_ratio=2.0,
+            confidence="HIGH",
+            confidence_components={"volume_confirm": {"score": 85.0}},
+            market_context={"market_direction": "BULLISH"},
+            sector_context={"tier": "strongest"},
+            supporting_factors=["Reclaimed session VWAP with 2.5x volume"],
+            risk_factors=["Overhead resistance at 3560"],
+            setup_details={"vwap": 3500.0, "atr": 20.0},
+            data_quality={"status": "COMPLETE", "bar_count": 120},
+            status="ACTIVE",
+            calculation_version=1,
+        )
+        draft._intraday_extras = {
+            "timeframe": "5m",
+            "target_2_price": 3580.0,
+            "target_2_method": "ATR_MULTIPLE",
+            "session_window": "MORNING",
+            "strategy_version": "1.0",
+            "expires_at": expires,
+        }
+
+        svc = RecommendationService()
+        rec = svc.save_draft(draft, instrument=instrument)
+
+        self.assertIsNotNone(rec.pk)
+        self.assertEqual(rec.signal, "BUY")
+        self.assertEqual(rec.horizon, "INTRADAY")
+        self.assertEqual(rec.setup_type, "VWAP_RECLAIM")
+        self.assertEqual(rec.entry_price, Decimal("3500.00"))
+        self.assertEqual(rec.stop_price, Decimal("3475.00"))
+        self.assertEqual(rec.target_price, Decimal("3550.00"))
+        self.assertEqual(rec.risk_reward_ratio, Decimal("2.00"))
+        # Verify intraday fields survived persistence
+        self.assertEqual(rec.timeframe, "5m")
+        self.assertEqual(rec.target_2_price, Decimal("3580.00"))
+        self.assertEqual(rec.target_2_method, "ATR_MULTIPLE")
+        self.assertEqual(rec.session_window, "MORNING")
+        self.assertEqual(rec.strategy_version, "1.0")
+        self.assertEqual(rec.expires_at, expires)
+
+    def test_phase19_5_bidirectional_tatamotors_mapping(self):
+        """
+        Phase 19.5 Regression (P2): Verifies bidirectional canonical resolution for Tata Motors:
+        - Forward: 'TATAMOTORS' -> token 884737 (TMPV in master)
+        - Reverse: token 884737 -> canonical symbol 'TATAMOTORS' (NOT 'TMPV')
+        - Identity: get_symbol(get_token('TATAMOTORS')) == 'TATAMOTORS'
+        """
+        from market.services.kite_registry import KiteInstrumentRegistry
+
+        token = KiteInstrumentRegistry.get_token("TATAMOTORS")
+        self.assertEqual(token, 884737)
+
+        symbol = KiteInstrumentRegistry.get_symbol(884737)
+        self.assertEqual(symbol, "TATAMOTORS")
+
+        # Round-trip consistency
+        self.assertEqual(KiteInstrumentRegistry.get_symbol(token), "TATAMOTORS")
+
+        # Metadata access via canonical symbol
+        meta = KiteInstrumentRegistry.get_meta("TATAMOTORS")
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["instrument_token"], 884737)
+
+    def test_phase19_5_intraday_bar_aggregator_pre_market_rejection(self):
+        """
+        Phase 19.5 Regression (P3): Verifies that IntradayBarAggregator strictly rejects
+        pre-open auction ticks (09:00-09:14:59 IST) and post-market/closed ticks,
+        while recording baseline volume so regular-session bars don't absorb pre-market volume spikes.
+        """
+        from datetime import datetime
+        from decimal import Decimal
+        from zoneinfo import ZoneInfo
+        from market.services.intraday_aggregator import IntradayBarAggregator
+        from market.normalizers.kite import NomadMarketTick
+
+        agg = IntradayBarAggregator(persist_to_db=False)
+        ist = ZoneInfo("Asia/Kolkata")
+
+        # 1. Pre-market call-auction tick at 09:10:00 IST (Friday 2026-09-04)
+        t_pre = datetime(2026, 9, 4, 9, 10, 0, tzinfo=ist)
+        pre_tick = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2940.0"),
+            volume=50000, received_timestamp=t_pre, exchange_timestamp=t_pre
+        )
+        res_pre = agg.process_tick(pre_tick)
+        self.assertEqual(res_pre, {})
+        self.assertIsNone(agg.get_current_bar("RELIANCE", "1m"))
+        self.assertIsNone(agg.get_current_bar("RELIANCE", "5m"))
+
+        # 2. First regular session tick at 09:15:10 IST
+        t_reg = datetime(2026, 9, 4, 9, 15, 10, tzinfo=ist)
+        reg_tick = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2950.0"),
+            volume=50500, received_timestamp=t_reg, exchange_timestamp=t_reg
+        )
+        res_reg = agg.process_tick(reg_tick)
+        self.assertIn("1m", res_reg)
+        bar_1m = res_reg["1m"]
+        self.assertIsNotNone(bar_1m)
+        self.assertEqual(bar_1m.open, Decimal("2950.0"))
+        # Verify volume delta: 50,500 - 50,000 baseline = 500 (NOT 50,500!)
+        self.assertEqual(bar_1m.volume, 500)
+
+        # 3. Post-market tick at 15:45:00 IST should also be rejected
+        t_post = datetime(2026, 9, 4, 15, 45, 0, tzinfo=ist)
+        post_tick = NomadMarketTick(
+            instrument_token=738561, symbol="RELIANCE", last_price=Decimal("2955.0"),
+            volume=60000, received_timestamp=t_post, exchange_timestamp=t_post
+        )
+        res_post = agg.process_tick(post_tick)
+        self.assertEqual(res_post, {})
+
+    def test_phase19_5_task_run_intraday_strategy_scan_persistence(self):
+        """
+        Phase 19.5 Regression (P1 Task Integration): Tests that run_intraday_strategy_scan
+        correctly persists actionable IntradaySignalEngine drafts via svc.save_draft
+        without falling back to legacy daily SignalEngine.
+        """
+        from unittest.mock import patch
+        from datetime import datetime, timezone
+        from market.tasks import run_intraday_strategy_scan
+        from market.models import Instrument, Company, StockRecommendation
+        from market.services.signal_engine import RecommendationDraft
+
+        company, _ = Company.objects.get_or_create(
+            name="Infosys Ltd",
+            defaults={"isin": "INE009A01021_TEST", "sector": "Technology"}
+        )
+        instrument, _ = Instrument.objects.get_or_create(
+            symbol="INFY_TEST",
+            defaults={"company": company, "exchange": "NSE", "instrument_type": "EQUITY", "is_active": True}
+        )
+
+        now = datetime(2026, 10, 15, 10, 0, tzinfo=timezone.utc)
+        mock_draft = RecommendationDraft(
+            instrument_id=str(instrument.id),
+            horizon="INTRADAY",
+            signal="BUY",
+            setup_type="MOMENTUM_BREAKOUT",
+            as_of=now,
+            entry_type="CURRENT_MARKET_PRICE",
+            entry_price=1800.0,
+            entry_condition="Enter at CMP",
+            stop_price=1780.0,
+            stop_method="STRUCTURAL",
+            invalidation_reason="Close below 1780",
+            target_price=1840.0,
+            target_method="MEASURED_MOVE",
+            risk=20.0,
+            reward=40.0,
+            risk_reward_ratio=2.0,
+            confidence="HIGH",
+            confidence_components={"momentum": {"score": 90.0}},
+            market_context={"market_direction": "BULLISH"},
+            sector_context={"tier": "strongest"},
+            supporting_factors=["Strong 5m volume breakout"],
+            risk_factors=[],
+            setup_details={"strategy_version": "1.0"},
+            data_quality={"status": "COMPLETE"},
+            status="ACTIVE",
+            calculation_version=1,
+        )
+        mock_draft._intraday_extras = {
+            "timeframe": "5m",
+            "target_2_price": 1860.0,
+            "target_2_method": "ATR_MULTIPLE",
+            "session_window": "MORNING",
+            "strategy_version": "1.0",
+            "expires_at": now,
+        }
+
+        with patch("market.services.market_session.IndianMarketSession.is_market_open", return_value=True), \
+             patch("market.services.intraday_signal_engine.IntradaySignalEngine.generate_recommendation", return_value=mock_draft):
+            result = run_intraday_strategy_scan()
+
+        self.assertGreaterEqual(result.get("actionable", 0), 1)
+
+        # Assert persisted StockRecommendation record
+        rec = StockRecommendation.objects.filter(instrument=instrument, horizon="INTRADAY").order_by("-as_of").first()
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.signal, "BUY")
+        self.assertEqual(rec.setup_type, "MOMENTUM_BREAKOUT")
+        self.assertEqual(rec.timeframe, "5m")
+        self.assertEqual(rec.target_2_price, Decimal("1860.00"))
+        self.assertEqual(rec.session_window, "MORNING")
+        self.assertEqual(rec.strategy_version, "1.0")
+
+    def test_cleanup_contaminated_preopen_bars_command(self):
+        """
+        Tests that cleanup_contaminated_preopen_bars command:
+        1. Correctly identifies pre-open bars (< 09:15 IST) for intraday timeframes.
+        2. In dry-run mode, preserves all records.
+        3. In confirmed mode, deletes ONLY pre-open intraday bars, preserving regular-session and daily bars.
+        4. Is idempotent.
+        """
+        from io import StringIO
+        from django.core.management import call_command
+        from market.models import OHLCVBar
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, date
+
+        ist = ZoneInfo("Asia/Kolkata")
+
+        # Pre-open bar (09:10 IST)
+        t_pre = datetime(2026, 10, 15, 9, 10, tzinfo=ist)
+        bar_pre = OHLCVBar.objects.create(
+            instrument=self.inst_rel,
+            timeframe="1m",
+            timestamp=t_pre,
+            open=Decimal("2900.0"), high=Decimal("2905.0"), low=Decimal("2895.0"), close=Decimal("2902.0"),
+            volume=5000,
+            source="NomadAggregator",
+        )
+
+        # Regular-session bar (09:20 IST)
+        t_reg = datetime(2026, 10, 15, 9, 20, tzinfo=ist)
+        bar_reg = OHLCVBar.objects.create(
+            instrument=self.inst_rel,
+            timeframe="1m",
+            timestamp=t_reg,
+            open=Decimal("2902.0"), high=Decimal("2910.0"), low=Decimal("2900.0"), close=Decimal("2908.0"),
+            volume=12000,
+            source="NomadAggregator",
+        )
+
+        # Daily bar (must NEVER be touched)
+        t_daily = datetime(2026, 10, 15, 8, 45, tzinfo=ist)
+        bar_daily = OHLCVBar.objects.create(
+            instrument=self.inst_rel,
+            timeframe="1d",
+            timestamp=t_daily,
+            open=Decimal("2900.0"), high=Decimal("2910.0"), low=Decimal("2895.0"), close=Decimal("2908.0"),
+            volume=100000,
+            source="YFinanceMarketProvider",
+        )
+
+        # 1. Test Dry Run
+        out = StringIO()
+        call_command("cleanup_contaminated_preopen_bars", date="2026-10-15", dry_run=True, stdout=out)
+        output = out.getvalue()
+        self.assertIn("DRY RUN (PREVIEW ONLY)", output)
+        self.assertIn("1 bars WOULD BE DELETED", output)
+        self.assertTrue(OHLCVBar.objects.filter(id=bar_pre.id).exists(), "Pre-open bar must not be deleted in dry-run")
+        self.assertTrue(OHLCVBar.objects.filter(id=bar_reg.id).exists(), "Regular bar must not be deleted")
+        self.assertTrue(OHLCVBar.objects.filter(id=bar_daily.id).exists(), "Daily bar must not be deleted")
+
+        # 2. Test Confirmed Deletion
+        out_confirm = StringIO()
+        call_command("cleanup_contaminated_preopen_bars", date="2026-10-15", confirm=True, stdout=out_confirm)
+        output_confirm = out_confirm.getvalue()
+        self.assertIn("Successfully deleted 1 contaminated bars", output_confirm)
+        self.assertFalse(OHLCVBar.objects.filter(id=bar_pre.id).exists(), "Pre-open bar must be deleted")
+        self.assertTrue(OHLCVBar.objects.filter(id=bar_reg.id).exists(), "Regular-session bar must be preserved")
+        self.assertTrue(OHLCVBar.objects.filter(id=bar_daily.id).exists(), "Daily bar must be preserved")
+
+        # 3. Test Idempotency
+        out_repeat = StringIO()
+        call_command("cleanup_contaminated_preopen_bars", date="2026-10-15", confirm=True, stdout=out_repeat)
+        self.assertIn("No contaminated pre-open bars found", out_repeat.getvalue())
 
 
+class Phase20APipelineVerificationTests(TestCase):
+    """
+    Phase 20A: Live Decision Pipeline Verification Tests.
+    Covers Sections A through F:
+      - Canonical universe & benchmark token resolution
+      - TATAMOTORS / TMPV demerger mapping preservation
+      - 4-benchmark index routing (NIFTY, BANKNIFTY, SENSEX, NIFTY IT)
+      - Skip reasons diagnostic instrumentation
+      - Recommendation persistence without daily engine invocation
+    """
 
+    def setUp(self):
+        self.company, _ = Company.objects.get_or_create(name="Tata Motors Ltd")
+        self.inst_tm, _ = Instrument.objects.get_or_create(
+            symbol="TATAMOTORS",
+            defaults={
+                "company": self.company,
+                "exchange": "NSE",
+                "instrument_type": "EQUITY",
+                "is_active": True,
+            }
+        )
+        self.univ, _ = Universe.objects.get_or_create(
+            name="NIFTY50",
+            defaults={"description": "Nifty 50 Index Universe"}
+        )
+        UniverseMembership.objects.get_or_create(universe=self.univ, instrument=self.inst_tm, defaults={"is_active": True})
+
+    def test_canonical_universe_and_benchmarks_resolution(self):
+        """Verify token resolution for benchmarks and equity symbols."""
+        from market.services.kite_registry import KiteInstrumentRegistry
+        benchmarks = ["^NSEI", "^NSEBANK", "^BSESN", "^CNXIT"]
+        expected_tokens = {
+            "^NSEI": 256265,
+            "^NSEBANK": 260105,
+            "^BSESN": 265,
+            "^CNXIT": 259849,
+        }
+        for b, exp_token in expected_tokens.items():
+            token = KiteInstrumentRegistry.get_token(b)
+            self.assertEqual(token, exp_token, f"Token for {b} must be {exp_token}")
+            rev_sym = KiteInstrumentRegistry.get_symbol(token)
+            self.assertEqual(rev_sym, b, f"Reverse symbol for {token} must be {b}")
+
+    def test_tatamotors_tmpv_end_to_end_mapping(self):
+        """Verify TATAMOTORS / TMPV resolves to token 884737 and reverse-resolves to TATAMOTORS."""
+        from market.services.kite_registry import KiteInstrumentRegistry
+        token_tm = KiteInstrumentRegistry.get_token("TATAMOTORS")
+        token_tmpv = KiteInstrumentRegistry.get_token("TMPV")
+        self.assertEqual(token_tm, 884737)
+        self.assertEqual(token_tmpv, 884737)
+
+        # Reverse resolution must preserve canonical Nomad symbol 'TATAMOTORS'
+        rev = KiteInstrumentRegistry.get_symbol(884737)
+        self.assertEqual(rev, "TATAMOTORS")
+
+        # KiteNormalizer must produce tick with symbol='TATAMOTORS'
+        from market.normalizers.kite import KiteNormalizer
+        norm_tick = KiteNormalizer.normalize_tick({
+            "instrument_token": 884737,
+            "last_price": 287.50,
+            "volume": 50000,
+        })
+        self.assertEqual(norm_tick.symbol, "TATAMOTORS")
+
+    def test_intraday_context_engine_four_benchmarks_routing(self):
+        """Verify all 4 benchmarks are routed in build_market_context_snapshot."""
+        from market.services.intraday_context_engine import IntradayMarketContextEngine
+        index_states = {
+            "NIFTY": {"last_price": 23000.0, "change_percent": 1.5, "open": 22700.0, "high": 23050.0, "low": 22650.0},
+            "BANKNIFTY": {"last_price": 55800.0, "change_percent": 0.9, "open": 55400.0, "high": 56000.0, "low": 55200.0},
+            "SENSEX": {"last_price": 75000.0, "change_percent": 1.4, "open": 74200.0, "high": 75100.0, "low": 74100.0},
+            "NIFTYIT": {"last_price": 31000.0, "change_percent": 2.1, "open": 30500.0, "high": 31100.0, "low": 30400.0},
+        }
+        ctx = IntradayMarketContextEngine.build_market_context_snapshot(
+            constituent_states=[],
+            index_states=index_states,
+        )
+        self.assertIsNotNone(ctx.get("nifty"))
+        self.assertIsNotNone(ctx.get("banknifty"))
+        self.assertIsNotNone(ctx.get("sensex"))
+        self.assertIsNotNone(ctx.get("nifty_it"))
+        self.assertEqual(ctx["sensex"]["symbol"], "^BSESN")
+        self.assertEqual(ctx["nifty_it"]["symbol"], "^CNXIT")
+        self.assertEqual(ctx["sensex"]["price"], 75000.0)
+        self.assertEqual(ctx["nifty_it"]["price"], 31000.0)
+
+    def test_recommendation_persistence_without_daily_engine(self):
+        """Verify RecommendationService.save_draft persists RecommendationDraft without calling SignalEngine."""
+        from datetime import datetime, timezone, timedelta
+        from decimal import Decimal
+        from market.services.signal_engine import RecommendationDraft
+        from market.services.recommendation_service import RecommendationService
+        from market.models import StockRecommendation
+
+        now = datetime.now(timezone.utc)
+        draft = RecommendationDraft(
+            instrument_id=self.inst_tm.id,
+            horizon="INTRADAY",
+            signal="BUY",
+            setup_type="OR_BREAKOUT",
+            as_of=now,
+            entry_type="STOP_LIMIT",
+            entry_price=Decimal("290.00"),
+            entry_condition="Enter above ORB high",
+            stop_price=Decimal("285.00"),
+            stop_method="STRUCTURE",
+            invalidation_reason="Close below 285",
+            target_price=Decimal("298.00"),
+            target_method="ATR_MULTIPLE",
+            risk=Decimal("5.00"),
+            reward=Decimal("8.00"),
+            risk_reward_ratio=Decimal("1.60"),
+            confidence="HIGH",
+            confidence_components={"momentum": 80.0},
+            market_context={"trend": "bullish"},
+            sector_context={"momentum": "positive"},
+            supporting_factors=["ORB breakout"],
+            risk_factors=["High volatility"],
+            setup_details={"range": 10.0},
+            data_quality={"status": "HEALTHY"},
+            status="ACTIVE",
+            calculation_version=1,
+        )
+        draft._intraday_extras = {
+            "timeframe": "5m",
+            "target_2_price": Decimal("305.00"),
+            "target_2_method": "PIVOT_R2",
+            "session_window": "MORNING",
+            "strategy_version": "1.0",
+            "expires_at": now + timedelta(hours=4),
+        }
+
+        svc = RecommendationService()
+        rec = svc.save_draft(draft, instrument=self.inst_tm)
+
+        self.assertIsNotNone(rec.pk)
+        self.assertEqual(rec.horizon, "INTRADAY")
+        self.assertEqual(rec.signal, "BUY")
+        self.assertEqual(rec.timeframe, "5m")
+        self.assertEqual(rec.target_2_price, Decimal("305.00"))
+        self.assertEqual(rec.session_window, "MORNING")
+        self.assertEqual(rec.strategy_version, "1.0")
+        self.assertIsNotNone(rec.expires_at)
+
+
+class Phase20A1IntradayWarmupAndReadinessTests(TestCase):
+    """
+    Phase 20A.1 Regression Suite: Intraday Warmup & Readiness Remediation.
+    Verifies:
+      1. TechnicalFeature gate remediation: Valid 5m bars without any 5m TechnicalFeature DB rows pass readiness.
+      2. Insufficient bars gate: < 100 5m bars rejected.
+      3. Stale data gate: bars older than threshold rejected.
+      4. OHLCV integrity gate: corrupted prices (low > high) rejected.
+      5. Kite normalizer support for native dict format candles.
+      6. Kite historical ingestion regular trading session gating (pre-open excluded).
+    """
+
+    def setUp(self):
+        from zoneinfo import ZoneInfo
+        self.IST = ZoneInfo("Asia/Kolkata")
+        self.company = Company.objects.create(
+            short_name="WARMTEST",
+            name="Warmup Test Ltd",
+            sector="Technology",
+            industry="Software",
+            is_active=True,
+        )
+        self.instrument = Instrument.objects.create(
+            company=self.company,
+            symbol="WARMTEST",
+            exchange="NSE",
+            instrument_type="EQUITY",
+            currency="INR",
+            is_active=True,
+        )
+
+    def test_readiness_valid_5m_bars_without_technical_feature_row(self):
+        """100 valid 5m bars pass readiness without requiring a 5m TechnicalFeature DB row."""
+        from market.models import TechnicalFeature
+        from market.services.intraday_readiness import IntradayReadinessService
+
+        # Confirm zero TechnicalFeature records exist in DB
+        self.assertEqual(TechnicalFeature.objects.filter(instrument=self.instrument).count(), 0)
+
+        # Create 100 consecutive 5m bars within regular session hours
+        start_ist = datetime(2026, 10, 15, 9, 15, tzinfo=self.IST)
+        bars = []
+        curr = start_ist
+        for i in range(100):
+            bars.append(OHLCVBar(
+                instrument=self.instrument,
+                timeframe="5m",
+                timestamp=curr.astimezone(timezone.utc),
+                open=Decimal("1500.00"),
+                high=Decimal("1515.00"),
+                low=Decimal("1495.00"),
+                close=Decimal("1505.00"),
+                volume=25000,
+                source="Kite",
+            ))
+            curr += timedelta(minutes=5)
+        OHLCVBar.objects.bulk_create(bars)
+
+        svc = IntradayReadinessService()
+        eval_time = (curr - timedelta(minutes=2)).astimezone(timezone.utc)
+        result = svc.check_readiness(self.instrument, "5m", as_of=eval_time)
+
+        self.assertTrue(result.is_ready, f"Expected ready, but got: {result.reason}")
+        self.assertEqual(result.bar_count, 100)
+        self.assertTrue(any("computable" in p for p in result.checks_passed))
+
+    def test_readiness_rejects_insufficient_bars(self):
+        """< 100 5m bars must be rejected by Check 2."""
+        from market.services.intraday_readiness import IntradayReadinessService
+
+        start_ist = datetime(2026, 10, 15, 9, 15, tzinfo=self.IST)
+        bars = []
+        curr = start_ist
+        for i in range(50):
+            bars.append(OHLCVBar(
+                instrument=self.instrument,
+                timeframe="5m",
+                timestamp=curr.astimezone(timezone.utc),
+                open=Decimal("1500.00"),
+                high=Decimal("1515.00"),
+                low=Decimal("1495.00"),
+                close=Decimal("1505.00"),
+                volume=25000,
+                source="Kite",
+            ))
+            curr += timedelta(minutes=5)
+        OHLCVBar.objects.bulk_create(bars)
+
+        svc = IntradayReadinessService()
+        result = svc.check_readiness(self.instrument, "5m", as_of=curr.astimezone(timezone.utc))
+
+        self.assertFalse(result.is_ready)
+        self.assertEqual(result.bar_count, 50)
+        self.assertTrue(any("Insufficient bars" in f for f in result.checks_failed))
+
+    def test_readiness_rejects_corrupted_ohlcv(self):
+        """Corrupted OHLCV (low > high) must be rejected by Check 5."""
+        from market.services.intraday_readiness import IntradayReadinessService
+
+        start_ist = datetime(2026, 10, 15, 9, 15, tzinfo=self.IST)
+        bars = []
+        curr = start_ist
+        for i in range(99):
+            bars.append(OHLCVBar(
+                instrument=self.instrument,
+                timeframe="5m",
+                timestamp=curr.astimezone(timezone.utc),
+                open=Decimal("1500.00"),
+                high=Decimal("1515.00"),
+                low=Decimal("1495.00"),
+                close=Decimal("1505.00"),
+                volume=25000,
+                source="Kite",
+            ))
+            curr += timedelta(minutes=5)
+
+        # Corrupted 100th bar: low > high
+        bars.append(OHLCVBar(
+            instrument=self.instrument,
+            timeframe="5m",
+            timestamp=curr.astimezone(timezone.utc),
+            open=Decimal("1500.00"),
+            high=Decimal("1480.00"),
+            low=Decimal("1520.00"),
+            close=Decimal("1500.00"),
+            volume=25000,
+            source="Kite",
+        ))
+        OHLCVBar.objects.bulk_create(bars)
+
+        svc = IntradayReadinessService()
+        result = svc.check_readiness(self.instrument, "5m", as_of=(curr + timedelta(minutes=2)).astimezone(timezone.utc))
+
+        self.assertFalse(result.is_ready)
+        self.assertTrue(any("violation" in f.lower() or "integrity" in f.lower() for f in result.checks_failed))
+
+    def test_kite_normalizer_handles_dict_candles(self):
+        """KiteNormalizer.normalize_candle successfully parses native dict format from Kite Connect."""
+        from market.normalizers.kite import KiteNormalizer
+
+        raw_dict = {
+            "date": datetime(2026, 10, 15, 11, 30, tzinfo=self.IST),
+            "open": 2800.5,
+            "high": 2815.0,
+            "low": 2795.2,
+            "close": 2810.0,
+            "volume": 84500,
+        }
+        normalized = KiteNormalizer.normalize_candle(raw_dict, "WARMTEST", timeframe="5m")
+
+        self.assertEqual(normalized["open"], Decimal("2800.5"))
+        self.assertEqual(normalized["high"], Decimal("2815.0"))
+        self.assertEqual(normalized["low"], Decimal("2795.2"))
+        self.assertEqual(normalized["close"], Decimal("2810.0"))
+        self.assertEqual(normalized["volume"], 84500)
+        self.assertEqual(normalized["timeframe"], "5m")
+        self.assertEqual(normalized["source"], "Kite")
+
+    def test_kite_historical_ingestion_gates_preopen_candles(self):
+        """KiteHistoricalIngestionService ignores pre-open candles (< 09:15:00 IST)."""
+        from datetime import time
+        from market.services.kite_historical import KiteHistoricalIngestionService
+
+        test_ist = self.IST
+
+        class MockProvider:
+            def get_historical_ohlcv(self, symbol, timeframe, start_date, end_date):
+                return {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": [
+                        # Pre-open candle at 09:08:00 IST (should be skipped)
+                        {
+                            "date": datetime(2026, 10, 15, 9, 8, tzinfo=test_ist),
+                            "open": 1000.0, "high": 1005.0, "low": 998.0, "close": 1002.0, "volume": 1000,
+                        },
+                        # Regular session candle at 09:15:00 IST (should be ingested)
+                        {
+                            "date": datetime(2026, 10, 15, 9, 15, tzinfo=test_ist),
+                            "open": 1002.0, "high": 1010.0, "low": 1000.0, "close": 1008.0, "volume": 50000,
+                        },
+                    ],
+                }
+
+        svc = KiteHistoricalIngestionService(provider=MockProvider())
+        res = svc.ingest_symbol("WARMTEST", timeframe="5m")
+
+        self.assertEqual(res["created"], 1)
+        self.assertEqual(res["errors"], 0)
+        # Verify only the 09:15:00 bar was persisted
+        persisted = list(OHLCVBar.objects.filter(instrument=self.instrument, timeframe="5m"))
+        self.assertEqual(len(persisted), 1)
+    def test_kite_historical_ingestion_gates_boundary_cases(self):
+        """KiteHistoricalIngestionService strictly respects [09:15, 15:30) IST boundaries."""
+        from datetime import time
+        from market.services.kite_historical import KiteHistoricalIngestionService
+
+        test_ist = self.IST
+
+        class MockProvider:
+            def get_historical_ohlcv(self, symbol, timeframe, start_date, end_date):
+                return {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": [
+                        # Pre-open at 09:10:00 (skip)
+                        {"date": datetime(2026, 10, 15, 9, 10, tzinfo=test_ist), "open": 1000.0, "high": 1005.0, "low": 998.0, "close": 1002.0, "volume": 1000},
+                        # Session open at 09:15:00 (keep)
+                        {"date": datetime(2026, 10, 15, 9, 15, tzinfo=test_ist), "open": 1002.0, "high": 1010.0, "low": 1000.0, "close": 1008.0, "volume": 50000},
+                        # Last regular session bar at 15:25:00 (keep)
+                        {"date": datetime(2026, 10, 15, 15, 25, tzinfo=test_ist), "open": 1020.0, "high": 1022.0, "low": 1018.0, "close": 1019.0, "volume": 40000},
+                        # Post-market bar at 15:30:00 (skip - 15:30 exclusive)
+                        {"date": datetime(2026, 10, 15, 15, 30, tzinfo=test_ist), "open": 1019.0, "high": 1021.0, "low": 1019.0, "close": 1020.0, "volume": 15000},
+                        # Post-market bar at 15:45:00 (skip)
+                        {"date": datetime(2026, 10, 15, 15, 45, tzinfo=test_ist), "open": 1020.0, "high": 1020.0, "low": 1020.0, "close": 1020.0, "volume": 2000},
+                        # Off-market bar at 16:05:00 (skip)
+                        {"date": datetime(2026, 10, 15, 16, 5, tzinfo=test_ist), "open": 1020.0, "high": 1020.0, "low": 1020.0, "close": 1020.0, "volume": 500},
+                    ],
+                }
+
+        svc = KiteHistoricalIngestionService(provider=MockProvider())
+        res = svc.ingest_symbol("WARMTEST", timeframe="5m")
+
+        self.assertEqual(res["created"], 2)
+        self.assertEqual(res["errors"], 0)
+        persisted = list(OHLCVBar.objects.filter(instrument=self.instrument, timeframe="5m").order_by("timestamp"))
+        self.assertEqual(len(persisted), 2)
+        self.assertEqual(persisted[0].timestamp.astimezone(self.IST).time(), time(9, 15))
+        self.assertEqual(persisted[1].timestamp.astimezone(self.IST).time(), time(15, 25))
+
+
+class Phase20BRuntimeReliabilityTests(TestCase):
+    """
+    Phase 20B unit and regression tests:
+    1. Ticker reconnect reliability, duplicate connection guards, and subscription preservation.
+    2. Authoritative completed bar selection, interim candle rejection, source precedence, and legitimate zero-volume preservation.
+    """
+
+    def setUp(self):
+        from zoneinfo import ZoneInfo
+        from market.models import Instrument, Company
+
+        self.IST = ZoneInfo("Asia/Kolkata")
+        self.company, _ = Company.objects.get_or_create(
+            name="Reliability Test Corp",
+            defaults={"isin": "INE999R01019", "sector": "Technology"},
+        )
+        self.instrument, _ = Instrument.objects.get_or_create(
+            symbol="RELTEST",
+            defaults={"company": self.company, "is_active": True, "instrument_type": "EQUITY"},
+        )
+
+    def test_ticker_reconnect_guards_against_duplicate_connections(self):
+        """When KiteTickerManager is already connected, reconnect() is a safe no-op."""
+        from market.services.kite_ticker import KiteTickerManager
+
+        manager = KiteTickerManager(api_key="mock_key", access_token="mock_token")
+        manager.is_connected = True
+
+        # Call reconnect
+        result = manager.reconnect()
+        self.assertTrue(result)
+        self.assertTrue(manager.is_connected)
+
+    def test_ticker_reconnect_preserves_and_restores_subscriptions(self):
+        """When disconnected, reconnect re-initializes client and restores all subscribed tokens."""
+        from market.services.kite_ticker import KiteTickerManager
+
+        class MockKws:
+            def __init__(self):
+                self.subscribed = []
+                self.mode = None
+                self.MODE_FULL = "full"
+                self.closed = False
+
+            def subscribe(self, tokens):
+                self.subscribed.extend(tokens)
+
+            def set_mode(self, mode, tokens):
+                self.mode = mode
+
+            def connect(self, threaded=True):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        mock_kws = MockKws()
+        manager = KiteTickerManager(
+            api_key="mock_key", access_token="mock_token", ticker_client=mock_kws
+        )
+        manager.subscribed_tokens = [12345, 67890]
+        manager.is_connected = False
+
+        # Simulate _on_connect callback
+        manager._on_connect(mock_kws, {})
+        self.assertTrue(manager.is_connected)
+        self.assertEqual(mock_kws.subscribed, [12345, 67890])
+        self.assertEqual(mock_kws.mode, "full")
+
+    def test_ticker_graceful_shutdown(self):
+        """manager.stop() safely closes kws and marks is_connected=False."""
+        from market.services.kite_ticker import KiteTickerManager
+
+        class MockKws:
+            def __init__(self):
+                self.closed = False
+                self.websocket_thread = None
+
+            def close(self):
+                self.closed = True
+
+        mock_kws = MockKws()
+        manager = KiteTickerManager(
+            api_key="mock_key", access_token="mock_token", ticker_client=mock_kws
+        )
+        manager.is_connected = True
+        manager.stop()
+
+        self.assertFalse(manager.is_connected)
+        self.assertTrue(mock_kws.closed)
+
+    def test_completed_candle_selection_filters_interim_unaligned_candles(self):
+        """_load_completed_bars excludes unaligned interim pseudo-bars and uncompleted candles."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.models import OHLCVBar
+
+        # Session date: 2026-10-16
+        # Candle 1: 11:20:00 (completed by 11:25:00)
+        # Candle 2: 11:25:00 (completed by 11:30:00)
+        # Candle 3: 11:30:00 (completes at 11:35:00)
+        # Interim pseudo-bar: 11:34:50 with volume=0
+        b1 = OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime(2026, 10, 16, 11, 20, 0, tzinfo=self.IST),
+            open=100.0, high=102.0, low=99.0, close=101.0, volume=50000,
+            source="NomadAggregator",
+        )
+        b2 = OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime(2026, 10, 16, 11, 25, 0, tzinfo=self.IST),
+            open=101.0, high=103.0, low=100.0, close=102.0, volume=60000,
+            source="NomadAggregator",
+        )
+        b3 = OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime(2026, 10, 16, 11, 30, 0, tzinfo=self.IST),
+            open=102.0, high=104.0, low=101.0, close=103.0, volume=70000,
+            source="NomadAggregator",
+        )
+        b_interim = OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime(2026, 10, 16, 11, 34, 50, tzinfo=self.IST),
+            open=103.0, high=103.0, low=103.0, close=103.0, volume=0,
+            source="YFinanceMarketProvider",
+        )
+
+        engine = IntradaySignalEngine()
+
+        # At as_of = 11:34:55:
+        # Latest completed candle is 11:25:00 (finishes at 11:30:00 <= 11:34:55).
+        # 11:30:00 candle finishes at 11:35:00 > 11:34:55 (still in-progress).
+        # Interim 11:34:50 is unaligned and in-progress.
+        as_of_1134 = datetime(2026, 10, 16, 11, 34, 55, tzinfo=self.IST)
+        bars = engine._load_completed_bars(self.instrument, "5m", as_of_1134)
+
+        self.assertEqual(len(bars), 2)
+        self.assertEqual(bars[-1].id, b2.id)
+        self.assertEqual(bars[-1].timestamp, b2.timestamp)
+        self.assertEqual(bars[-1].volume, 60000)
+
+        # At as_of = 11:35:05:
+        # The 11:30:00 candle has now completed (11:30:00 + 5m = 11:35:00 <= 11:35:05).
+        as_of_1135 = datetime(2026, 10, 16, 11, 35, 5, tzinfo=self.IST)
+        bars_1135 = engine._load_completed_bars(self.instrument, "5m", as_of_1135)
+
+        self.assertEqual(len(bars_1135), 3)
+        self.assertEqual(bars_1135[-1].id, b3.id)
+        self.assertEqual(bars_1135[-1].timestamp, b3.timestamp)
+        self.assertEqual(bars_1135[-1].volume, 70000)
+
+    def test_source_precedence_nomad_aggregator_over_yfinance(self):
+        """When multiple candidate bars share the same timestamp, NomadAggregator takes precedence."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from unittest.mock import patch, MagicMock
+
+        ts = datetime(2026, 10, 16, 10, 0, 0, tzinfo=self.IST)
+
+        # Candidate bar from YFinance with 0 volume
+        b_yf = MagicMock()
+        b_yf.timestamp = ts
+        b_yf.open = 100.0; b_yf.high = 100.0; b_yf.low = 100.0; b_yf.close = 100.0; b_yf.volume = 0
+        b_yf.source = "YFinanceMarketProvider"
+
+        # Candidate bar from NomadAggregator with live volume
+        b_agg = MagicMock()
+        b_agg.timestamp = ts
+        b_agg.open = 100.0; b_agg.high = 102.0; b_agg.low = 99.5; b_agg.close = 101.5; b_agg.volume = 25000
+        b_agg.source = "NomadAggregator"
+
+        engine = IntradaySignalEngine()
+        as_of = datetime(2026, 10, 16, 10, 10, 0, tzinfo=self.IST)
+
+        with patch("market.models.OHLCVBar.objects.filter") as mock_filter:
+            mock_filter.return_value.order_by.return_value.__getitem__.return_value = [b_yf, b_agg]
+            bars = engine._load_completed_bars(self.instrument, "5m", as_of)
+
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].source, "NomadAggregator")
+        self.assertEqual(bars[0].volume, 25000)
+
+    def test_preserves_legitimate_zero_volume_completed_candles(self):
+        """Aligned completed bars with volume=0 (e.g. illiquid or index) are preserved."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.models import OHLCVBar
+
+        ts = datetime(2026, 10, 16, 10, 15, 0, tzinfo=self.IST)
+        b = OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=ts,
+            open=100.0, high=100.0, low=100.0, close=100.0, volume=0,
+            source="NomadAggregator",
+        )
+
+        engine = IntradaySignalEngine()
+        as_of = datetime(2026, 10, 16, 10, 25, 0, tzinfo=self.IST)
+        bars = engine._load_completed_bars(self.instrument, "5m", as_of)
+
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].volume, 0)
+        self.assertEqual(bars[0].timestamp, ts)
+
+    def test_missing_latest_bars_triggers_stale_draft(self):
+        """When the latest completed bar is beyond allowable lag, Gate 2 returns a STALE no-action draft."""
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from unittest.mock import patch, MagicMock
+
+        engine = IntradaySignalEngine()
+        # Mock readiness to pass Gate 1
+        with patch("market.services.intraday_readiness.IntradayReadinessService.check_readiness") as mock_readiness:
+            mock_res = MagicMock()
+            mock_res.is_ready = True
+            mock_readiness.return_value = mock_res
+
+            # Create a completed bar from 2 hours ago
+            old_ts = datetime(2026, 10, 16, 9, 30, 0, tzinfo=self.IST)
+            mock_bars = []
+            for i in range(35):
+                b = MagicMock()
+                b.timestamp = old_ts - timedelta(minutes=(35 - i) * 5)
+                b.open = 100.0; b.high = 101.0; b.low = 99.0; b.close = 100.0; b.volume = 10000
+                b.source = "NomadAggregator"
+                mock_bars.append(b)
+
+            as_of = datetime(2026, 10, 16, 11, 45, 0, tzinfo=self.IST)
+
+            with patch.object(engine, "_load_completed_bars", return_value=mock_bars):
+                draft = engine.generate_recommendation(self.instrument, "5m", as_of=as_of)
+
+            self.assertEqual(draft.signal, "NO_ACTION")
+            self.assertEqual(draft.data_quality.get("status"), "STALE")
+            self.assertIn("stale", (draft.invalidation_reason or "").lower())
+
+    def test_completed_bars_rejects_preopen_and_postmarket_bars(self):
+        """
+        Phase 20B.2 Fix A Regression:
+        _load_completed_bars strictly rejects off-session bars (< 09:15:00 IST or >= 15:30:00 IST).
+        Tests 09:10, 09:14, 09:15, valid aligned intraday, 15:25, 15:30, and post-market (15:35, 16:00)
+        across both 1m and 5m timeframes, including UTC timezone conversions.
+        """
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.models import OHLCVBar
+        from datetime import datetime, time, timedelta
+        from zoneinfo import ZoneInfo
+
+        ist = ZoneInfo("Asia/Kolkata")
+        d = datetime(2026, 10, 16, tzinfo=ist).date()
+        engine = IntradaySignalEngine()
+
+        # ── 1. Test 5-minute timeframe ────────────────────────────────────────
+        # 09:10 (pre-open, minute%5==0, must be rejected)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(9, 10), tzinfo=ist),
+            open=100, high=101, low=99, close=100, volume=1000, source="NomadAggregator",
+        )
+        # 09:15 (regular session start, valid)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(9, 15), tzinfo=ist),
+            open=100, high=102, low=100, close=101, volume=5000, source="NomadAggregator",
+        )
+        # 11:30 (aligned midday bar, valid)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(11, 30), tzinfo=ist),
+            open=101, high=103, low=101, close=102, volume=6000, source="NomadAggregator",
+        )
+        # 15:25 (last valid 5m bar of regular session)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(15, 25), tzinfo=ist),
+            open=102, high=103, low=101, close=102, volume=4000, source="NomadAggregator",
+        )
+        # 15:30 (session close boundary, must be rejected)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(15, 30), tzinfo=ist),
+            open=102, high=102, low=102, close=102, volume=100, source="NomadAggregator",
+        )
+        # 15:35 (post-market, must be rejected)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(15, 35), tzinfo=ist),
+            open=102, high=102, low=102, close=102, volume=50, source="NomadAggregator",
+        )
+
+        as_of_eod = datetime.combine(d, time(16, 0), tzinfo=ist)
+        bars_5m = engine._load_completed_bars(self.instrument, "5m", as_of_eod)
+        bar_5m_times = [b.timestamp.astimezone(ist).time() for b in bars_5m]
+
+        self.assertNotIn(time(9, 10), bar_5m_times)
+        self.assertIn(time(9, 15), bar_5m_times)
+        self.assertIn(time(11, 30), bar_5m_times)
+        self.assertIn(time(15, 25), bar_5m_times)
+        self.assertNotIn(time(15, 30), bar_5m_times)
+        self.assertNotIn(time(15, 35), bar_5m_times)
+        self.assertEqual(len(bars_5m), 3)
+
+        # ── 2. Test 1-minute timeframe & Timezone normalization ───────────────
+        ts_0914_utc = datetime.combine(d, time(9, 14), tzinfo=ist).astimezone(ZoneInfo("UTC"))
+        ts_0915_utc = datetime.combine(d, time(9, 15), tzinfo=ist).astimezone(ZoneInfo("UTC"))
+        ts_1529_utc = datetime.combine(d, time(15, 29), tzinfo=ist).astimezone(ZoneInfo("UTC"))
+        ts_1530_utc = datetime.combine(d, time(15, 30), tzinfo=ist).astimezone(ZoneInfo("UTC"))
+        ts_1600_utc = datetime.combine(d, time(16, 0), tzinfo=ist).astimezone(ZoneInfo("UTC"))
+
+        OHLCVBar.objects.create(instrument=self.instrument, timeframe="1m", timestamp=ts_0914_utc, open=100, high=100, low=100, close=100, volume=100, source="NomadAggregator")
+        OHLCVBar.objects.create(instrument=self.instrument, timeframe="1m", timestamp=ts_0915_utc, open=100, high=101, low=100, close=100.5, volume=500, source="NomadAggregator")
+        OHLCVBar.objects.create(instrument=self.instrument, timeframe="1m", timestamp=ts_1529_utc, open=102, high=102.5, low=102, close=102.2, volume=600, source="NomadAggregator")
+        OHLCVBar.objects.create(instrument=self.instrument, timeframe="1m", timestamp=ts_1530_utc, open=102, high=102, low=102, close=102, volume=200, source="NomadAggregator")
+        OHLCVBar.objects.create(instrument=self.instrument, timeframe="1m", timestamp=ts_1600_utc, open=102, high=102, low=102, close=102, volume=10, source="NomadAggregator")
+
+        bars_1m = engine._load_completed_bars(self.instrument, "1m", as_of_eod)
+        bar_1m_times = [b.timestamp.astimezone(ist).time() for b in bars_1m]
+
+        self.assertNotIn(time(9, 14), bar_1m_times)
+        self.assertIn(time(9, 15), bar_1m_times)
+        self.assertIn(time(15, 29), bar_1m_times)
+        self.assertNotIn(time(15, 30), bar_1m_times)
+        self.assertNotIn(time(16, 0), bar_1m_times)
+        self.assertEqual(len(bars_1m), 2)
+
+    def test_preopen_bars_cannot_contaminate_vwap_calculations(self):
+        """
+        Phase 20B.2 Fix A Regression:
+        Verifies that pre-open records cannot enter VWAP calculation through _load_completed_bars.
+        """
+        from market.services.intraday_signal_engine import IntradaySignalEngine
+        from market.services.intraday_indicators import compute_intraday_indicators
+        from market.models import OHLCVBar
+        from datetime import datetime, time
+        from zoneinfo import ZoneInfo
+
+        ist = ZoneInfo("Asia/Kolkata")
+        d = datetime(2026, 10, 16, tzinfo=ist).date()
+        engine = IntradaySignalEngine()
+
+        # Pre-open bar at 09:10 with outlier price 200.0 (normal price 100.0)
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(9, 10), tzinfo=ist),
+            open=200.0, high=200.0, low=200.0, close=200.0, volume=100000,
+            source="NomadAggregator",
+        )
+        # Regular bar at 09:15 at price 100.0
+        OHLCVBar.objects.create(
+            instrument=self.instrument, timeframe="5m",
+            timestamp=datetime.combine(d, time(9, 15), tzinfo=ist),
+            open=100.0, high=101.0, low=99.0, close=100.0, volume=1000,
+            source="NomadAggregator",
+        )
+
+        as_of = datetime.combine(d, time(9, 25), tzinfo=ist)
+        bars = engine._load_completed_bars(self.instrument, "5m", as_of)
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].timestamp.astimezone(ist).time(), time(9, 15))
+
+        # Compute indicators on loaded bars
+        indicators = compute_intraday_indicators(bars, session_date=d)
+        # VWAP should be 100.0 (based exclusively on the 09:15 bar, completely unaffected by the 200.0 pre-open bar)
+        self.assertAlmostEqual(indicators.vwap, 100.0, places=1)
+
+    def test_process_locking_guards_against_duplicate_daemons_and_preserves_pid(self):
+        """
+        Phase 20B.2 Fix B Regression:
+        Proves that non-truncating open preserves original PID when a second process
+        attempts startup, and that subsequent legitimate startup succeeds after release.
+        """
+        import fcntl
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            lock_path = tmp.name
+
+        try:
+            # Process 1 acquires lock using non-truncating open pattern
+            fd1 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            f1 = open(fd1, "r+", closefd=True)
+            fcntl.flock(f1, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f1.seek(0)
+            f1.truncate()
+            f1.write("12345")
+            f1.flush()
+
+            # Process 2 attempts startup on the same file
+            blocked = False
+            fd2 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            f2 = open(fd2, "r+", closefd=True)
+            try:
+                fcntl.flock(f2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                f2.seek(0)
+                f2.truncate()
+                f2.write("99999")
+                f2.flush()
+            except (BlockingIOError, IOError):
+                blocked = True
+            finally:
+                f2.close()
+
+            # Process 2 was blocked
+            self.assertTrue(blocked)
+            # CRITICAL: Active PID '12345' was NOT truncated to 0 bytes
+            with open(lock_path, "r") as reader:
+                content = reader.read()
+            self.assertEqual(content, "12345")
+
+            # Process 1 releases lock and removes file
+            fcntl.flock(f1, fcntl.LOCK_UN)
+            f1.close()
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+
+            # Process 3 (later legitimate startup) successfully acquires
+            fd3 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            f3 = open(fd3, "r+", closefd=True)
+            fcntl.flock(f3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f3.seek(0)
+            f3.truncate()
+            f3.write("67890")
+            f3.flush()
+
+            with open(lock_path, "r") as reader:
+                content3 = reader.read()
+            self.assertEqual(content3, "67890")
+
+            fcntl.flock(f3, fcntl.LOCK_UN)
+            f3.close()
+        finally:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
