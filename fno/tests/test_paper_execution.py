@@ -3,7 +3,7 @@ Unit tests for StatutoryFeeCalculator, PaperExecutionEngine, and StrategyPerform
 Reference: Phase 22D Specification
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import uuid
 import zoneinfo
@@ -21,8 +21,11 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 class PaperExecutionTestCase(TestCase):
     def setUp(self):
         self.fee_calc = StatutoryFeeCalculator()
-        self.engine = PaperExecutionEngine(fee_calculator=self.fee_calc)
         self.now_utc = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
+        self.engine = PaperExecutionEngine(
+            fee_calculator=self.fee_calc,
+            clock=lambda: self.now_utc,
+        )
         self.expiry = date(2026, 10, 22)
 
         self.quote_valid = OptionQuoteSnapshot.objects.create(
@@ -1083,7 +1086,12 @@ class PaperExecutionTestCase(TestCase):
         )
 
         # 1. Entry fill records exchange_time (09:30:00), not arrival_time (09:30:01.850)
-        evt_buy = self.engine.process_signal(self.signal_buy, q_skew, execution_wall_time=None)
+        evt_buy = self.engine.process_signal(
+            self.signal_buy,
+            q_skew,
+            execution_wall_time=None,
+            validation_time=arrival_time,
+        )
         self.assertEqual(evt_buy.event_type, "ORDER_FILLED")
         self.assertEqual(evt_buy.timestamp, exch_time)
         self.assertNotEqual(evt_buy.timestamp, arrival_time)
@@ -1119,7 +1127,12 @@ class PaperExecutionTestCase(TestCase):
             trigger_rationale="Target",
             snapshot_reference_id="snap-skew-exit",
         )
-        evt_exit = self.engine.process_signal(sig_exit, q_exit, execution_wall_time=None)
+        evt_exit = self.engine.process_signal(
+            sig_exit,
+            q_exit,
+            execution_wall_time=None,
+            validation_time=arrival_exit,
+        )
         self.assertEqual(evt_exit.event_type, "POSITION_CLOSED")
         self.assertEqual(evt_exit.timestamp, exch_exit)
         self.assertNotEqual(evt_exit.timestamp, arrival_exit)
@@ -1128,5 +1141,269 @@ class PaperExecutionTestCase(TestCase):
         self.assertEqual(trade.exit_timestamp, exch_exit)
         self.assertNotEqual(trade.exit_timestamp, arrival_exit)
         self.assertEqual(trade.friction_breakdown["effective_schedule_date"], "2026-04-01")
+
+
+class QuoteFreshnessGuardTestCase(TestCase):
+    """
+    Focused regression test suite for Phase 22D Quote-Freshness Safety.
+    Verifies dynamic quote age recalculation at the execution decision boundary,
+    rejection of stale, future, missing, and timezone-naive timestamps,
+    and symmetrical entry and exit gating with open exposure preservation.
+    """
+
+    def setUp(self):
+        self.fee_calc = StatutoryFeeCalculator()
+        self.now_utc = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
+        self.engine = PaperExecutionEngine(
+            fee_calculator=self.fee_calc,
+            clock=lambda: self.now_utc,
+        )
+        self.expiry = date(2026, 10, 22)
+
+        self.signal_buy = OptionSignal(
+            signal_id=str(uuid.uuid4()),
+            strategy_id="STRAT-FRESH-01",
+            strategy_version="1.0.0",
+            tradingsymbol="NIFTY26OCT24500CE",
+            instrument_token=3001,
+            underlying_symbol="^NSEI",
+            option_type="CE",
+            strike_price=Decimal("24500.00"),
+            expiry_date=self.expiry,
+            action="BUY_TO_OPEN",
+            suggested_lot_count=1,
+            limit_price_hint=Decimal("100.00"),
+            trigger_rule_name="ORB_TEST",
+            trigger_rationale="Freshness test buy",
+            snapshot_reference_id="snap-fresh-buy",
+        )
+
+        self.signal_exit = OptionSignal(
+            signal_id=str(uuid.uuid4()),
+            strategy_id="STRAT-FRESH-01",
+            strategy_version="1.0.0",
+            tradingsymbol="NIFTY26OCT24500CE",
+            instrument_token=3001,
+            underlying_symbol="^NSEI",
+            option_type="CE",
+            strike_price=Decimal("24500.00"),
+            expiry_date=self.expiry,
+            action="EXIT_TARGET",
+            suggested_lot_count=1,
+            trigger_rule_name="TARGET_TEST",
+            trigger_rationale="Freshness test exit",
+            snapshot_reference_id="snap-fresh-exit",
+        )
+
+    def _create_quote(self, **kwargs) -> OptionQuoteSnapshot:
+        defaults = {
+            "instrument_token": 3001,
+            "tradingsymbol": "NIFTY26OCT24500CE",
+            "exchange_timestamp_utc": self.now_utc,
+            "received_wall_clock_utc": self.now_utc,
+            "exchange_time_status": "VALID",
+            "best_bid": Decimal("100.00"),
+            "best_ask": Decimal("101.00"),
+            "bid_quantity_l1": 500,
+            "ask_quantity_l1": 500,
+            "quote_status": "VALID",
+            "is_stale": False,
+            "is_locked": False,
+            "is_crossed": False,
+            "is_execution_eligible": True,
+        }
+        defaults.update(kwargs)
+        return OptionQuoteSnapshot.objects.create(**defaults)
+
+    def test_fresh_quote_at_exact_threshold_boundary(self):
+        """Verifies boundary: age <= 3.0s passes; age > 3.0s is rejected."""
+        # 1. Quote age exactly 0.0s -> passes
+        q_0s = self._create_quote(exchange_timestamp_utc=self.now_utc)
+        sig1 = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt1 = self.engine.process_signal(sig1, q_0s)
+        self.assertEqual(evt1.event_type, "ORDER_FILLED")
+
+        # Clean active trade to test next boundary
+        self.engine.active_trades.clear()
+        PaperTradeLedger.objects.all().delete()
+
+        # 2. Quote age exactly 3.0s -> passes (documented inclusive boundary)
+        q_3s = self._create_quote(exchange_timestamp_utc=self.now_utc - timedelta(seconds=3))
+        sig2 = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt2 = self.engine.process_signal(sig2, q_3s)
+        self.assertEqual(evt2.event_type, "ORDER_FILLED")
+
+        self.engine.active_trades.clear()
+        PaperTradeLedger.objects.all().delete()
+
+        # 3. Quote age 3.001s (> 3.0s) -> rejected
+        q_3001s = self._create_quote(exchange_timestamp_utc=self.now_utc - timedelta(milliseconds=3001))
+        sig3 = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt3 = self.engine.process_signal(sig3, q_3001s)
+        self.assertEqual(evt3.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt3.message, "REJECTED_STALE_QUOTE")
+
+    def test_quote_aging_after_ingestion_rejection(self):
+        """
+        Verifies Finding A: A quote whose persisted is_stale flag is False is
+        re-evaluated and rejected when decision clock evaluates it as > 3.0s old.
+        """
+        q_aged = self._create_quote(
+            exchange_timestamp_utc=self.now_utc - timedelta(seconds=10),
+            is_stale=False,  # Persisted flag at ingestion time was False!
+            quote_status="VALID",
+        )
+        sig = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt = self.engine.process_signal(sig, q_aged)
+
+        self.assertEqual(evt.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt.message, "REJECTED_STALE_QUOTE")
+
+        # Verify DB ledger record: rejected, no fills, no fees, no P&L
+        trade = PaperTradeLedger.objects.get(signal_id=uuid.UUID(sig.signal_id))
+        self.assertEqual(trade.status, "REJECTED")
+        self.assertEqual(trade.entry_fill_price, Decimal("0.00"))
+        self.assertEqual(trade.total_frictions, Decimal("0.00"))
+        self.assertIsNone(trade.gross_pnl)
+        self.assertIsNone(trade.net_pnl)
+
+    def test_future_exchange_timestamp_rejected(self):
+        """Verifies quotes with exchange timestamps in the future are rejected."""
+        q_future = self._create_quote(
+            exchange_timestamp_utc=self.now_utc + timedelta(seconds=5),
+        )
+        sig = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt = self.engine.process_signal(sig, q_future)
+
+        self.assertEqual(evt.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt.message, "REJECTED_FUTURE_TIMESTAMP")
+
+        trade = PaperTradeLedger.objects.get(signal_id=uuid.UUID(sig.signal_id))
+        self.assertEqual(trade.status, "REJECTED")
+        self.assertEqual(trade.rejection_reason, "REJECTED_FUTURE_TIMESTAMP")
+
+    def test_timezone_naive_exchange_timestamp_rejected(self):
+        """Verifies quotes with timezone-naive timestamps fail closed as REJECTED_TIMEZONE_AMBIGUOUS."""
+        naive_dt = datetime(2026, 10, 19, 10, 0, 0)  # tzinfo=None
+        q_naive = OptionQuoteSnapshot(
+            instrument_token=3001,
+            tradingsymbol="NIFTY26OCT24500CE",
+            exchange_timestamp_utc=naive_dt,
+            received_wall_clock_utc=self.now_utc,
+            exchange_time_status="VALID",
+            best_bid=Decimal("100.00"),
+            best_ask=Decimal("101.00"),
+            quote_status="VALID",
+        )
+        sig = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt = self.engine.process_signal(sig, q_naive)
+
+        self.assertEqual(evt.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt.message, "REJECTED_TIMEZONE_AMBIGUOUS")
+
+    def test_stale_exit_rejected_preserves_unresolved_exposure(self):
+        """
+        Verifies Finding B: Exit path applies full quote freshness guard.
+        A stale quote on exit transitions the trade to PENDING_LIQUIDITY,
+        records REJECTED_STALE_QUOTE, preserves unresolved exposure, and charges ZERO fees/P&L.
+        """
+        # 1. Establish open trade
+        q_fresh = self._create_quote(exchange_timestamp_utc=self.now_utc)
+        sig_buy = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt_buy = self.engine.process_signal(sig_buy, q_fresh)
+        self.assertEqual(evt_buy.event_type, "ORDER_FILLED")
+
+        trade = PaperTradeLedger.objects.get(signal_id=uuid.UUID(sig_buy.signal_id))
+        self.assertEqual(trade.status, "OPEN")
+
+        # 2. Attempt exit with stale quote (age = 8 seconds, persisted is_stale=False)
+        q_stale_exit = self._create_quote(
+            exchange_timestamp_utc=self.now_utc - timedelta(seconds=8),
+            is_stale=False,
+            quote_status="VALID",
+            best_bid=Decimal("110.00"),
+            best_ask=Decimal("111.00"),
+        )
+        sig_exit = self.signal_exit.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt_exit = self.engine.process_signal(sig_exit, q_stale_exit)
+
+        self.assertEqual(evt_exit.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt_exit.message, "REJECTED_STALE_QUOTE")
+        self.assertIsNone(evt_exit.fill_price)
+        self.assertEqual(evt_exit.fill_quantity, 0)
+
+        # 3. Verify exposure is preserved in PENDING_LIQUIDITY
+        trade.refresh_from_db()
+        self.assertEqual(trade.status, "PENDING_LIQUIDITY")
+        self.assertEqual(trade.rejection_reason, "REJECTED_STALE_QUOTE")
+        self.assertEqual(trade.exit_trigger_reason, "EXIT_TARGET")
+        self.assertIsNone(trade.exit_timestamp)
+        self.assertIsNone(trade.exit_fill_price)
+        self.assertIsNone(trade.gross_pnl)
+        self.assertIsNone(trade.net_pnl)
+        self.assertEqual(trade.total_frictions, Decimal("0.00"))
+
+        # In-memory tracking remains active
+        trade_key = f"{sig_exit.strategy_id}:{sig_exit.tradingsymbol}"
+        self.assertIn(trade_key, self.engine.active_trades)
+
+    def test_exit_microstructure_gates_preserve_position_and_zero_frictions(self):
+        """Verifies locked, crossed, and wide-spread quotes on exit reject and preserve exposure."""
+        # 1. Establish open trade
+        q_fresh = self._create_quote(exchange_timestamp_utc=self.now_utc)
+        sig_buy = self.signal_buy.model_copy(update={"signal_id": str(uuid.uuid4())})
+        self.engine.process_signal(sig_buy, q_fresh)
+        trade = PaperTradeLedger.objects.get(signal_id=uuid.UUID(sig_buy.signal_id))
+
+        # Locked quote on exit
+        q_locked = self._create_quote(
+            exchange_timestamp_utc=self.now_utc,
+            best_bid=Decimal("105.00"),
+            best_ask=Decimal("105.00"),
+            is_locked=True,
+            quote_status="LOCKED",
+        )
+        sig_exit1 = self.signal_exit.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt1 = self.engine.process_signal(sig_exit1, q_locked)
+        self.assertEqual(evt1.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt1.message, "REJECTED_LOCKED_QUOTE")
+        trade.refresh_from_db()
+        self.assertEqual(trade.status, "PENDING_LIQUIDITY")
+        self.assertEqual(trade.rejection_reason, "REJECTED_LOCKED_QUOTE")
+        self.assertIsNone(trade.net_pnl)
+
+        # Crossed quote on exit
+        q_crossed = self._create_quote(
+            exchange_timestamp_utc=self.now_utc,
+            best_bid=Decimal("110.00"),
+            best_ask=Decimal("105.00"),
+            is_crossed=True,
+            quote_status="CROSSED",
+        )
+        sig_exit2 = self.signal_exit.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt2 = self.engine.process_signal(sig_exit2, q_crossed)
+        self.assertEqual(evt2.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt2.message, "REJECTED_CROSSED_BOOK")
+        trade.refresh_from_db()
+        self.assertEqual(trade.status, "PENDING_LIQUIDITY")
+        self.assertEqual(trade.rejection_reason, "REJECTED_CROSSED_BOOK")
+        self.assertIsNone(trade.net_pnl)
+
+        # Wide spread quote on exit (>2.5%)
+        q_wide = self._create_quote(
+            exchange_timestamp_utc=self.now_utc,
+            best_bid=Decimal("100.00"),
+            best_ask=Decimal("104.00"),  # 4% spread
+        )
+        sig_exit3 = self.signal_exit.model_copy(update={"signal_id": str(uuid.uuid4())})
+        evt3 = self.engine.process_signal(sig_exit3, q_wide)
+        self.assertEqual(evt3.event_type, "ORDER_REJECTED")
+        self.assertEqual(evt3.message, "REJECTED_EXCESSIVE_SPREAD")
+        trade.refresh_from_db()
+        self.assertEqual(trade.status, "PENDING_LIQUIDITY")
+        self.assertEqual(trade.rejection_reason, "REJECTED_EXCESSIVE_SPREAD")
+        self.assertIsNone(trade.net_pnl)
+        self.assertEqual(trade.total_frictions, Decimal("0.00"))
+
 
 

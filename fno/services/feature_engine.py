@@ -265,14 +265,33 @@ class OptionFeatureEngine:
             ask_q1 = quote.ask_quantity_l1
 
             if exch_ts and exch_status == "VALID":
-                age_sec = Decimal(str(round((now_utc - exch_ts).total_seconds(), 3)))
-                quote_age = max(Decimal("0.0"), age_sec)
-                feed_lat_ms = int((rec_wall - exch_ts).total_seconds() * 1000)
-                is_fresh = (quote_age <= Decimal("3.0"))
+                if exch_ts.tzinfo is None or now_utc.tzinfo is None:
+                    quote_age = None
+                    feed_lat_ms = None
+                    is_fresh = False
+                    is_stale = True
+                    exch_status = "TIMEZONE_AMBIGUOUS_REJECTED"
+                else:
+                    diff_sec = (now_utc - exch_ts).total_seconds()
+                    age_sec = Decimal(str(round(diff_sec, 3)))
+                    quote_age = age_sec
+                    feed_lat_ms = (
+                        int((rec_wall - exch_ts).total_seconds() * 1000)
+                        if (rec_wall and rec_wall.tzinfo)
+                        else None
+                    )
+                    if diff_sec < 0:
+                        is_fresh = False
+                        is_stale = True
+                        exch_status = "FUTURE_SKEW_REJECTED"
+                    else:
+                        is_fresh = (age_sec <= Decimal("3.0")) and not quote.is_stale and (quote.quote_status != "STALE")
+                        is_stale = not is_fresh
             else:
                 quote_age = None
                 feed_lat_ms = None
                 is_fresh = False
+                is_stale = True
         else:
             rec_wall = now_utc
             exch_ts = None

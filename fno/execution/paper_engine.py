@@ -26,7 +26,7 @@ Enforces:
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 import uuid
 import zoneinfo
 
@@ -93,10 +93,19 @@ class PaperExecutionEngine:
     MAX_ALLOWED_SPREAD_PCT = Decimal("0.025")  # 2.5%
     QUOTE_FRESHNESS_LIMIT_SEC = Decimal("3.0")
 
-    def __init__(self, fee_calculator: Optional[StatutoryFeeCalculator] = None):
+    def __init__(
+        self,
+        fee_calculator: Optional[StatutoryFeeCalculator] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+    ):
         self.fee_calculator = fee_calculator or StatutoryFeeCalculator()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.active_trades: Dict[str, PaperTradeLedger] = {}  # Key: f"{strategy_id}:{tradingsymbol}"
         self.sync_active_trades_from_db()
+
+    def get_decision_time(self, validation_time: Optional[datetime] = None) -> datetime:
+        """Returns authoritative decision-boundary clock used to evaluate quote freshness."""
+        return validation_time if validation_time is not None else self.clock()
 
     def sync_active_trades_from_db(self) -> int:
         """
@@ -212,10 +221,13 @@ class PaperExecutionEngine:
         market_regime: Optional[str] = None,
         vix_level: Optional[Decimal] = None,
         execution_wall_time: Optional[datetime] = None,
+        *,
+        validation_time: Optional[datetime] = None,
     ) -> Optional[PaperTradeEvent]:
         """
         Executes an incoming OptionSignal against the current quote state.
-        Enforces strict statutory fee-schedule date validation and exchange timestamp verification.
+        Enforces strict statutory fee-schedule date validation, exchange timestamp verification,
+        and quote-freshness evaluation at the decision boundary.
         Returns a PaperTradeEvent reflecting the outcome.
         """
         return self._process_signal_internal(
@@ -225,6 +237,7 @@ class PaperExecutionEngine:
             vix_level=vix_level,
             execution_wall_time=execution_wall_time,
             allow_default_schedule=False,
+            validation_time=validation_time,
         )
 
     def _test_only_process_signal_with_override(
@@ -236,6 +249,7 @@ class PaperExecutionEngine:
         execution_wall_time: Optional[datetime] = None,
         *,
         allow_default_schedule: bool = True,
+        validation_time: Optional[datetime] = None,
     ) -> Optional[PaperTradeEvent]:
         """
         TEST-ONLY helper for synthetic unit tests requiring explicit fee schedule override.
@@ -248,6 +262,7 @@ class PaperExecutionEngine:
             vix_level=vix_level,
             execution_wall_time=execution_wall_time,
             allow_default_schedule=allow_default_schedule,
+            validation_time=validation_time,
         )
 
     def _process_signal_internal(
@@ -258,6 +273,7 @@ class PaperExecutionEngine:
         vix_level: Optional[Decimal] = None,
         execution_wall_time: Optional[datetime] = None,
         allow_default_schedule: bool = False,
+        validation_time: Optional[datetime] = None,
     ) -> Optional[PaperTradeEvent]:
         """
         Internal implementation of process_signal supporting explicit schedule override
@@ -299,6 +315,7 @@ class PaperExecutionEngine:
                 trade_key=trade_key,
                 execution_time=execution_time,
                 allow_default_schedule=allow_default_schedule,
+                validation_time=validation_time,
             )
 
         # --- Handle BUY_TO_OPEN Signal ---
@@ -310,6 +327,8 @@ class PaperExecutionEngine:
                 market_regime=market_regime,
                 vix_level=vix_level,
                 execution_time=execution_time,
+                validation_time=validation_time,
+                allow_default_schedule=allow_default_schedule,
             )
 
         return None
@@ -322,6 +341,8 @@ class PaperExecutionEngine:
         market_regime: Optional[str],
         vix_level: Optional[Decimal],
         execution_time: Optional[datetime],
+        validation_time: Optional[datetime] = None,
+        allow_default_schedule: bool = False,
     ) -> PaperTradeEvent:
         """Validates and executes entry buy taker fills."""
         # 0. Check Authoritative Execution Timestamp
@@ -400,7 +421,12 @@ class PaperExecutionEngine:
             )
 
         # Microstructure Gating Checks
-        rejection_reason = self._check_quote_execution_eligibility(quote)
+        rejection_reason = self._check_quote_execution_eligibility(
+            quote,
+            validation_time=validation_time,
+            is_exit=False,
+            allow_default_schedule=allow_default_schedule,
+        )
         if rejection_reason is not None:
             logger.info("Entry signal %s rejected by quote gate: %s", signal.signal_id, rejection_reason)
             with transaction.atomic():
@@ -515,6 +541,7 @@ class PaperExecutionEngine:
         trade_key: str,
         execution_time: Optional[datetime],
         allow_default_schedule: bool = False,
+        validation_time: Optional[datetime] = None,
     ) -> PaperTradeEvent:
         """Validates and executes exit orders against best bid."""
         trade = self.active_trades.get(trade_key)
@@ -616,6 +643,39 @@ class PaperExecutionEngine:
                 slippage=Decimal("0.00"),
                 timestamp=execution_time,
                 message="EXIT_UNEXECUTABLE_TINY_BID",
+            )
+
+        # 3. Symmetric quote freshness and microstructure eligibility gate for exit
+        eligibility_reason = self._check_quote_execution_eligibility(
+            quote,
+            validation_time=validation_time,
+            is_exit=True,
+            allow_default_schedule=allow_default_schedule,
+        )
+        if eligibility_reason is not None:
+            logger.warning(
+                "Exit quote failed eligibility guard (%s) on signal %s for %s. Preserving trade in PENDING_LIQUIDITY.",
+                eligibility_reason,
+                signal.signal_id,
+                trade.tradingsymbol,
+            )
+            trade.status = "PENDING_LIQUIDITY"
+            trade.exit_trigger_reason = signal.action
+            trade.rejection_reason = eligibility_reason
+            trade.save()
+            self.active_trades[trade_key] = trade
+
+            return PaperTradeEvent(
+                event_id=str(uuid.uuid4()),
+                event_type="ORDER_REJECTED",
+                strategy_id=signal.strategy_id,
+                signal_id=signal.signal_id,
+                tradingsymbol=signal.tradingsymbol,
+                fill_price=None,
+                fill_quantity=0,
+                slippage=Decimal("0.00"),
+                timestamp=execution_time,
+                message=eligibility_reason,
             )
 
         # 3. Valid Taker Sell Fill Execution
@@ -933,10 +993,43 @@ class PaperExecutionEngine:
             message=new_status,
         )
 
-    def _check_quote_execution_eligibility(self, quote: OptionQuoteSnapshot) -> Optional[str]:
-        """Validates quote microstructure for taker fills."""
-        if quote.exchange_time_status != "VALID":
-            return "REJECTED_UNVERIFIED_TIMESTAMP"
+    def _check_quote_execution_eligibility(
+        self,
+        quote: OptionQuoteSnapshot,
+        validation_time: Optional[datetime] = None,
+        *,
+        is_exit: bool = False,
+        allow_default_schedule: bool = False,
+    ) -> Optional[str]:
+        """
+        Validates quote freshness, timestamp integrity, and order-book microstructure
+        at the execution decision boundary for taker fills.
+        """
+        if quote is None:
+            return "REJECTED_MISSING_QUOTE"
+
+        if not (allow_default_schedule and quote.exchange_timestamp_utc is None):
+            if quote.exchange_time_status != "VALID" or quote.exchange_timestamp_utc is None:
+                return "REJECTED_UNVERIFIED_TIMESTAMP"
+
+            # Timezone verification - fail closed on naive datetimes
+            if quote.exchange_timestamp_utc.tzinfo is None:
+                return "REJECTED_TIMEZONE_AMBIGUOUS"
+
+            decision_time = self.get_decision_time(validation_time)
+            if decision_time.tzinfo is None:
+                return "REJECTED_TIMEZONE_AMBIGUOUS"
+
+            # Dynamically recalculate quote age at decision boundary
+            quote_age_sec = Decimal(str(round((decision_time - quote.exchange_timestamp_utc).total_seconds(), 4)))
+            if quote_age_sec < Decimal("0.0"):
+                return "REJECTED_FUTURE_TIMESTAMP"
+
+            if quote_age_sec > self.QUOTE_FRESHNESS_LIMIT_SEC:
+                return "REJECTED_STALE_QUOTE"
+
+        if quote.is_stale or quote.quote_status == "STALE":
+            return "REJECTED_STALE_QUOTE"
 
         if quote.quote_status == "EMPTY_BOOK" or quote.best_ask is None or quote.best_bid is None:
             return "REJECTED_EMPTY_BOOK"
@@ -944,8 +1037,8 @@ class PaperExecutionEngine:
         if quote.quote_status == "ZERO_BID" or quote.best_bid <= Decimal("0.00"):
             return "REJECTED_ZERO_BID"
 
-        if quote.is_stale or quote.quote_status == "STALE":
-            return "REJECTED_STALE_QUOTE"
+        if not is_exit and quote.best_ask <= Decimal("0.00"):
+            return "REJECTED_INVALID_ASK_PRICE"
 
         if quote.is_locked or quote.quote_status == "LOCKED":
             return "REJECTED_LOCKED_QUOTE"

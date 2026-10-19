@@ -3,7 +3,7 @@ Unit tests for OptionFeatureEngine & OptionFeatureSnapshot schema.
 Reference: Phase 22B Specification
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from django.test import TestCase
 
@@ -257,4 +257,39 @@ class FeatureEngineTestCase(TestCase):
         )
         self.assertFalse(snapshot.is_valid_for_signal)
         self.assertEqual(snapshot.greeks_status, "CALCULATION_FAILED")
+
+    def test_future_exchange_timestamp_sets_future_skew_and_invalidates_signal(self):
+        """Verifies quotes with future exchange timestamps trigger FUTURE_SKEW_REJECTED and is_stale=True."""
+        self.quote.exchange_timestamp_utc = self.ts + timedelta(seconds=10)
+        self.quote.save()
+
+        snapshot = self.feature_engine.build_snapshot(
+            bar=self.bar,
+            quote=self.quote,
+            underlying_spot=Decimal("24500.00"),
+            calculation_time=self.ts,
+        )
+        self.assertFalse(snapshot.is_quote_fresh)
+        self.assertTrue(snapshot.is_stale)
+        self.assertLess(snapshot.quote_age_seconds, Decimal("0.0"))
+        self.assertEqual(snapshot.exchange_time_status, "FUTURE_SKEW_REJECTED")
+        self.assertFalse(snapshot.is_valid_for_signal)
+
+    def test_quote_aging_marks_stale_and_invalidates_signal(self):
+        """Verifies quote age > 3.0s recalculates is_quote_fresh=False and is_stale=True even if quote.is_stale was False."""
+        self.quote.exchange_timestamp_utc = self.ts - timedelta(seconds=5)
+        self.quote.is_stale = False
+        self.quote.save()
+
+        snapshot = self.feature_engine.build_snapshot(
+            bar=self.bar,
+            quote=self.quote,
+            underlying_spot=Decimal("24500.00"),
+            calculation_time=self.ts,
+        )
+        self.assertFalse(snapshot.is_quote_fresh)
+        self.assertTrue(snapshot.is_stale)
+        self.assertGreater(snapshot.quote_age_seconds, Decimal("3.0"))
+        self.assertFalse(snapshot.is_valid_for_signal)
+
 

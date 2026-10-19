@@ -7,6 +7,7 @@ before signals can be forwarded to the paper execution engine.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -38,9 +39,11 @@ class SignalValidator:
     def validate_snapshot_eligibility(
         self,
         snapshot: OptionFeatureSnapshot,
+        validation_time: Optional[datetime] = None,
     ) -> SignalValidationResult:
         """
         Validates feature snapshot before a strategy can use it for signal generation.
+        Enforces quote freshness, timestamp integrity, metadata consistency, and order-book health.
         """
         if snapshot.is_partial_bar:
             return SignalValidationResult(
@@ -49,12 +52,86 @@ class SignalValidator:
                 rejection_reason="Bar interval overlapped a reconnect gap or partial bar interval.",
             )
 
-        if snapshot.is_stale:
+        if snapshot.exchange_time_status != "VALID":
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_UNVERIFIED_TIMESTAMP",
+                rejection_reason=f"Exchange time status is {snapshot.exchange_time_status}.",
+            )
+
+        if snapshot.exchange_timestamp_utc is None:
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_UNVERIFIED_TIMESTAMP",
+                rejection_reason="Exchange timestamp is missing.",
+            )
+
+        if snapshot.exchange_timestamp_utc.tzinfo is None:
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_TIMEZONE_AMBIGUOUS",
+                rejection_reason="Exchange timestamp is timezone-naive.",
+            )
+
+        # Freshness and quote age validation
+        if snapshot.quote_age_seconds is None:
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_MISSING_QUOTE_AGE",
+                rejection_reason="Quote age seconds is missing.",
+            )
+
+        if snapshot.quote_age_seconds < Decimal("0.0"):
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_FUTURE_TIMESTAMP",
+                rejection_reason=f"Quote age ({snapshot.quote_age_seconds}s) is negative (future exchange timestamp).",
+            )
+
+        if snapshot.quote_age_seconds > Decimal("3.0"):
             return SignalValidationResult(
                 is_valid=False,
                 rejection_code="REJECTED_STALE_QUOTE",
                 rejection_reason=f"Quote age ({snapshot.quote_age_seconds}s) exceeds 3.0s freshness limit.",
             )
+
+        if snapshot.is_stale:
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_STALE_QUOTE",
+                rejection_reason=f"Quote marked stale (age {snapshot.quote_age_seconds}s).",
+            )
+
+        # Inconsistent freshness metadata validation:
+        # e.g., is_stale=False while is_quote_fresh=False
+        if not snapshot.is_quote_fresh:
+            return SignalValidationResult(
+                is_valid=False,
+                rejection_code="REJECTED_INCONSISTENT_FRESHNESS",
+                rejection_reason="Inconsistent freshness metadata: is_quote_fresh is False while is_stale is False.",
+            )
+
+        # Dynamic validation against validation_time clock if provided
+        if validation_time is not None:
+            if validation_time.tzinfo is None:
+                return SignalValidationResult(
+                    is_valid=False,
+                    rejection_code="REJECTED_TIMEZONE_AMBIGUOUS",
+                    rejection_reason="Validation time is timezone-naive.",
+                )
+            dynamic_age = Decimal(str(round((validation_time - snapshot.exchange_timestamp_utc).total_seconds(), 4)))
+            if dynamic_age < Decimal("0.0"):
+                return SignalValidationResult(
+                    is_valid=False,
+                    rejection_code="REJECTED_FUTURE_TIMESTAMP",
+                    rejection_reason=f"Exchange timestamp is in the future relative to validation time ({dynamic_age}s).",
+                )
+            if dynamic_age > Decimal("3.0"):
+                return SignalValidationResult(
+                    is_valid=False,
+                    rejection_code="REJECTED_STALE_QUOTE",
+                    rejection_reason=f"Quote age at validation time ({dynamic_age}s) exceeds 3.0s freshness limit.",
+                )
 
         if snapshot.is_locked:
             return SignalValidationResult(
@@ -68,13 +145,6 @@ class SignalValidator:
                 is_valid=False,
                 rejection_code="REJECTED_CROSSED_BOOK",
                 rejection_reason="Best bid exceeds best ask (crossed book arbitrage anomaly).",
-            )
-
-        if snapshot.exchange_time_status != "VALID":
-            return SignalValidationResult(
-                is_valid=False,
-                rejection_code="REJECTED_UNVERIFIED_TIMESTAMP",
-                rejection_reason=f"Exchange time status is {snapshot.exchange_time_status}.",
             )
 
         if snapshot.quote_status == "ZERO_BID":

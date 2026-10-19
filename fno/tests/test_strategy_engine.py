@@ -37,6 +37,7 @@ class StrategyEngineTestCase(SimpleTestCase):
             engine_git_commit="test_commit",
             feature_set_id="DEFAULT_NIFTY_OPTS_V1",
             calculation_timestamp_utc=self.dt_valid_utc,
+            exchange_timestamp_utc=self.dt_valid_utc,
             received_wall_clock_utc=self.dt_valid_utc,
             timeframe="1m",
             exchange_time_status="VALID",
@@ -177,3 +178,73 @@ class StrategyEngineTestCase(SimpleTestCase):
         exit_signals = self.manager.process_feature_snapshot(target_snap)
         self.assertEqual(len(exit_signals), 1)
         self.assertEqual(exit_signals[0].action, "EXIT_TARGET")
+
+    def test_signal_rejection_on_inconsistent_freshness_metadata(self):
+        """Verifies validator rejects snapshots where is_stale=False but is_quote_fresh=False."""
+        inconsistent_snap = self.snapshot_ce.model_copy(update={
+            "is_stale": False,
+            "is_quote_fresh": False,
+            "quote_age_seconds": Decimal("1.2"),
+            "is_valid_for_signal": True,
+        })
+        signals = self.manager.process_feature_snapshot(inconsistent_snap)
+        self.assertEqual(len(signals), 0)
+        self.assertTrue(any(
+            a.status == "REJECTED" and a.rejection_code == "REJECTED_INCONSISTENT_FRESHNESS"
+            for a in self.manager.audit_log
+        ))
+
+    def test_signal_rejection_on_quote_age_exceeding_threshold_even_if_is_stale_false(self):
+        """Verifies quote age > 3.0s is rejected even if is_stale=False and is_valid_for_signal=True."""
+        stale_age_snap = self.snapshot_ce.model_copy(update={
+            "is_stale": False,
+            "is_quote_fresh": True,
+            "quote_age_seconds": Decimal("3.5"),
+            "is_valid_for_signal": True,
+        })
+        signals = self.manager.process_feature_snapshot(stale_age_snap)
+        self.assertEqual(len(signals), 0)
+        self.assertTrue(any(
+            a.status == "REJECTED" and a.rejection_code == "REJECTED_STALE_QUOTE"
+            for a in self.manager.audit_log
+        ))
+
+    def test_signal_rejection_on_negative_or_missing_quote_age(self):
+        """Verifies negative quote age (future) and missing quote age are rejected."""
+        # Future / negative quote age
+        future_snap = self.snapshot_ce.model_copy(update={
+            "quote_age_seconds": Decimal("-1.5"),
+            "is_valid_for_signal": True,
+        })
+        signals_fut = self.manager.process_feature_snapshot(future_snap)
+        self.assertEqual(len(signals_fut), 0)
+        self.assertTrue(any(
+            a.status == "REJECTED" and a.rejection_code == "REJECTED_FUTURE_TIMESTAMP"
+            for a in self.manager.audit_log
+        ))
+
+        # Missing quote age
+        missing_snap = self.snapshot_ce.model_copy(update={
+            "quote_age_seconds": None,
+            "is_valid_for_signal": True,
+        })
+        signals_mis = self.manager.process_feature_snapshot(missing_snap)
+        self.assertEqual(len(signals_mis), 0)
+        self.assertTrue(any(
+            a.status == "REJECTED" and a.rejection_code == "REJECTED_MISSING_QUOTE_AGE"
+            for a in self.manager.audit_log
+        ))
+
+    def test_signal_rejection_on_timezone_naive_exchange_timestamp(self):
+        """Verifies timezone-naive exchange timestamp fails closed."""
+        naive_snap = self.snapshot_ce.model_copy(update={
+            "exchange_timestamp_utc": datetime(2026, 10, 19, 10, 0, 0),  # naive
+            "is_valid_for_signal": True,
+        })
+        signals = self.manager.process_feature_snapshot(naive_snap)
+        self.assertEqual(len(signals), 0)
+        self.assertTrue(any(
+            a.status == "REJECTED" and a.rejection_code == "REJECTED_TIMEZONE_AMBIGUOUS"
+            for a in self.manager.audit_log
+        ))
+
