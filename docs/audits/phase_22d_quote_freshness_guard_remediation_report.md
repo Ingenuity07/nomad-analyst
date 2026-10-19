@@ -192,6 +192,6 @@ Explicit assertions verified in regression tests:
    - *Risk:* If local system clock drifts significantly relative to the exchange matching engine clock, quotes could erroneously trigger `REJECTED_FUTURE_TIMESTAMP` or `REJECTED_STALE_QUOTE`.
    - *Mitigation:* Ensure NTP synchronization (e.g. `chrony` or `systemd-timesyncd`) is active on paper/live execution hosts.
 2. **Live Acceptance Validation:**
-   - *Next Action:* Schedule observation during market hours (09:15 - 15:30 IST) to collect authentic telemetry on quote rejection frequency and fill rate under actual tick feed volatility.
+   - *Next Action:* Follow the reproducible checklist in [`docs/audits/phase_22d_next_market_session_checklist.md`](file:///Users/shivamsingh/personal/nomad-analyst/docs/audits/phase_22d_next_market_session_checklist.md) during the live session observation window (09:15 - 09:45 IST) to evaluate `AC-1-L01` through `AC-1-L05` and collect authentic telemetry under actual tick feed volatility.
 3. **Scope and Performance Disclaimer:**
    - *Disclaimer:* This remediation strictly validates execution safety invariants, microstructure quote-freshness guards, and the closure of the public validation-clock bypass. It does not claim or evaluate strategy profitability, alpha performance, or live broker execution correctness.
