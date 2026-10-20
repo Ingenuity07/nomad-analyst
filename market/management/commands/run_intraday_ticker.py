@@ -59,6 +59,18 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        # Explicit unbuffered / line-buffered execution for reliable real-time log timestamps
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(line_buffering=True)
+            except Exception:
+                pass
+        if hasattr(sys.stderr, "reconfigure"):
+            try:
+                sys.stderr.reconfigure(line_buffering=True)
+            except Exception:
+                pass
+
         custom_stocks = options["stocks"]
         duration = options["duration"]
         snapshot_interval = options["snapshot_interval"]
@@ -67,6 +79,7 @@ class Command(BaseCommand):
         self.stdout.write("=" * 80)
         self.stdout.write("NOMAD ANALYST — LIVE INTRADAY TICKER & STATE DAEMON")
         self.stdout.write("=" * 80)
+        self.stdout.flush()
 
         # 0. Acquire Process-level advisory lock to prevent duplicate ticker daemons
         import fcntl
@@ -215,6 +228,7 @@ class Command(BaseCommand):
                                     f"(backoff: {current_backoff:.1f}s)..."
                                 )
                             )
+                            self.stdout.flush()
                             manager.reconnect()
                             # Allow brief grace period for connection callback
                             for _ in range(10):
@@ -229,6 +243,7 @@ class Command(BaseCommand):
                                         f"Restored {len(manager.subscribed_tokens)} instrument subscriptions."
                                     )
                                 )
+                                self.stdout.flush()
                                 reconnect_attempts = 0
                                 current_backoff = initial_backoff
                             else:
@@ -239,6 +254,7 @@ class Command(BaseCommand):
                                         f"Next attempt in {current_backoff:.1f}s."
                                     )
                                 )
+                                self.stdout.flush()
 
                     # Check duration limit if set
                     if duration > 0 and (now - start_time) >= duration:
@@ -257,6 +273,7 @@ class Command(BaseCommand):
                                         f"| Direction: {snapshot.market_direction} | Regime: {snapshot.market_regime}"
                                     )
                                 )
+                                self.stdout.flush()
                         except Exception as ex:
                             logger.error(f"Error persisting snapshot: {ex}")
 
@@ -269,6 +286,7 @@ class Command(BaseCommand):
                                             f"  [FNO] Flushed {flushed} completed option bar(s) to DB."
                                         )
                                     )
+                                    self.stdout.flush()
                             except Exception as ex:
                                 logger.error(f"Error flushing F&O completed bars: {ex}")
 
@@ -287,6 +305,7 @@ class Command(BaseCommand):
                             f"Feed: {freshness['freshness']} ({freshness['age_seconds']}s ago) | "
                             f"Snapshots: {manager.stats['snapshots_updated']}{fno_info}"
                         )
+                        self.stdout.flush()
 
                     time.sleep(1.0)
 
