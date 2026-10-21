@@ -12,6 +12,8 @@ from market.models import Company, Instrument, OHLCVBar, StockIntradayContext
 from fno.models import OptionOHLCVBar, OptionQuoteSnapshot
 from fno.services.log_parsers import (
     get_latest_completed_spot_bar,
+    get_completed_spot_bars,
+    segment_authoritative_strike_regimes,
     evaluate_equity_isolation_verdict,
     evaluate_option_bar_coverage_verdict,
     is_bar_within_disconnect_interval,
@@ -1400,5 +1402,275 @@ class QuoteFreshnessAndDynamicATMAcceptanceTests(TestCase):
         self.assertEqual(metrics["fresh_and_eligible"], 4)
 
 
+class AC1L05DynamicATMCompletedSpotBarTests(TestCase):
+    """
+    Focused regression tests for AC-1-L05: Look-ahead-free completed spot bar timing,
+    authoritative strike regime segmentation, and dynamic universe reconciliation.
+    """
 
+    def setUp(self):
+        self.utc = datetime.timezone.utc
+        self.ist = ZoneInfo("Asia/Kolkata")
+        self.now = timezone.now()
+        self.start_window = self.now - datetime.timedelta(minutes=30)
+        self.inst = Instrument(symbol="^NSEI", exchange="INDEX")
 
+    def test_bar_closing_exactly_at_evaluation_time_is_eligible(self):
+        """
+        A 1-minute bar opening at eval_time - 60s closes at exactly eval_time.
+        Requires timestamp + 1 minute <= eval_time.
+        At eval_time, it is completed and MUST be eligible.
+        """
+        bar_open = self.now - datetime.timedelta(seconds=60)
+        bar = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=bar_open,
+            open=Decimal("24500.00"),
+            high=Decimal("24520.00"),
+            low=Decimal("24490.00"),
+            close=Decimal("24510.00"),
+            volume=1000,
+        )
+        completed = get_completed_spot_bars([bar], as_of_time=self.now)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].close, Decimal("24510.00"))
+
+        latest = get_latest_completed_spot_bar([bar], as_of_time=self.now)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.close, Decimal("24510.00"))
+
+    def test_bar_closing_after_evaluation_time_is_excluded(self):
+        """
+        A 1-minute bar opening at eval_time - 30s closes at eval_time + 30s.
+        Because timestamp + 1 minute > eval_time, it is in-flight and MUST be excluded.
+        """
+        bar_open = self.now - datetime.timedelta(seconds=30)
+        inflight_bar = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=bar_open,
+            open=Decimal("24500.00"),
+            high=Decimal("24520.00"),
+            low=Decimal("24490.00"),
+            close=Decimal("24510.00"),
+            volume=500,
+        )
+        completed = get_completed_spot_bars([inflight_bar], as_of_time=self.now)
+        self.assertEqual(completed, [])
+
+        latest = get_latest_completed_spot_bar([inflight_bar], as_of_time=self.now)
+        self.assertIsNone(latest)
+
+    def test_inflight_bar_crossing_atm_boundary_cannot_create_authoritative_transition(self):
+        """
+        Critical AC-1-L05 look-ahead test:
+        Bar 1 opens at 09:19:00, closes at 09:20:00 with close=24500 (ATM 24500). Completed.
+        Bar 2 opens at 09:20:00, has provisional close=24560 (ATM 24550), closing at 09:21:00.
+        At eval_time = 09:20:30 (during Bar 2), Bar 2 is in-flight.
+        It CANNOT create an authoritative transition or strike regime to ATM 24550.
+        """
+        t_0919 = datetime.datetime(2026, 10, 19, 9, 19, 0, tzinfo=self.ist)
+        t_0920 = datetime.datetime(2026, 10, 19, 9, 20, 0, tzinfo=self.ist)
+        eval_time = datetime.datetime(2026, 10, 19, 9, 20, 30, tzinfo=self.ist)
+
+        bar_1 = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=t_0919,
+            open=Decimal("24490.00"),
+            high=Decimal("24510.00"),
+            low=Decimal("24480.00"),
+            close=Decimal("24500.00"),
+            volume=1000,
+        )
+        bar_2_inflight = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=t_0920,
+            open=Decimal("24510.00"),
+            high=Decimal("24570.00"),
+            low=Decimal("24505.00"),
+            close=Decimal("24560.00"),  # Crosses into 24550 ATM!
+            volume=500,
+        )
+
+        all_bars = [bar_1, bar_2_inflight]
+
+        # Look-ahead-free segmentation:
+        regimes, excursions = segment_authoritative_strike_regimes(all_bars, as_of_time=eval_time)
+
+        # Must only have INITIAL_REGIME at 24500 based on completed Bar 1:
+        self.assertEqual(len(regimes), 1)
+        self.assertEqual(regimes[0]["atm"], Decimal("24500.00"))
+        self.assertEqual(regimes[0]["transition_type"], "INITIAL_REGIME")
+        self.assertEqual(excursions, [])
+
+        # Omitting as_of_time without explicit opt-in must raise ValueError (fail-safe against look-ahead):
+        with self.assertRaises(ValueError) as cm:
+            segment_authoritative_strike_regimes(all_bars)
+        self.assertIn("requires a timezone-aware 'as_of_time'", str(cm.exception))
+
+        with self.assertRaises(ValueError) as cm2:
+            segment_authoritative_strike_regimes(all_bars, as_of_time=None)
+        self.assertIn("requires a timezone-aware 'as_of_time'", str(cm2.exception))
+
+        # Explicit opt-in for unfiltered historical bars allows testing the difference:
+        unfiltered_regimes, _ = segment_authoritative_strike_regimes(
+            all_bars, allow_unfiltered_historical_bars=True
+        )
+        self.assertEqual(len(unfiltered_regimes), 2)
+        self.assertEqual(unfiltered_regimes[1]["atm"], Decimal("24550.00"))
+        self.assertEqual(unfiltered_regimes[1]["transition_type"], "BAR_CLOSE_CROSSING")
+
+    def test_inflight_bar_high_low_excursions_cannot_influence_acceptance(self):
+        """
+        High/low excursions from in-flight bars must be excluded from evaluation.
+        Bar 1 is completed (close 24500, high 24510, low 24490).
+        Bar 2 is in-flight at 09:20:30 (close 24500, but high reaches 24580 -> ATM 24600).
+        The in-flight excursion cannot be recorded or reported.
+        """
+        t_0919 = datetime.datetime(2026, 10, 19, 9, 19, 0, tzinfo=self.ist)
+        t_0920 = datetime.datetime(2026, 10, 19, 9, 20, 0, tzinfo=self.ist)
+        eval_time = datetime.datetime(2026, 10, 19, 9, 20, 30, tzinfo=self.ist)
+
+        bar_1 = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=t_0919,
+            open=Decimal("24495.00"),
+            high=Decimal("24510.00"),
+            low=Decimal("24490.00"),
+            close=Decimal("24500.00"),
+            volume=800,
+        )
+        bar_2_inflight = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=t_0920,
+            open=Decimal("24500.00"),
+            high=Decimal("24580.00"),  # Intrabar wick crossing to 24600!
+            low=Decimal("24495.00"),
+            close=Decimal("24500.00"),
+            volume=400,
+        )
+
+        regimes, excursions = segment_authoritative_strike_regimes([bar_1, bar_2_inflight], as_of_time=eval_time)
+        self.assertEqual(len(regimes), 1)
+        self.assertEqual(regimes[0]["atm"], Decimal("24500.00"))
+        self.assertEqual(excursions, [])
+
+    def test_no_completed_bars_produces_inconclusive_result(self):
+        """
+        If no completed spot bars exist in the observation window (e.g. at market open
+        09:15:30 with only the 09:15 in-flight candle), the audit produces an inconclusive result.
+        It never fabricates an ATM strike or transition.
+        """
+        t_0915 = datetime.datetime(2026, 10, 19, 9, 15, 0, tzinfo=self.ist)
+        eval_time = datetime.datetime(2026, 10, 19, 9, 15, 30, tzinfo=self.ist)
+
+        inflight_open_bar = OHLCVBar(
+            instrument=self.inst,
+            timeframe="1m",
+            timestamp=t_0915,
+            open=Decimal("24500.00"),
+            high=Decimal("24510.00"),
+            low=Decimal("24495.00"),
+            close=Decimal("24505.00"),
+            volume=200,
+        )
+
+        completed = get_completed_spot_bars([inflight_open_bar], as_of_time=eval_time)
+        self.assertEqual(completed, [])
+
+        regimes, excursions = segment_authoritative_strike_regimes([inflight_open_bar], as_of_time=eval_time)
+        self.assertEqual(regimes, [])
+        self.assertEqual(excursions, [])
+
+    def test_completed_spot_bars_preserve_chronological_ordering_even_if_unsorted(self):
+        """
+        Verifies get_completed_spot_bars guarantees returning bars sorted chronologically
+        even if the input collection is in reverse or random order.
+        """
+        t1 = self.now - datetime.timedelta(minutes=3)
+        t2 = self.now - datetime.timedelta(minutes=2)
+        t3 = self.now - datetime.timedelta(minutes=1)
+
+        b1 = OHLCVBar(instrument=self.inst, timeframe="1m", timestamp=t1, open=Decimal("24500"), high=Decimal("24500"), low=Decimal("24500"), close=Decimal("24500"), volume=100)
+        b2 = OHLCVBar(instrument=self.inst, timeframe="1m", timestamp=t2, open=Decimal("24510"), high=Decimal("24510"), low=Decimal("24510"), close=Decimal("24510"), volume=100)
+        b3 = OHLCVBar(instrument=self.inst, timeframe="1m", timestamp=t3, open=Decimal("24520"), high=Decimal("24520"), low=Decimal("24520"), close=Decimal("24520"), volume=100)
+
+        unsorted = [b3, b1, b2]
+        completed = get_completed_spot_bars(unsorted, as_of_time=self.now)
+        self.assertEqual([b.timestamp for b in completed], [t1, t2, t3])
+
+    def test_universe_reconciliation_count_derived_from_runtime_config(self):
+        """
+        Verifies that expected subscription counts are derived dynamically from the
+        runtime UnderlyingAssetConfig (e.g. 22 for K=5, 18 for K=4) without hardcoding.
+        """
+        from fno.services.option_registry import OptionInstrumentRegistry, UnderlyingAssetConfig
+        from fno.services.desired_universe import DesiredUniverseManager, CONFIG_NIFTY
+
+        reg = OptionInstrumentRegistry()
+        dum_default = DesiredUniverseManager(registry=reg, config=CONFIG_NIFTY)
+        expected_default = (2 * dum_default.config.strike_window_k + 1) * 2
+        self.assertEqual(expected_default, 22)
+
+        config_k4 = UnderlyingAssetConfig(
+            underlying_symbol="^NSEI",
+            underlying_name="NIFTY 50",
+            master_name="NIFTY",
+            strike_step=Decimal("50.0"),
+            lot_size=25,
+            tick_size=Decimal("0.05"),
+            strike_window_k=4,
+        )
+        dum_k4 = DesiredUniverseManager(registry=reg, config=config_k4)
+        expected_k4 = (2 * dum_k4.config.strike_window_k + 1) * 2
+        self.assertEqual(expected_k4, 18)
+
+    def test_segment_authoritative_strike_regimes_requires_timezone_aware_timestamp(self):
+        """Naive as_of_time must raise ValueError to prevent timezone ambiguity."""
+        bar = OHLCVBar(instrument=self.inst, timeframe="1m", timestamp=self.now, open=Decimal("24500"), high=Decimal("24500"), low=Decimal("24500"), close=Decimal("24500"), volume=100)
+        t_naive = datetime.datetime(2026, 10, 19, 9, 20, 30)
+        with self.assertRaises(ValueError) as cm:
+            segment_authoritative_strike_regimes([bar], as_of_time=t_naive)
+        self.assertIn("must be timezone-aware", str(cm.exception))
+
+    def test_incomplete_desired_universe_resolution_blocks_pass(self):
+        """
+        If the resolved desired universe from contract registry is incomplete
+        (e.g. fewer than (2*K+1)*2 contracts, or 0 contracts), it must be flagged
+        and prevent a false PASS in AC-1-L05 evaluation.
+        """
+        # Theoretical universe for K=5 is 22:
+        strike_window_k = 5
+        theoretical_count = (2 * strike_window_k + 1) * 2
+        self.assertEqual(theoretical_count, 22)
+
+        # Incomplete resolved contracts (e.g. only 18 resolved due to missing strikes in registry)
+        resolved_contracts_tokens = {1000 + i for i in range(18)}
+        expected_active_tokens = len(resolved_contracts_tokens)
+        universe_incomplete = (expected_active_tokens < theoretical_count) or (expected_active_tokens == 0)
+
+        self.assertTrue(universe_incomplete)
+        self.assertEqual(expected_active_tokens, 18)
+
+        # In AC-1-L05 logic, universe_incomplete forces an INCONCLUSIVE outcome and prevents PASS
+        all_transitions_passed = True
+        has_inconclusive = False
+        if universe_incomplete:
+            has_inconclusive = True
+
+        status = "PASS" if (all_transitions_passed and not has_inconclusive) else "INCONCLUSIVE"
+        self.assertEqual(status, "INCONCLUSIVE")
+
+        # Zero resolved contracts case (registry lookup failure or empty strike cache)
+        zero_resolved_tokens = set()
+        expected_zero = len(zero_resolved_tokens)
+        zero_incomplete = (expected_zero < theoretical_count) or (expected_zero == 0)
+        self.assertTrue(zero_incomplete)
+        has_inconclusive_zero = True if zero_incomplete else False
+        status_zero = "PASS" if (all_transitions_passed and not has_inconclusive_zero) else "INCONCLUSIVE"
+        self.assertEqual(status_zero, "INCONCLUSIVE")

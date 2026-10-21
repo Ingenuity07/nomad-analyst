@@ -299,7 +299,9 @@ class Command(BaseCommand):
                             fno_ticks = fno_consumer.stats.get("ticks_received", 0)
                             fno_active = len(fno_consumer.active_tokens)
                             fno_bars = fno_consumer.stats.get("bars_created", 0)
-                            fno_info = f" | F&O Ticks: {fno_ticks:<5} | F&O Active: {fno_active} | F&O Bars: {fno_bars}"
+                            fno_evals = fno_consumer.stats.get("strategy_evaluations", 0)
+                            fno_trades = fno_consumer.stats.get("paper_trades_executed", 0)
+                            fno_info = f" | F&O Ticks: {fno_ticks:<5} | F&O Active: {fno_active} | F&O Bars: {fno_bars} | Evals: {fno_evals} | Trades: {fno_trades}"
                         self.stdout.write(
                             f"  [HEARTBEAT] Ticks Received: {tick_count:<6} | "
                             f"Feed: {freshness['freshness']} ({freshness['age_seconds']}s ago) | "
@@ -314,7 +316,10 @@ class Command(BaseCommand):
                 manager.stop()
                 if fno_consumer:
                     try:
-                        flushed = fno_consumer.flush_completed_bars()
+                        if hasattr(fno_consumer, "force_close_and_flush_all"):
+                            flushed = fno_consumer.force_close_and_flush_all()
+                        else:
+                            flushed = fno_consumer.flush_completed_bars()
                         if flushed > 0:
                             self.stdout.write(
                                 self.style.SUCCESS(
@@ -330,6 +335,8 @@ class Command(BaseCommand):
                         f" | F&O Ticks: {fno_consumer.stats.get('ticks_received', 0)}"
                         f" | F&O Bars: {fno_consumer.stats.get('bars_created', 0)}"
                         f" | F&O Quotes: {fno_consumer.stats.get('quotes_recorded', 0)}"
+                        f" | F&O Evals: {fno_consumer.stats.get('strategy_evaluations', 0)}"
+                        f" | Paper Trades: {fno_consumer.stats.get('paper_trades_executed', 0)}"
                     )
                 self.stdout.write("=" * 80)
                 self.stdout.write(

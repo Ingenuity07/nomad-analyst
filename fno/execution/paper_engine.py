@@ -26,11 +26,12 @@ Enforces:
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import logging
+import threading
 from typing import Callable, Dict, List, Optional
 import uuid
 import zoneinfo
 
-from django.db import transaction
+from django.db import IntegrityError, connection, transaction
 
 from fno.models import OptionQuoteSnapshot, PaperTradeLedger
 from fno.execution.fee_calculator import StatutoryFeeCalculator
@@ -100,6 +101,7 @@ class PaperExecutionEngine:
     ):
         self.fee_calculator = fee_calculator or StatutoryFeeCalculator()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._lock = threading.Lock()
         self.active_trades: Dict[str, PaperTradeLedger] = {}  # Key: f"{strategy_id}:{tradingsymbol}"
         self.sync_active_trades_from_db()
 
@@ -342,7 +344,31 @@ class PaperExecutionEngine:
         validation_time: Optional[datetime] = None,
         allow_default_schedule: bool = False,
     ) -> PaperTradeEvent:
-        """Validates and executes entry buy taker fills."""
+        """Validates and executes entry buy taker fills with thread serialization."""
+        with self._lock:
+            return self._handle_buy_signal_locked(
+                signal=signal,
+                quote=quote,
+                trade_key=trade_key,
+                market_regime=market_regime,
+                vix_level=vix_level,
+                execution_time=execution_time,
+                validation_time=validation_time,
+                allow_default_schedule=allow_default_schedule,
+            )
+
+    def _handle_buy_signal_locked(
+        self,
+        signal: OptionSignal,
+        quote: OptionQuoteSnapshot,
+        trade_key: str,
+        market_regime: Optional[str],
+        vix_level: Optional[Decimal],
+        execution_time: Optional[datetime],
+        validation_time: Optional[datetime] = None,
+        allow_default_schedule: bool = False,
+    ) -> PaperTradeEvent:
+        """Internal locked implementation enforcing position exclusivity and microstructure gating."""
         # 0. Check Authoritative Execution Timestamp
         if execution_time is None:
             rejection_code = (
@@ -381,10 +407,16 @@ class PaperExecutionEngine:
                 message=rejection_code,
             )
 
-        # Check if already active in memory or DB (enforcing position uniqueness invariant)
-        existing_trade = self.active_trades.get(trade_key)
-        if not existing_trade:
-            existing_trade = PaperTradeLedger.objects.filter(
+        with transaction.atomic():
+            if connection.vendor == "postgresql":
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        [f"fno_strategy_exclusive:{signal.strategy_id}"],
+                    )
+
+            # Check if already active in DB or memory (enforcing position uniqueness invariant)
+            exact_active_trade = PaperTradeLedger.objects.filter(
                 strategy_id=signal.strategy_id,
                 tradingsymbol=signal.tradingsymbol,
                 status__in=[
@@ -394,40 +426,94 @@ class PaperExecutionEngine:
                     "PENDING_EXPIRY_SETTLEMENT",
                 ],
             ).first()
-            if existing_trade:
-                self.active_trades[trade_key] = existing_trade
+            if not exact_active_trade:
+                exact_active_trade = self.active_trades.get(trade_key)
+            else:
+                self.active_trades[trade_key] = exact_active_trade
 
-        if existing_trade and existing_trade.status in (
-            "OPEN",
-            "PENDING_LIQUIDITY",
-            "UNEXECUTABLE_OVERNIGHT_CARRY",
-            "PENDING_EXPIRY_SETTLEMENT",
-        ):
-            rejection_code = "REJECTED_POSITION_ALREADY_OPEN"
-            logger.warning("Rejecting signal %s: %s", signal.signal_id, rejection_code)
-            return PaperTradeEvent(
-                event_id=str(uuid.uuid4()),
-                event_type="ORDER_REJECTED",
+            strategy_active_trade = exact_active_trade or PaperTradeLedger.objects.filter(
                 strategy_id=signal.strategy_id,
-                signal_id=signal.signal_id,
-                tradingsymbol=signal.tradingsymbol,
-                fill_price=None,
-                fill_quantity=0,
-                slippage=Decimal("0.00"),
-                timestamp=execution_time,
-                message=rejection_code,
-            )
+                status__in=[
+                    "OPEN",
+                    "PENDING_LIQUIDITY",
+                    "UNEXECUTABLE_OVERNIGHT_CARRY",
+                    "PENDING_EXPIRY_SETTLEMENT",
+                ],
+            ).first()
+            if not strategy_active_trade:
+                strategy_active_trade = next(
+                    (t for t in self.active_trades.values() if t.strategy_id == signal.strategy_id),
+                    None
+                )
+            else:
+                active_key = f"{strategy_active_trade.strategy_id}:{strategy_active_trade.tradingsymbol}"
+                self.active_trades[active_key] = strategy_active_trade
 
-        # Microstructure Gating Checks
-        rejection_reason = self._check_quote_execution_eligibility(
-            quote,
-            validation_time=validation_time,
-            is_exit=False,
-            allow_default_schedule=allow_default_schedule,
-        )
-        if rejection_reason is not None:
-            logger.info("Entry signal %s rejected by quote gate: %s", signal.signal_id, rejection_reason)
-            with transaction.atomic():
+            if strategy_active_trade:
+                if exact_active_trade:
+                    rejection_code = "REJECTED_POSITION_ALREADY_OPEN"
+                    event_message = rejection_code
+                    logger.warning(
+                        "Rejecting entry signal %s: %s (Active: %s #%s [%s])",
+                        signal.signal_id,
+                        rejection_code,
+                        exact_active_trade.tradingsymbol,
+                        exact_active_trade.trade_id,
+                        exact_active_trade.status,
+                    )
+                else:
+                    rejection_code = "REJECTED_MAX_CONCURRENT_POSITIONS_EXCEEDED"
+                    event_message = f"{rejection_code} (Active: {strategy_active_trade.tradingsymbol} #{strategy_active_trade.trade_id} [{strategy_active_trade.status}])"
+                    logger.warning(
+                        "Rejecting entry signal %s for %s: %s",
+                        signal.signal_id,
+                        signal.strategy_id,
+                        event_message,
+                    )
+                try:
+                    PaperTradeLedger.objects.create(
+                        strategy_id=signal.strategy_id,
+                        strategy_version=signal.strategy_version,
+                        signal_id=uuid.UUID(str(signal.signal_id)),
+                        instrument_token=signal.instrument_token,
+                        tradingsymbol=signal.tradingsymbol,
+                        option_type=signal.option_type,
+                        strike_price=signal.strike_price,
+                        expiry_date=signal.expiry_date,
+                        entry_timestamp=execution_time,
+                        entry_fill_price=Decimal("0.00"),
+                        entry_slippage=Decimal("0.00"),
+                        quantity=signal.suggested_lot_count * 65,
+                        status="REJECTED",
+                        rejection_reason=rejection_code,
+                        market_regime_at_entry=market_regime,
+                        vix_level_at_entry=vix_level,
+                    )
+                except Exception as e:
+                    logger.error("Failed to record rejected paper trade in ledger: %s", e)
+
+                return PaperTradeEvent(
+                    event_id=str(uuid.uuid4()),
+                    event_type="ORDER_REJECTED",
+                    strategy_id=signal.strategy_id,
+                    signal_id=signal.signal_id,
+                    tradingsymbol=signal.tradingsymbol,
+                    fill_price=None,
+                    fill_quantity=0,
+                    slippage=Decimal("0.00"),
+                    timestamp=execution_time,
+                    message=event_message,
+                )
+
+            # Microstructure Gating Checks
+            rejection_reason = self._check_quote_execution_eligibility(
+                quote,
+                validation_time=validation_time,
+                is_exit=False,
+                allow_default_schedule=allow_default_schedule,
+            )
+            if rejection_reason is not None:
+                logger.info("Entry signal %s rejected by quote gate: %s", signal.signal_id, rejection_reason)
                 PaperTradeLedger.objects.create(
                     strategy_id=signal.strategy_id,
                     strategy_version=signal.strategy_version,
@@ -447,90 +533,136 @@ class PaperExecutionEngine:
                     vix_level_at_entry=vix_level,
                 )
 
+                return PaperTradeEvent(
+                    event_id=str(uuid.uuid4()),
+                    event_type="ORDER_REJECTED",
+                    strategy_id=signal.strategy_id,
+                    signal_id=signal.signal_id,
+                    tradingsymbol=signal.tradingsymbol,
+                    fill_price=None,
+                    fill_quantity=0,
+                    slippage=Decimal("0.00"),
+                    timestamp=execution_time,
+                    message=rejection_reason,
+                )
+
+            # Calculate conservative fill with strict tick-grid rounding
+            best_ask = quote.best_ask
+            fill_price = self.calculate_taker_buy_fill(best_ask)
+            if fill_price is None:
+                return PaperTradeEvent(
+                    event_id=str(uuid.uuid4()),
+                    event_type="ORDER_REJECTED",
+                    strategy_id=signal.strategy_id,
+                    signal_id=signal.signal_id,
+                    tradingsymbol=signal.tradingsymbol,
+                    fill_price=None,
+                    fill_quantity=0,
+                    slippage=Decimal("0.00"),
+                    timestamp=execution_time,
+                    message="REJECTED_INVALID_ASK_PRICE",
+                )
+
+            slippage = fill_price - best_ask
+            qty = signal.suggested_lot_count * 65
+
+            # Check max acceptable slippage
+            slippage_pct = slippage / best_ask
+            if slippage_pct > signal.max_acceptable_slippage_pct:
+                logger.info("Signal %s rejected: slippage %s exceeds max %s", signal.signal_id, slippage_pct, signal.max_acceptable_slippage_pct)
+                return PaperTradeEvent(
+                    event_id=str(uuid.uuid4()),
+                    event_type="ORDER_REJECTED",
+                    strategy_id=signal.strategy_id,
+                    signal_id=signal.signal_id,
+                    tradingsymbol=signal.tradingsymbol,
+                    fill_price=None,
+                    fill_quantity=0,
+                    slippage=Decimal("0.00"),
+                    timestamp=execution_time,
+                    message="REJECTED_EXCESSIVE_SLIPPAGE",
+                )
+
+            # Create Open Trade Ledger Entry
+            try:
+                trade = PaperTradeLedger.objects.create(
+                    strategy_id=signal.strategy_id,
+                    strategy_version=signal.strategy_version,
+                    signal_id=uuid.UUID(str(signal.signal_id)),
+                    instrument_token=signal.instrument_token,
+                    tradingsymbol=signal.tradingsymbol,
+                    option_type=signal.option_type,
+                    strike_price=signal.strike_price,
+                    expiry_date=signal.expiry_date,
+                    entry_timestamp=execution_time,
+                    entry_fill_price=fill_price,
+                    entry_slippage=slippage,
+                    quantity=qty,
+                    status="OPEN",
+                    market_regime_at_entry=market_regime,
+                    vix_level_at_entry=vix_level,
+                )
+            except IntegrityError:
+                rejection_code = "REJECTED_MAX_CONCURRENT_POSITIONS_EXCEEDED"
+                logger.warning(
+                    "Concurrent collision detected: Database exclusivity constraint prevented duplicate open position for %s (signal %s)",
+                    signal.strategy_id,
+                    signal.signal_id,
+                )
+                self.sync_active_trades_from_db()
+                winning_trade = next((t for t in self.active_trades.values() if t.strategy_id == signal.strategy_id), None)
+                active_info = f"Active: {winning_trade.tradingsymbol} #{winning_trade.trade_id} [{winning_trade.status}]" if winning_trade else "Active position exists"
+                event_message = f"{rejection_code} ({active_info})"
+
+                try:
+                    PaperTradeLedger.objects.create(
+                        strategy_id=signal.strategy_id,
+                        strategy_version=signal.strategy_version,
+                        signal_id=uuid.UUID(str(signal.signal_id)),
+                        instrument_token=signal.instrument_token,
+                        tradingsymbol=signal.tradingsymbol,
+                        option_type=signal.option_type,
+                        strike_price=signal.strike_price,
+                        expiry_date=signal.expiry_date,
+                        entry_timestamp=execution_time,
+                        entry_fill_price=Decimal("0.00"),
+                        entry_slippage=Decimal("0.00"),
+                        quantity=qty,
+                        status="REJECTED",
+                        rejection_reason=rejection_code,
+                        market_regime_at_entry=market_regime,
+                        vix_level_at_entry=vix_level,
+                    )
+                except Exception as e:
+                    logger.error("Failed to record concurrent collision rejection in ledger: %s", e)
+
+                return PaperTradeEvent(
+                    event_id=str(uuid.uuid4()),
+                    event_type="ORDER_REJECTED",
+                    strategy_id=signal.strategy_id,
+                    signal_id=signal.signal_id,
+                    tradingsymbol=signal.tradingsymbol,
+                    fill_price=None,
+                    fill_quantity=0,
+                    slippage=Decimal("0.00"),
+                    timestamp=execution_time,
+                    message=event_message,
+                )
+
+            self.active_trades[trade_key] = trade
+
             return PaperTradeEvent(
                 event_id=str(uuid.uuid4()),
-                event_type="ORDER_REJECTED",
+                event_type="ORDER_FILLED",
                 strategy_id=signal.strategy_id,
                 signal_id=signal.signal_id,
                 tradingsymbol=signal.tradingsymbol,
-                fill_price=None,
-                fill_quantity=0,
-                slippage=Decimal("0.00"),
+                fill_price=fill_price,
+                fill_quantity=qty,
+                slippage=slippage,
                 timestamp=execution_time,
-                message=rejection_reason,
+                message="TAKER_BUY_FILLED",
             )
-
-        # Calculate conservative fill with strict tick-grid rounding
-        best_ask = quote.best_ask
-        fill_price = self.calculate_taker_buy_fill(best_ask)
-        if fill_price is None:
-            return PaperTradeEvent(
-                event_id=str(uuid.uuid4()),
-                event_type="ORDER_REJECTED",
-                strategy_id=signal.strategy_id,
-                signal_id=signal.signal_id,
-                tradingsymbol=signal.tradingsymbol,
-                fill_price=None,
-                fill_quantity=0,
-                slippage=Decimal("0.00"),
-                timestamp=execution_time,
-                message="REJECTED_INVALID_ASK_PRICE",
-            )
-
-        slippage = fill_price - best_ask
-        qty = signal.suggested_lot_count * 65
-
-        # Check max acceptable slippage
-        slippage_pct = slippage / best_ask
-        if slippage_pct > signal.max_acceptable_slippage_pct:
-            logger.info("Signal %s rejected: slippage %s exceeds max %s", signal.signal_id, slippage_pct, signal.max_acceptable_slippage_pct)
-            return PaperTradeEvent(
-                event_id=str(uuid.uuid4()),
-                event_type="ORDER_REJECTED",
-                strategy_id=signal.strategy_id,
-                signal_id=signal.signal_id,
-                tradingsymbol=signal.tradingsymbol,
-                fill_price=None,
-                fill_quantity=0,
-                slippage=Decimal("0.00"),
-                timestamp=execution_time,
-                message="REJECTED_EXCESSIVE_SLIPPAGE",
-            )
-
-        # Create Open Trade Ledger Entry
-        with transaction.atomic():
-            trade = PaperTradeLedger.objects.create(
-                strategy_id=signal.strategy_id,
-                strategy_version=signal.strategy_version,
-                signal_id=uuid.UUID(signal.signal_id),
-                instrument_token=signal.instrument_token,
-                tradingsymbol=signal.tradingsymbol,
-                option_type=signal.option_type,
-                strike_price=signal.strike_price,
-                expiry_date=signal.expiry_date,
-                entry_timestamp=execution_time,
-                entry_fill_price=fill_price,
-                entry_slippage=slippage,
-                quantity=qty,
-                status="OPEN",
-                market_regime_at_entry=market_regime,
-                vix_level_at_entry=vix_level,
-            )
-
-        self.active_trades[trade_key] = trade
-
-        return PaperTradeEvent(
-            event_id=str(uuid.uuid4()),
-            event_type="ORDER_FILLED",
-            strategy_id=signal.strategy_id,
-            signal_id=signal.signal_id,
-            tradingsymbol=signal.tradingsymbol,
-            fill_price=fill_price,
-            fill_quantity=qty,
-            slippage=slippage,
-            timestamp=execution_time,
-            message="TAKER_BUY_FILLED",
-        )
 
     def _handle_exit_signal(
         self,

@@ -7,7 +7,7 @@ Used across live-session audits, automated regression suites, and verification s
 """
 
 import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -434,8 +434,35 @@ def evaluate_reconciliation_verdict(matches: List[Dict[str, Any]], error: Option
 
 
 # ============================================================================
-# 3. AC-1-L02: Look-Ahead-Free Completed Spot Bar Timing Convention
+# 3. AC-1-L02 & AC-1-L05: Look-Ahead-Free Completed Spot Bar Timing Convention
 # ============================================================================
+
+def get_completed_spot_bars(
+    spot_bars: List[Any],
+    as_of_time: datetime.datetime,
+    bar_duration: datetime.timedelta = datetime.timedelta(minutes=1)
+) -> List[Any]:
+    """
+    Filters and returns all completed spot bars available at as_of_time in chronological order.
+
+    In OHLCVBar, `timestamp` denotes the bar OPENING time.
+    A bar covering [b.timestamp, b.timestamp + bar_duration) is completed and its
+    `close` price is formed only at `b.timestamp + bar_duration`.
+
+    Therefore, at evaluation time `as_of_time`, a spot candle is completed ONLY if:
+        b.timestamp + bar_duration <= as_of_time
+
+    Any bar where `b.timestamp + bar_duration > as_of_time` (including an in-flight candle
+    whose close/high/low are provisional) is strictly excluded to eliminate look-ahead bias.
+
+    Ordering Guarantee:
+    Enforces chronological ordering on `b.timestamp` internally.
+    """
+    if as_of_time.tzinfo is None or as_of_time.tzinfo.utcoffset(as_of_time) is None:
+        raise ValueError("as_of_time must be timezone-aware.")
+    completed = [b for b in spot_bars if (b.timestamp + bar_duration) <= as_of_time]
+    return sorted(completed, key=lambda b: b.timestamp)
+
 
 def get_latest_completed_spot_bar(
     spot_bars: List[Any],
@@ -444,36 +471,106 @@ def get_latest_completed_spot_bar(
 ) -> Optional[Any]:
     """
     Selects the latest completed spot bar available at as_of_time without look-ahead bias.
-
-    In OHLCVBar, `timestamp` denotes the bar OPENING time.
-    A bar covering [b.timestamp, b.timestamp + bar_duration) is completed and its
-    `close` price is formed only at `b.timestamp + bar_duration`.
-
-    Therefore, at evaluation time `as_of_time` (e.g. the start of an option interval slot),
-    a spot candle's close is available ONLY if:
-        b.timestamp + bar_duration <= as_of_time
-
-    Any bar where `b.timestamp + bar_duration > as_of_time` (including a bar where
-    `b.timestamp == as_of_time`, which is currently in-flight) is strictly rejected
-    as not yet completed to eliminate look-ahead bias.
-
-    Ordering Guarantee:
-    Enforces chronological ordering on `b.timestamp` internally using `max(..., key=lambda b: b.timestamp)`.
-    Even if the caller passes an unsorted or reversely-ordered iterable of spot bars,
-    the chronologically latest completed bar is guaranteed to be returned.
-
-    Args:
-        spot_bars: Iterable/list of spot OHLCVBar instances (need not be pre-sorted).
-        as_of_time: The evaluation boundary timestamp (e.g. slot start time).
-        bar_duration: The duration of the spot bar (default: 1 minute).
-
-    Returns:
-        The latest OHLCVBar whose conclusion was at or prior to as_of_time, or None.
+    Delegates to get_completed_spot_bars.
     """
-    completed = [b for b in spot_bars if (b.timestamp + bar_duration) <= as_of_time]
+    completed = get_completed_spot_bars(spot_bars, as_of_time=as_of_time, bar_duration=bar_duration)
     if not completed:
         return None
-    return max(completed, key=lambda b: b.timestamp)
+    return completed[-1]
+
+
+def segment_authoritative_strike_regimes(
+    spot_bars: List[Any],
+    as_of_time: Optional[datetime.datetime] = None,
+    step: Decimal = Decimal("50.0"),
+    bar_duration: datetime.timedelta = datetime.timedelta(minutes=1),
+    allow_unfiltered_historical_bars: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Segments spot bars chronologically into authoritative strike regimes
+    and non-authoritative intrabar high/low excursions using ROUND_HALF_UP.
+
+    Look-Ahead Prevention (Fail-Safe):
+    - Requires a timezone-aware `as_of_time` to eliminate look-ahead bias from in-flight bars.
+      Filters completed bars via `get_completed_spot_bars(spot_bars, as_of_time=as_of_time, bar_duration=bar_duration)`
+      where (b.timestamp + bar_duration) <= as_of_time.
+    - If `as_of_time is None` and `allow_unfiltered_historical_bars` is False (the default),
+      raises ValueError to prevent accidental look-ahead.
+    - Unfiltered processing of pre-completed historical bars is allowed ONLY when explicitly opted into via
+      `allow_unfiltered_historical_bars=True`.
+    - If no completed bars exist at as_of_time, returns ([], []).
+
+    Invariant:
+    - Authoritative ATM is updated ONLY upon a completed bar close crossing.
+    - Intrabar excursions (high/low reaching adjacent strikes while close remains in regime)
+      are tracked for diagnostics and NEVER update authoritative ATM.
+    """
+    if as_of_time is None and not allow_unfiltered_historical_bars:
+        raise ValueError(
+            "segment_authoritative_strike_regimes requires a timezone-aware 'as_of_time' "
+            "to eliminate look-ahead bias from in-flight bars. To process pre-filtered "
+            "historical bars without look-ahead filtering, explicitly pass "
+            "allow_unfiltered_historical_bars=True."
+        )
+
+    if as_of_time is not None:
+        if as_of_time.tzinfo is None or as_of_time.tzinfo.utcoffset(as_of_time) is None:
+            raise ValueError("as_of_time must be timezone-aware.")
+        completed_bars = get_completed_spot_bars(spot_bars, as_of_time=as_of_time, bar_duration=bar_duration)
+    else:
+        completed_bars = sorted(spot_bars, key=lambda b: b.timestamp)
+
+    if not completed_bars:
+        return [], []
+
+    def calculate_atm_strike(spot: Decimal) -> Decimal:
+        return (spot / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step
+
+    regimes: List[Dict[str, Any]] = []
+    authoritative_atm: Optional[Decimal] = None
+    intrabar_excursions: List[Dict[str, Any]] = []
+
+    for b in completed_bars:
+        atm_c = calculate_atm_strike(b.close)
+        atm_h = calculate_atm_strike(b.high)
+        atm_l = calculate_atm_strike(b.low)
+
+        if authoritative_atm is None:
+            regimes.append({
+                "atm": atm_c,
+                "start_ts": b.timestamp,
+                "bar_open_ts": b.timestamp,
+                "spot": b.close,
+                "end_ts": None,
+                "transition_type": "INITIAL_REGIME",
+                "is_authoritative": True,
+            })
+            authoritative_atm = atm_c
+        elif atm_c != authoritative_atm:
+            t_close = b.timestamp + bar_duration
+            regimes[-1]["end_ts"] = t_close
+            regimes.append({
+                "atm": atm_c,
+                "start_ts": t_close,
+                "bar_open_ts": b.timestamp,
+                "spot": b.close,
+                "end_ts": None,
+                "transition_type": "BAR_CLOSE_CROSSING",
+                "is_authoritative": True,
+            })
+            authoritative_atm = atm_c
+        else:
+            if atm_h != authoritative_atm or atm_l != authoritative_atm:
+                excursion_atm = atm_h if atm_h != authoritative_atm else atm_l
+                excursion_spot = b.high if atm_h != authoritative_atm else b.low
+                intrabar_excursions.append({
+                    "bar_ts": b.timestamp,
+                    "authoritative_atm": authoritative_atm,
+                    "excursion_atm": excursion_atm,
+                    "spot": excursion_spot,
+                })
+
+    return regimes, intrabar_excursions
 
 
 DAEMON_ACTIVITY_MARKERS = (

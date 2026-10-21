@@ -38,6 +38,7 @@ class StatutoryFeeBreakdown:
     total_frictions: Decimal            # Brokerage + statutory_levies
     effective_schedule_date: str = "2026-04-01"
     broker_name: str = "DISCOUNT_FLAT_DEFAULT"
+    fee_model_label: str = "STRESS_TEST_FEE_SCHEDULE_2026 (STT: 0.15% Stress vs 0.10% Statutory)"
 
     def to_dict(self) -> Dict[str, str]:
         return {k: str(v) for k, v in asdict(self).items()}
@@ -47,6 +48,7 @@ class StatutoryFeeCalculator:
     """
     Computes effective-dated transaction fees and taxes for NFO options.
     Distinguishes broker-specific commercial fees from statutory charges.
+    Explicitly separates legal statutory baseline rates from conservative stress assumptions.
     """
 
     EFFECTIVE_SCHEDULE_DATE = "2026-04-01"
@@ -55,8 +57,14 @@ class StatutoryFeeCalculator:
     EXCHANGE_TURNOVER_RATE = Decimal("0.0003553")  # 0.03553% (NSE/FA/73061)
     SEBI_TURNOVER_RATE = Decimal("0.000001")       # 0.0001% (₹10/crore)
     STAMP_DUTY_BUY_RATE = Decimal("0.00003")       # 0.003%
-    STT_SELL_RATE = Decimal("0.0015")             # 0.15% (Finance Act 2026)
+
+    # STT Rates: Legal statutory rate vs. Conservative stress scenario
+    STATUTORY_STT_SELL_RATE = Decimal("0.0010")  # 0.10% legal statutory rate (Finance (No. 2) Act 2024, eff 2024-10-01)
+    STRESS_STT_SELL_RATE = Decimal("0.0015")     # 0.15% conservative stress scenario (+50% friction drag)
+    STT_SELL_RATE = STRESS_STT_SELL_RATE         # Active trial model: conservative stress scenario
+
     GST_RATE = Decimal("0.18")                     # 18%
+    SCHEDULE_LABEL = "STRESS_TEST_FEE_SCHEDULE_2026 (STT: 0.15% Stress vs 0.10% Statutory)"
 
     @classmethod
     def round_paisa(cls, amount: Decimal) -> Decimal:
@@ -147,4 +155,5 @@ class StatutoryFeeCalculator:
             statutory_levies=statutory_levies,
             total_frictions=total_frictions,
             effective_schedule_date=cls.EFFECTIVE_SCHEDULE_DATE,
+            fee_model_label=cls.SCHEDULE_LABEL,
         )

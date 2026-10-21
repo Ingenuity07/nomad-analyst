@@ -35,6 +35,7 @@ NSE_HOLIDAYS_2026 = {
     date(2026, 10, 2),  # Mahatma Gandhi Jayanti
     date(2026, 10, 20), # Dussehra
     date(2026, 11, 8),  # Diwali Laxmi Pujan (Muhurat trading in evening)
+    date(2026, 11, 10), # Diwali Balipratipada (trading holiday)
     date(2026, 11, 24), # Gurunanak Jayanti
     date(2026, 12, 25), # Christmas
 }

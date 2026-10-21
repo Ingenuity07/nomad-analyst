@@ -39,15 +39,51 @@ class NiftyOrbBreakoutStrategy(BaseStrategy):
         self.opening_range_high: Optional[Decimal] = None
         self.opening_range_low: Optional[Decimal] = None
         self.opening_range_established: bool = False
+        self.opening_range_session_date: Optional[date] = None
         self.active_position: Optional[Dict[str, Any]] = None
         self.entry_window_start = time(9, 30, 0)
         self.entry_window_end = time(14, 30, 0)
+        self.sync_active_position_from_db()
 
-    def set_opening_range(self, high: Decimal, low: Decimal) -> None:
-        """Manually or externally seeds the 15-minute opening range boundaries."""
+    def sync_active_position_from_db(self) -> Optional[Dict[str, Any]]:
+        """
+        Synchronizes in-memory active position state from PaperTradeLedger.
+        Recovers any unresolved trade upon startup/restart to prevent duplicate entries.
+        """
+        try:
+            from fno.models import PaperTradeLedger
+            trade = PaperTradeLedger.objects.filter(
+                strategy_id=self.strategy_id,
+                status__in=[
+                    "OPEN",
+                    "PENDING_LIQUIDITY",
+                    "UNEXECUTABLE_OVERNIGHT_CARRY",
+                    "PENDING_EXPIRY_SETTLEMENT",
+                ]
+            ).order_by("-entry_timestamp").first()
+            if trade and trade.entry_fill_price is not None:
+                ref_fill = trade.entry_fill_price
+                self.active_position = {
+                    "tradingsymbol": trade.tradingsymbol,
+                    "entry_fill_price": ref_fill,
+                    "quantity": trade.quantity,
+                    "entry_time": trade.entry_timestamp.astimezone(IST),
+                    "stop_loss": ref_fill * (Decimal("1.0") - self.config.stop_loss_pct),
+                    "profit_target": ref_fill * (Decimal("1.0") + self.config.profit_target_pct),
+                }
+                return self.active_position
+            else:
+                self.active_position = None
+                return None
+        except Exception:
+            return None
+
+    def set_opening_range(self, high: Decimal, low: Decimal, session_date: Optional[date] = None) -> None:
+        """Manually or externally seeds the 15-minute opening range boundaries for a session date."""
         self.opening_range_high = high
         self.opening_range_low = low
         self.opening_range_established = True
+        self.opening_range_session_date = session_date
 
     def on_feature_snapshot(
         self,
@@ -220,3 +256,6 @@ class NiftyOrbBreakoutStrategy(BaseStrategy):
                 }
         elif event.event_type in ("POSITION_CLOSED", "SETTLEMENT"):
             self.active_position = None
+        elif event.event_type == "ORDER_REJECTED":
+            # Explicit confirmation: rejected orders never create or alter active position
+            pass
