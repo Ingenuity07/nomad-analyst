@@ -21,6 +21,7 @@ describe('Application Shell & Navigation', () => {
     expect(screen.getByText('NOMAD ANALYST')).toBeInTheDocument();
     expect(screen.getByText('Market Overview')).toBeInTheDocument();
     expect(screen.getByText('Intraday Scanner')).toBeInTheDocument();
+    expect(screen.getByText('F&O Laboratory')).toBeInTheDocument();
     expect(screen.getByText('Opportunities')).toBeInTheDocument();
     expect(screen.getByText('Stocks & Research')).toBeInTheDocument();
     expect(screen.getByText('Recommendations')).toBeInTheDocument();

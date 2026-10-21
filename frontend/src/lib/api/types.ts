@@ -893,3 +893,163 @@ export interface ExamineResponse {
   research: ResearchRunItem;
   delta?: ResearchDeltaItem | null;
 }
+
+// ── F&O Laboratory Contracts (Phase FNO-1) ───────────────────────────────────
+
+export interface OptionQuoteSnapshotItem {
+  id: number;
+  instrument_token: number;
+  tradingsymbol: string;
+  strike_price?: number | string | null;
+  option_type?: 'CE' | 'PE' | null;
+  expiry_date?: string | null;
+  exchange_timestamp_utc: string | null;
+  received_wall_clock_utc: string;
+  exchange_time_status: string;
+  best_bid: string | number | null;
+  best_ask: string | number | null;
+  bid_quantity_l1: number | null;
+  ask_quantity_l1: number | null;
+  depth: Record<string, any>;
+  quote_status: string;
+  is_stale: boolean;
+  is_locked: boolean;
+  is_crossed: boolean;
+  is_execution_eligible: boolean;
+  spread_pct: string | null;
+  spread_abs: string | null;
+  created_at: string;
+}
+
+export interface FnoOverviewResponse {
+  underlying: {
+    symbol: string;
+    spot_price: number | null;
+    market_direction: string;
+    market_regime: string;
+    atm_strike: number | null;
+    as_of?: string | null;
+  };
+  feed: {
+    status: 'ACTIVE' | 'DEGRADED' | 'STANDBY_MARKET_CLOSED' | 'DISCONNECTED';
+    market_session?: 'OPEN' | 'CLOSED';
+    ticker_running?: boolean;
+    ticker_pid?: number | null;
+    latest_exchange_timestamp: string | null;
+    latest_received_wall_clock: string | null;
+    quote_age_seconds: number | null;
+    active_contracts_tracked: number;
+    total_quotes_today?: number;
+    total_bars_today?: number;
+  };
+  quotes: OptionQuoteSnapshotItem[];
+  timestamp: string;
+}
+
+export interface PaperTradeLedgerItem {
+  trade_id: number;
+  strategy_id: string;
+  strategy_version: string;
+  signal_id: string;
+  instrument_token: number;
+  tradingsymbol: string;
+  option_type: 'CE' | 'PE';
+  strike_price: string | number;
+  expiry_date: string;
+  entry_timestamp: string;
+  entry_fill_price: string | number;
+  entry_slippage: string | number;
+  quantity: number;
+  exit_timestamp: string | null;
+  exit_trigger_reason: string | null;
+  fill_type: string;
+  exit_fill_price: string | number | null;
+  exit_slippage: string | number;
+  gross_pnl: string | number | null;
+  total_frictions: string | number;
+  net_pnl: string | number | null;
+  friction_breakdown: Record<string, any>;
+  statutory_breakdown: Record<string, any>;
+  market_regime_at_entry: string | null;
+  vix_level_at_entry: string | number | null;
+  status: string;
+  rejection_reason: string | null;
+  created_at: string;
+}
+
+export interface FnoStrategyResponse {
+  strategy: {
+    strategy_id: string;
+    name: string;
+    version: string;
+    status: string;
+    runtime_telemetry_available: boolean;
+    session_date: string;
+    last_evaluation_time?: string | null;
+  };
+  opening_range: {
+    expected_bars: number;
+    available_bars: number;
+    runtime_established?: boolean;
+    range_high: number | null;
+    range_low: number | null;
+    range_width: number | null;
+    status: 'PENDING_OPEN' | 'FORMING' | 'LOCKED' | 'FAIL_CLOSED' | 'UNAVAILABLE' | 'INCOMPLETE';
+    time_window: string;
+  };
+  audit_trail: {
+    evaluations_count?: number | null;
+    eligible_evaluations?: number | null;
+    signals_count?: number;
+    rejections_count?: number;
+    rejection_summary: Record<string, number>;
+    recent_signals: PaperTradeLedgerItem[];
+    total_signals_today: number;
+  };
+  timestamp: string;
+}
+
+export interface FnoTradesResponse {
+  summary: {
+    ledger_status?: 'EMPTY' | 'POPULATED' | 'UNAVAILABLE';
+    total_trades: number;
+    open_positions_count: number;
+    wins: number;
+    losses: number;
+    win_rate_pct: number;
+    gross_pnl: string;
+    net_pnl: string;
+    total_frictions: string;
+    is_paper_trading: boolean;
+  };
+  open_positions: PaperTradeLedgerItem[];
+  closed_trades: PaperTradeLedgerItem[];
+  rejections: PaperTradeLedgerItem[];
+  timestamp: string;
+}
+
+export interface FnoDiagnosticsResponse {
+  session_date: string;
+  bars: {
+    total_today: number;
+    complete_count: number;
+    partial_count: number;
+    partial_ratio_pct: number;
+    quality_status: 'EXCELLENT' | 'DEGRADED' | 'CRITICAL';
+  };
+  quotes: {
+    total_today: number;
+    eligible_count: number;
+    stale_count: number;
+    latest_feed_latency_seconds: number | null;
+  };
+  components: {
+    postgresql: string;
+    ticker_daemon?: string;
+    ticker_pid?: number | null;
+    fee_schedule: string;
+    paper_execution_mode: string;
+  };
+  timestamp: string;
+}
+

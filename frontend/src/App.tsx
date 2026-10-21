@@ -10,6 +10,7 @@ import { PageLoadingFallback } from '@/components/common/PageLoadingFallback';
 const MarketPage = lazy(() => import('@/pages/MarketPage'));
 const MarketIntelligencePage = lazy(() => import('@/pages/MarketIntelligencePage'));
 const IntradayPage = lazy(() => import('@/pages/IntradayPage'));
+const FnoPage = lazy(() => import('@/pages/FnoPage'));
 const DeliveryPage = lazy(() => import('@/pages/DeliveryPage'));
 const StocksDirectoryPage = lazy(() => import('@/pages/StocksDirectoryPage'));
 const StockDetailPage = lazy(() => import('@/pages/StockDetailPage'));
@@ -58,6 +59,14 @@ export const App: React.FC = () => {
                 element={
                   <Suspense fallback={<PageLoadingFallback />}>
                     <IntradayPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="fno"
+                element={
+                  <Suspense fallback={<PageLoadingFallback />}>
+                    <FnoPage />
                   </Suspense>
                 }
               />

@@ -12,6 +12,7 @@ const NAV_ITEMS: NavItem[] = [
   { to: '/market', label: 'Market Overview', icon: '📊' },
   { to: '/market-intelligence', label: 'Market & Sectors', icon: '🌐' },
   { to: '/intraday', label: 'Intraday Scanner', icon: '⚡' },
+  { to: '/fno', label: 'F&O Laboratory', icon: '⚡', tag: 'BETA' },
   { to: '/delivery', label: 'Opportunities', icon: '🎯' },
   { to: '/stocks', label: 'Stocks & Research', icon: '📈' },
   { to: '/fundamentals', label: 'Fundamentals', icon: '🏛️' },

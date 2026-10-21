@@ -17,6 +17,7 @@ urlpatterns = [
 
     # Versioned REST API presentation layer (v1)
     path('api/v1/', include('market.urls')),
+    path('api/v1/fno/', include('fno.urls')),
 
     # Zerodha Kite OAuth root callback (matches registered redirect URL)
     path('kite/callback/', include([
