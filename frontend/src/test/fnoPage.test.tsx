@@ -357,7 +357,7 @@ describe('F&O Laboratory Workspace (Phase FNO-1 & FNO-1A)', () => {
     await waitFor(() => {
       expect(screen.getByText('STRAT-ORB-15M Specification')).toBeInTheDocument();
     });
-    expect(screen.getByText('15 / 15 Bars (100%)')).toBeInTheDocument();
+    expect(screen.getByText(/15 \/ 15 Bars \(100%\) — Range Locked/)).toBeInTheDocument();
     expect(screen.getByText('₹24550.00')).toBeInTheDocument();
     expect(screen.getByText('₹24480.00')).toBeInTheDocument();
     expect(screen.getByText('70 pts')).toBeInTheDocument();
@@ -376,6 +376,10 @@ describe('F&O Laboratory Workspace (Phase FNO-1 & FNO-1A)', () => {
       expect(screen.getByText('₹1185.50')).toBeInTheDocument();
       expect(screen.getByText('100%')).toBeInTheDocument();
     });
+
+    // Verify trial-not-started notice banner
+    expect(screen.getByText('20-Session Prospective Paper Trial: Inactive')).toBeInTheDocument();
+    expect(screen.getByText('APPROVAL REQUIRED')).toBeInTheDocument();
 
     // Default open positions subtab
     expect(screen.getByText('#1001')).toBeInTheDocument();
@@ -465,7 +469,7 @@ describe('F&O Laboratory Workspace (Phase FNO-1 & FNO-1A)', () => {
     });
   });
 
-  it('renders clean zero-exposure banner when ledger is empty', async () => {
+  it('renders clean zero-exposure banner when ledger is empty and trial not started', async () => {
     global.fetch = vi.fn().mockImplementation(() =>
       Promise.resolve({
         ok: true,
@@ -499,9 +503,207 @@ describe('F&O Laboratory Workspace (Phase FNO-1 & FNO-1A)', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText('Paper Ledger Zero-Exposure:')).toBeInTheDocument();
+      expect(screen.getByText(/Zero-Exposure Paper Ledger:/)).toBeInTheDocument();
       expect(screen.getByText('CLEAN TRIAL LEDGER')).toBeInTheDocument();
       expect(screen.getByText('LEDGER EMPTY')).toBeInTheDocument();
+      expect(screen.getByText('No Open Positions')).toBeInTheDocument();
+      expect(screen.getByText(/Trial not started\. No simulated positions are active/)).toBeInTheDocument();
+    });
+  });
+
+  describe('Regression: Quote Freshness Presentation & Disagreement', () => {
+    it('separates feed health (ACTIVE) from quote freshness (STALE >3.0s)', async () => {
+      global.fetch = vi.fn().mockImplementation((input: any) => {
+        const url = typeof input === 'string' ? input : input?.url || String(input);
+        if (url.includes('/fno/overview/')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'application/json' }),
+            json: async () => ({
+              ...mockOverviewData,
+              feed: {
+                ...mockOverviewData.feed,
+                status: 'ACTIVE',
+                quote_age_seconds: 4.8,
+              },
+            }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          json: async () => ({}),
+        });
+      });
+
+      render(
+        <QueryClientProvider client={queryClient}>
+          <FnoOverviewTab />
+        </QueryClientProvider>
+      );
+
+      await waitFor(() => {
+        // Feed connection is Live (Streaming)
+        expect(screen.getByText('Live (Streaming)')).toBeInTheDocument();
+        // Quote freshness clearly indicates Stale and taker ineligible despite active feed
+        expect(screen.getByText('4.8s Age')).toBeInTheDocument();
+        expect(screen.getByText('Stale (>3.0s — Taker Ineligible)')).toBeInTheDocument();
+        // Crucially, verify it is NEVER labeled Optimal or Real-Time
+        expect(screen.queryByText(/Optimal/i)).not.toBeInTheDocument();
+        expect(screen.queryByText(/Real-Time/i)).not.toBeInTheDocument();
+      });
+    });
+
+    it('handles missing quote timestamps explicitly without inventing freshness values', async () => {
+      global.fetch = vi.fn().mockImplementation((input: any) => {
+        const url = typeof input === 'string' ? input : input?.url || String(input);
+        if (url.includes('/fno/overview/')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'application/json' }),
+            json: async () => ({
+              ...mockOverviewData,
+              feed: {
+                ...mockOverviewData.feed,
+                status: 'ACTIVE',
+                latest_exchange_timestamp: null,
+                latest_received_wall_clock: null,
+                quote_age_seconds: null,
+              },
+              quotes: [
+                {
+                  ...mockOverviewData.quotes[0],
+                  exchange_timestamp_utc: null,
+                  exchange_time_status: 'UNAVAILABLE',
+                  is_execution_eligible: false,
+                },
+              ],
+            }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          json: async () => ({}),
+        });
+      });
+
+      render(
+        <QueryClientProvider client={queryClient}>
+          <FnoOverviewTab />
+        </QueryClientProvider>
+      );
+
+      await waitFor(() => {
+        // Must show Unavailable instead of a fabricated 0.0s or Real-time
+        expect(screen.getByText('Unavailable')).toBeInTheDocument();
+        expect(screen.getByText('Awaiting quote timestamp')).toBeInTheDocument();
+        expect(screen.getByText('Timestamp Unavailable')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('Regression: Opening Range Bar Count vs Authority', () => {
+    it('does not imply opening range is established even if available_bars is 15 when runtime telemetry is UNAVAILABLE', async () => {
+      global.fetch = vi.fn().mockImplementation((input: any) => {
+        const url = typeof input === 'string' ? input : input?.url || String(input);
+        if (url.includes('/fno/strategy/')) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'application/json' }),
+            json: async () => ({
+              strategy: {
+                strategy_id: 'STRAT-ORB-15M',
+                name: 'NIFTY 15m Opening Range Breakout',
+                version: '1.0.0',
+                status: 'UNAVAILABLE',
+                runtime_telemetry_available: false,
+                session_date: '2026-10-21',
+              },
+              opening_range: {
+                expected_bars: 15,
+                available_bars: 15, // Historical bars exist in DB
+                runtime_established: false, // NOT established by runtime daemon
+                range_high: 24550.0,
+                range_low: 24480.0,
+                range_width: 70.0,
+                status: 'UNAVAILABLE',
+                time_window: '09:15–09:30 IST',
+              },
+              audit_trail: {
+                evaluations_count: null,
+                rejections_count: 0,
+                rejection_summary: {},
+                recent_signals: [],
+                total_signals_today: 0,
+              },
+              timestamp: '2026-10-21T10:00:00Z',
+            }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          json: async () => ({}),
+        });
+      });
+
+      render(
+        <QueryClientProvider client={queryClient}>
+          <FnoStrategyTab />
+        </QueryClientProvider>
+      );
+
+      await waitFor(() => {
+        // Bar completeness MUST show UNAVAILABLE (Awaiting Runtime), not 100% or Locked
+        expect(screen.getByText('UNAVAILABLE (Awaiting Runtime)')).toBeInTheDocument();
+        // Bounds must show '—' because runtime has not confirmed them
+        expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(3);
+        // Explanatory note must be visible
+        expect(
+          screen.getByText(
+            'Historical database bars alone do not establish a valid range without active strategy daemon verification.'
+          )
+        ).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('Regression: Prospective Paper Trial Messaging', () => {
+    it('clearly communicates in header and ledger that the trial has NOT started and requires approval', async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <FnoPage />
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText('TRIAL NOT STARTED')).toBeInTheDocument();
+      });
+
+      // Header trial status badge and subtitle
+      expect(
+        screen.getByText(/20-Session Trial: Not Started \(Approval Required\)/)
+      ).toBeInTheDocument();
+
+      // Switch to Paper Trading tab
+      const paperTab = screen.getByRole('button', { name: /^Paper Trading$/i });
+      fireEvent.click(paperTab);
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('20-Session Prospective Paper Trial: Inactive')
+        ).toBeInTheDocument();
+        expect(screen.getByText('APPROVAL REQUIRED')).toBeInTheDocument();
+      });
     });
   });
 });

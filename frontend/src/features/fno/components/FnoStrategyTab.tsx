@@ -36,9 +36,36 @@ export const FnoStrategyTab: React.FC = () => {
 
   const barCount = openingRange?.available_bars ?? 0;
   const expectedBars = openingRange?.expected_bars ?? 15;
-  const progressPct = Math.min(Math.round((barCount / expectedBars) * 100), 100);
+  const isRuntimeAvailable = Boolean(strategy?.runtime_telemetry_available);
+  const isRangeLocked = openingRange?.status === 'LOCKED' && openingRange?.runtime_established === true;
+  const isRangeForming = openingRange?.status === 'FORMING' && isRuntimeAvailable;
+  const isRangeFailed = openingRange?.status === 'FAIL_CLOSED' || openingRange?.status === 'INCOMPLETE';
+
+  // Reliable progress percentage strictly governed by runtime telemetry
+  const effectiveProgressPct = isRangeLocked
+    ? 100
+    : isRangeForming
+    ? Math.min(Math.round((barCount / expectedBars) * 100), 100)
+    : 0;
+
+  const getProgressLabel = () => {
+    if (!isRuntimeAvailable || openingRange?.status === 'UNAVAILABLE') {
+      return 'UNAVAILABLE (Awaiting Runtime)';
+    }
+    if (isRangeLocked) {
+      return '15 / 15 Bars (100%) — Range Locked';
+    }
+    if (isRangeForming) {
+      return `${barCount} / ${expectedBars} Bars (${effectiveProgressPct}%) — Forming`;
+    }
+    if (isRangeFailed) {
+      return `INCOMPLETE (${barCount} / ${expectedBars} Bars) — Entries Prohibited`;
+    }
+    return '0 / 15 Bars (0%) — Pre-Market';
+  };
 
   const getRangeBadgeVariant = (status?: string): 'positive' | 'negative' | 'warning' | 'neutral' => {
+    if (!isRuntimeAvailable || status === 'UNAVAILABLE') return 'neutral';
     switch (status) {
       case 'LOCKED':
         return 'positive';
@@ -215,7 +242,7 @@ export const FnoStrategyTab: React.FC = () => {
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 'var(--space-1)' }}>
                 <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>Bar Completeness</span>
                 <span style={{ fontSize: 'var(--text-xs)', fontFamily: 'var(--font-mono)', fontWeight: 'var(--weight-bold)', color: 'var(--text-primary)' }}>
-                  {barCount} / {expectedBars} Bars ({progressPct}%)
+                  {getProgressLabel()}
                 </span>
               </div>
               <div
@@ -230,31 +257,46 @@ export const FnoStrategyTab: React.FC = () => {
                 <div
                   style={{
                     height: '100%',
-                    width: `${progressPct}%`,
-                    backgroundColor: openingRange?.status === 'LOCKED' ? 'var(--positive)' : 'var(--brand-primary)',
+                    width: `${effectiveProgressPct}%`,
+                    backgroundColor: isRangeLocked
+                      ? 'var(--positive)'
+                      : isRangeFailed
+                      ? 'var(--negative)'
+                      : isRangeForming
+                      ? 'var(--brand-primary)'
+                      : 'transparent',
                     transition: 'width 0.4s ease',
                   }}
                 />
+              </div>
+              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', marginTop: 'var(--space-1)' }}>
+                {!isRuntimeAvailable || openingRange?.status === 'UNAVAILABLE'
+                  ? 'Historical database bars alone do not establish a valid range without active strategy daemon verification.'
+                  : isRangeLocked
+                  ? 'Complete 15-minute range verified and locked for breakout evaluations.'
+                  : isRangeFailed
+                  ? 'Window had missing minutes or corrupt bars. Strategy fails closed; breakout entries prohibited.'
+                  : '09:15–09:30 IST window forming minute-by-minute.'}
               </div>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 'var(--space-2)', paddingTop: 'var(--space-1)' }}>
               <div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>RANGE HIGH</div>
-                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-bold)', fontFamily: 'var(--font-mono)', color: 'var(--positive)' }}>
-                  {openingRange?.range_high ? `₹${openingRange.range_high.toFixed(2)}` : '—'}
+                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-bold)', fontFamily: 'var(--font-mono)', color: isRangeLocked ? 'var(--positive)' : 'var(--text-muted)' }}>
+                  {isRangeLocked && openingRange?.range_high ? `₹${openingRange.range_high.toFixed(2)}` : '—'}
                 </div>
               </div>
               <div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>RANGE LOW</div>
-                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-bold)', fontFamily: 'var(--font-mono)', color: 'var(--negative)' }}>
-                  {openingRange?.range_low ? `₹${openingRange.range_low.toFixed(2)}` : '—'}
+                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-bold)', fontFamily: 'var(--font-mono)', color: isRangeLocked ? 'var(--negative)' : 'var(--text-muted)' }}>
+                  {isRangeLocked && openingRange?.range_low ? `₹${openingRange.range_low.toFixed(2)}` : '—'}
                 </div>
               </div>
               <div>
                 <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>WIDTH</div>
-                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-bold)', fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
-                  {openingRange?.range_width ? `${openingRange.range_width} pts` : '—'}
+                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-bold)', fontFamily: 'var(--font-mono)', color: isRangeLocked ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                  {isRangeLocked && openingRange?.range_width ? `${openingRange.range_width} pts` : '—'}
                 </div>
               </div>
             </div>

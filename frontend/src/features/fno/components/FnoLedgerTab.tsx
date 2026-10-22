@@ -248,6 +248,37 @@ export const FnoLedgerTab: React.FC = () => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+      {/* 20-Session Prospective Paper Trial Status Banner */}
+      <div
+        style={{
+          padding: 'var(--space-3) var(--space-4)',
+          backgroundColor: 'var(--bg-surface-subtle)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-md)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 'var(--space-3)',
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+            <Badge variant="neutral" size="sm">TRIAL NOT STARTED</Badge>
+            <span style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-semibold)', color: 'var(--text-primary)' }}>
+              20-Session Prospective Paper Trial: Inactive
+            </span>
+            <Badge variant="warning" size="sm">APPROVAL REQUIRED</Badge>
+          </div>
+          <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>
+            The 20-session prospective paper trial has not started and requires explicit approval before execution. No paper trades are scheduled or executing.
+          </span>
+        </div>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-2xs)', color: 'var(--text-muted)' }}>
+          MODE: STRICT_SIMULATED (GATED)
+        </span>
+      </div>
+
       {/* Session Ledger Performance Summary */}
       <Card
         header="Paper Trading Session Performance"
@@ -268,12 +299,12 @@ export const FnoLedgerTab: React.FC = () => {
           <Metric
             label="OPEN POSITIONS"
             value={`${summary?.open_positions_count ?? 0}`}
-            subtext="Simulated active"
+            subtext={summary?.open_positions_count ? 'Simulated active' : 'Trial inactive'}
           />
           <Metric
             label="COMPLETED TRADES"
             value={`${summary?.total_trades ?? 0}`}
-            subtext="Closed today"
+            subtext={summary?.total_trades ? 'Closed today' : 'Zero trial trades'}
           />
           <Metric
             label="WIN RATE"
@@ -313,7 +344,7 @@ export const FnoLedgerTab: React.FC = () => {
           }}
         >
           <span>
-            📋 <strong>Paper Ledger Zero-Exposure:</strong> No simulated trades have been executed in this session. The 20-session trial has zero trial trades recorded.
+            📋 <strong>Zero-Exposure Paper Ledger:</strong> The prospective 20-session trial has not started and zero trial trades have been executed. Explicit approval is required.
           </span>
           <Badge variant="neutral" size="sm">CLEAN TRIAL LEDGER</Badge>
         </div>
@@ -376,7 +407,7 @@ export const FnoLedgerTab: React.FC = () => {
           openPositions.length === 0 ? (
             <EmptyState
               title="No Open Positions"
-              description="No simulated positions are currently active in STRAT-ORB-15M."
+              description="Trial not started. No simulated positions are active in STRAT-ORB-15M."
             />
           ) : (
             <Table
@@ -391,7 +422,7 @@ export const FnoLedgerTab: React.FC = () => {
           closedTrades.length === 0 ? (
             <EmptyState
               title="No Completed Trades"
-              description="No paper trades have closed during the current session."
+              description="Zero trial trades recorded. The prospective paper trial has not begun."
             />
           ) : (
             <Table
@@ -406,7 +437,7 @@ export const FnoLedgerTab: React.FC = () => {
           rejections.length === 0 ? (
             <EmptyState
               title="No Trade Rejections"
-              description="No orders have been rejected by runtime liquidity or guard policies."
+              description="No runtime rejections recorded while the prospective paper trial remains inactive."
             />
           ) : (
             <Table

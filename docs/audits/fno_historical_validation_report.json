@@ -1,0 +1,88 @@
+{
+  "validation_timestamp_utc": "2026-10-22T13:31:41.363029+00:00",
+  "dataset_dir": "data/historical/fno/nifty",
+  "manifest_present": true,
+  "overall_status": "FAIL",
+  "checks": {
+    "MANIFEST_VERIFICATION": {
+      "status": "PASS",
+      "details": "manifest.json exists and is readable."
+    },
+    "INDEX_SCHEMA": {
+      "status": "PASS",
+      "details": "Index schema valid. Total rows: 486,050",
+      "total_rows": 486050
+    },
+    "INDEX_OHLC_GEOMETRY": {
+      "status": "PASS",
+      "details": "All index rows satisfy geometric boundaries (high>=low, positive prices)."
+    },
+    "INDEX_DUPLICATES": {
+      "status": "PASS",
+      "details": "Zero duplicate timestamps in index dataset."
+    },
+    "INDEX_MARKET_HOURS": {
+      "status": "PASS",
+      "details": "All index bars fall strictly within valid NSE trading and settlement session boundaries."
+    },
+    "INDEX_ORB_15M_READINESS": {
+      "status": "PARTIAL_PASS",
+      "details": "ORB 15m completeness: 1256/1262 days have complete 15/15 bars (6 days incomplete or shortened/Muhurat).",
+      "total_days": 1262,
+      "complete_days": 1256,
+      "incomplete_days": 6
+    },
+    "OPTIONS_SCHEMA": {
+      "status": "PASS",
+      "details": "Option schema valid across 54 expiry files. Total rows: 15,213,485",
+      "files_checked": 54,
+      "total_rows": 15213485
+    },
+    "OPTIONS_OHLC_GEOMETRY": {
+      "status": "PASS",
+      "details": "All option rows satisfy geometric boundaries (high>=low, positive prices)."
+    },
+    "OPTIONS_DUPLICATES": {
+      "status": "FAIL",
+      "details": "Found 33261 duplicate contract-minute rows in option dataset across 2 source files (2025-12-30: 1,716; 2026-01-06: 31,545). HistoricalReader deduplicates deterministically via QUALIFY ROW_NUMBER.",
+      "duplicate_count": 33261,
+      "affected_files": [
+        "2025-12-30.parquet",
+        "2026-01-06.parquet"
+      ]
+    },
+    "OPTIONS_CONTRACT_METADATA": {
+      "status": "PASS",
+      "details": "All option contracts have valid symbol (NIFTY), strike (>0), and type (CE/PE)."
+    },
+    "OPTIONS_VOLUME_AND_OI": {
+      "status": "PASS",
+      "details": "Volume & OI valid: 0 negative values. Active trade bars: 15,138,150 (99.5%), legitimate inactive bars: 75,335 (0.5%).",
+      "active_trade_bars": 15138150,
+      "inactive_bars": 75335
+    },
+    "OPTIONS_MARKET_HOURS": {
+      "status": "FAIL",
+      "details": "Found 8227 option rows outside standard continuous hours (09:15-15:30 IST); all fall between 15:39 and 15:45 IST (NSE post-market closing settlement session; 0 anomalous rows outside 09:15-15:45 IST).",
+      "total_non_standard_rows": 8227,
+      "post_market_settlement_rows": 8227,
+      "anomalous_out_of_bounds_rows": 0
+    },
+    "OPTIONS_ATM_SERIES_COVERAGE": {
+      "status": "PASS",
+      "details": "100% ATM series coverage: Both CE and PE present for all 232 liquid window days (within 14d of expiry).",
+      "liquid_window_days": 232,
+      "complete_atm_days": 232
+    },
+    "BID_ASK_AVAILABILITY_DISCLAIMER": {
+      "status": "PASS",
+      "details": "Verified: Dataset contains 1-minute OHLCV only. Historical bid/ask order book quotes are confirmed UNAVAILABLE and not fabricated."
+    }
+  },
+  "summary": {
+    "total_checks": 14,
+    "passed": 11,
+    "failed": 2,
+    "not_tested": 0
+  }
+}

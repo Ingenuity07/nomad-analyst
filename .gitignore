@@ -60,3 +60,6 @@ discovery_traces/*.html
 
 # Kite instrument master CSV dumps
 data/universe/*.csv
+
+# Historical Options & Market Datasets (Parquet / DuckDB)
+data/historical/

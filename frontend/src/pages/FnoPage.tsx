@@ -26,7 +26,7 @@ export const FnoPage: React.FC = () => {
   return (
     <PageContainer
       title="F&O Laboratory"
-      subtitle="Institutional-grade options intelligence, strategy execution, and real-time taker paper ledger"
+      subtitle="Institutional-grade options intelligence, strategy telemetry, and paper trade ledger (Trial Inactive — Approval Required)"
     >
       {/* Workspace Metric Header */}
       <FnoWorkspaceHeader overview={overview} isLoading={isOverviewLoading} />

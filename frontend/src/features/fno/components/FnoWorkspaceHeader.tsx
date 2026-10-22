@@ -80,6 +80,9 @@ export const FnoWorkspaceHeader: React.FC<FnoWorkspaceHeaderProps> = ({ overview
             <Badge variant={getFeedBadgeVariant(feedStatus)} size="sm">
               {getFeedBadgeLabel(feedStatus)}
             </Badge>
+            <Badge variant="neutral" size="sm">
+              TRIAL NOT STARTED
+            </Badge>
           </div>
           <div
             style={{
@@ -88,7 +91,7 @@ export const FnoWorkspaceHeader: React.FC<FnoWorkspaceHeaderProps> = ({ overview
               marginTop: 'var(--space-1)',
             }}
           >
-            NIFTY 50 Options Analysis • STRAT-ORB-15M Strategy Lab • Real-Time Paper Execution
+            NIFTY 50 Options Analysis • STRAT-ORB-15M Strategy Lab • 20-Session Trial: Not Started (Approval Required)
           </div>
         </div>
 
@@ -109,7 +112,17 @@ export const FnoWorkspaceHeader: React.FC<FnoWorkspaceHeaderProps> = ({ overview
           <Metric
             label="QUOTE AGE"
             value={quoteAge !== null && quoteAge !== undefined ? `${quoteAge.toFixed(1)}s` : '—'}
-            subtext={quoteAge !== null && quoteAge !== undefined && quoteAge > 3.0 ? 'Delayed' : 'Real-time'}
+            subtext={
+              feedStatus === 'STANDBY_MARKET_CLOSED'
+                ? 'Post-Market'
+                : quoteAge === null || quoteAge === undefined
+                ? 'No quote data'
+                : quoteAge <= 1.0
+                ? 'Fresh (<1.0s)'
+                : quoteAge <= 3.0
+                ? 'Acceptable (≤3.0s)'
+                : 'Stale (>3.0s)'
+            }
           />
 
           <Metric

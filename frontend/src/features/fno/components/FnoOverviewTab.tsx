@@ -124,28 +124,33 @@ export const FnoOverviewTab: React.FC = () => {
     },
     {
       key: 'exchange_timestamp_utc',
-      header: 'Time Status',
+      header: 'Exchange Time',
       render: (row) => (
         <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-          <span>{row.exchange_time_status}</span>
-          {row.exchange_timestamp_utc && (
+          <div>{row.exchange_time_status}</div>
+          {row.exchange_timestamp_utc ? (
             <div style={{ color: 'var(--text-secondary)' }}>
               {new Date(row.exchange_timestamp_utc).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
             </div>
+          ) : (
+            <div style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>Timestamp Unavailable</div>
           )}
         </div>
       ),
     },
   ];
 
+  const feed = data?.feed;
+  const quoteAge = feed?.quote_age_seconds;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
       {/* Feed Context Overview Card */}
-      <Card header="NIFTY Context & Feed Freshness">
+      <Card header="NIFTY Underlying Context & Feed Health">
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
             gap: 'var(--space-4)',
             paddingTop: 'var(--space-2)',
           }}
@@ -176,19 +181,39 @@ export const FnoOverviewTab: React.FC = () => {
 
           <div>
             <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', textTransform: 'uppercase' }}>
-              Feed Freshness
+              Feed Connection
             </div>
             <div style={{ fontSize: 'var(--text-base)', fontWeight: 'var(--weight-bold)', color: 'var(--text-primary)' }}>
-              {data?.feed.status === 'ACTIVE'
-                ? 'Optimal (<1.0s)'
-                : data?.feed.status === 'DEGRADED'
-                ? 'Lagging (>3.0s)'
-                : data?.feed.status === 'STANDBY_MARKET_CLOSED'
+              {feed?.status === 'ACTIVE'
+                ? 'Live (Streaming)'
+                : feed?.status === 'DEGRADED'
+                ? 'Lagging (>30s)'
+                : feed?.status === 'STANDBY_MARKET_CLOSED'
                 ? 'Standby (Market Closed)'
                 : 'Disconnected'}
             </div>
             <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-              Arrival: {data?.feed.latest_received_wall_clock ? new Date(data.feed.latest_received_wall_clock).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'No Ticks'}
+              Arrival: {feed?.latest_received_wall_clock ? new Date(feed.latest_received_wall_clock).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'No Ticks Received'}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-muted)', textTransform: 'uppercase' }}>
+              Quote Freshness (L1 Taker Gate)
+            </div>
+            <div style={{ fontSize: 'var(--text-base)', fontWeight: 'var(--weight-bold)', color: 'var(--text-primary)' }}>
+              {quoteAge !== null && quoteAge !== undefined ? `${quoteAge.toFixed(1)}s Age` : 'Unavailable'}
+            </div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+              {feed?.status === 'STANDBY_MARKET_CLOSED'
+                ? 'Post-Market Snapshot'
+                : quoteAge === null || quoteAge === undefined
+                ? 'Awaiting quote timestamp'
+                : quoteAge <= 1.0
+                ? 'Fresh (<1.0s)'
+                : quoteAge <= 3.0
+                ? 'Acceptable (≤3.0s)'
+                : 'Stale (>3.0s — Taker Ineligible)'}
             </div>
           </div>
 
@@ -197,7 +222,7 @@ export const FnoOverviewTab: React.FC = () => {
               Tracked Option Strikes
             </div>
             <div style={{ fontSize: 'var(--text-base)', fontWeight: 'var(--weight-bold)', color: 'var(--text-primary)' }}>
-              {data?.feed.active_contracts_tracked ?? 0} Contracts
+              {feed?.active_contracts_tracked ?? 0} Contracts
             </div>
             <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
               Rolling 5-Day L1 & L2 Depth
